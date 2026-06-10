@@ -1,0 +1,7 @@
+Metadata-Version: 2.4
+Name: gpu-queue
+Version: 0.1.0
+Summary: Filesystem-backed GPU job queue with flock serialization
+Requires-Python: >=3.11
+Provides-Extra: test
+Requires-Dist: pytest>=8.0; extra == "test"

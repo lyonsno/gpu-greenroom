@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""GPU Queue CLI — submit, list, status, cancel, run worker."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+from .models import JobRequest, JobStatus
+from .queue import GPUQueue
+
+DEFAULT_QUEUE_DIR = os.environ.get("GPU_QUEUE_DIR", os.path.expanduser("~/.local/state/gpu-queue"))
+
+# Default job type configurations
+DEFAULT_JOB_TYPES = {
+    "trellis2mlx": [
+        "python", "generate.py",
+        "--image", "{input_path}",
+        "--output", "{output_dir}/output.glb",
+        "--seed", "{seed}",
+    ],
+    "supermat": [
+        "python", "run_supermat.py",
+        "--image", "{input_path}",
+        "--output-dir", "{output_dir}",
+    ],
+}
+
+
+def get_queue(args) -> GPUQueue:
+    return GPUQueue(args.queue_dir)
+
+
+def cmd_submit(args):
+    queue = get_queue(args)
+    params = {}
+    if args.params:
+        for p in args.params:
+            k, v = p.split("=", 1)
+            params[k] = v
+
+    # Default seed if not specified for trellis2mlx
+    if args.job_type == "trellis2mlx" and "seed" not in params:
+        params["seed"] = "42"
+
+    request = JobRequest(
+        job_type=args.job_type,
+        input_path=args.input,
+        output_dir=args.output_dir,
+        params=params,
+    )
+    job_dir = queue.submit(request)
+    print(f"Submitted job {request.job_id}")
+    print(f"  Type: {request.job_type}")
+    print(f"  Input: {request.input_path}")
+    print(f"  Output: {request.output_dir}")
+    print(f"  Dir: {job_dir}")
+
+
+def cmd_list(args):
+    queue = get_queue(args)
+    status_filter = JobStatus(args.status) if args.status else None
+    jobs = queue.list_jobs(status_filter)
+
+    if not jobs:
+        print("No jobs found.")
+        return
+
+    for job in jobs:
+        elapsed = ""
+        if job.started_at and job.finished_at:
+            elapsed = f" ({job.finished_at - job.started_at:.1f}s)"
+        elif job.started_at:
+            elapsed = f" ({time.time() - job.started_at:.1f}s running)"
+        print(f"  {job.job_id}  {job.status.value:10s}  {job.job_type:12s}  {os.path.basename(job.input_path)}{elapsed}")
+
+
+def cmd_status(args):
+    queue = get_queue(args)
+    state = queue.get_job(args.job_id)
+    if state is None:
+        print(f"Job {args.job_id} not found.")
+        sys.exit(1)
+    print(json.dumps(json.loads(state.to_json()), indent=2))
+
+
+def cmd_cancel(args):
+    queue = get_queue(args)
+    if queue.cancel(args.job_id):
+        print(f"Cancelled job {args.job_id}")
+    else:
+        print(f"Could not cancel {args.job_id} (not found or not pending)")
+        sys.exit(1)
+
+
+def cmd_worker(args):
+    """Run the worker loop — picks and runs jobs sequentially."""
+    queue = get_queue(args)
+
+    # Load job types from config file if it exists
+    job_types = dict(DEFAULT_JOB_TYPES)
+    config_path = Path(args.queue_dir) / "job_types.json"
+    if config_path.exists():
+        custom = json.loads(config_path.read_text())
+        job_types.update(custom)
+
+    print(f"GPU Queue Worker starting")
+    print(f"  Queue dir: {args.queue_dir}")
+    print(f"  Job types: {', '.join(job_types.keys())}")
+    print(f"  Poll interval: {args.poll}s")
+
+    # Recover stale jobs on startup
+    recovered = queue.recover_stale()
+    if recovered:
+        print(f"  Recovered {len(recovered)} stale job(s): {', '.join(recovered)}")
+
+    try:
+        while True:
+            ran = queue.run_one(job_types)
+            if ran:
+                # Check for more immediately
+                continue
+            time.sleep(args.poll)
+    except KeyboardInterrupt:
+        print("\nWorker stopped.")
+
+
+def cmd_recover(args):
+    queue = get_queue(args)
+    recovered = queue.recover_stale()
+    if recovered:
+        print(f"Recovered {len(recovered)} stale job(s):")
+        for jid in recovered:
+            print(f"  {jid}")
+    else:
+        print("No stale jobs found.")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="gpu-queue",
+        description="Filesystem-backed GPU job queue with flock serialization",
+    )
+    parser.add_argument(
+        "--queue-dir", default=DEFAULT_QUEUE_DIR,
+        help=f"Queue directory (default: {DEFAULT_QUEUE_DIR})",
+    )
+
+    sub = parser.add_subparsers(dest="command")
+
+    # submit
+    p_submit = sub.add_parser("submit", help="Submit a job")
+    p_submit.add_argument("job_type", help="Job type (e.g. trellis2mlx, supermat)")
+    p_submit.add_argument("input", help="Input file path")
+    p_submit.add_argument("output_dir", help="Output directory")
+    p_submit.add_argument("-p", "--params", nargs="*", help="Key=value params (e.g. seed=42)")
+    p_submit.set_defaults(func=cmd_submit)
+
+    # list
+    p_list = sub.add_parser("list", help="List jobs")
+    p_list.add_argument("-s", "--status", choices=["pending", "running", "done", "failed", "cancelled"])
+    p_list.set_defaults(func=cmd_list)
+
+    # status
+    p_status = sub.add_parser("status", help="Get job status")
+    p_status.add_argument("job_id")
+    p_status.set_defaults(func=cmd_status)
+
+    # cancel
+    p_cancel = sub.add_parser("cancel", help="Cancel a pending job")
+    p_cancel.add_argument("job_id")
+    p_cancel.set_defaults(func=cmd_cancel)
+
+    # worker
+    p_worker = sub.add_parser("worker", help="Run the worker loop")
+    p_worker.add_argument("--poll", type=float, default=2.0, help="Poll interval in seconds")
+    p_worker.set_defaults(func=cmd_worker)
+
+    # recover
+    p_recover = sub.add_parser("recover", help="Recover stale running jobs")
+    p_recover.set_defaults(func=cmd_recover)
+
+    args = parser.parse_args()
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

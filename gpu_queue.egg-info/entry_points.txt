@@ -1,0 +1,2 @@
+[console_scripts]
+gpu-queue = gpu_queue.cli:main
