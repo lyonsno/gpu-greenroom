@@ -1,4 +1,4 @@
-"""Tests for the GPU queue CLI."""
+"""Tests for the GPU Greenroom CLI."""
 
 import json
 import subprocess
@@ -15,7 +15,7 @@ def run_cli(*args, queue_dir=None):
     if queue_dir:
         cmd.extend(["--queue-dir", str(queue_dir)])
     cmd.extend(args)
-    result = subprocess.run(cmd, capture_output=True, text=True, cwd="/private/tmp/gpu-queue")
+    result = subprocess.run(cmd, capture_output=True, text=True, cwd="/private/tmp/gpu-greenroom")
     return result.returncode, result.stdout, result.stderr
 
 

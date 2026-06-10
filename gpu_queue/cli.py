@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GPU Queue CLI — submit, list, status, cancel, run worker."""
+"""GPU Greenroom CLI — submit, list, status, cancel, run worker."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from pathlib import Path
 from .models import JobRequest, JobStatus
 from .queue import GPUQueue
 
-DEFAULT_QUEUE_DIR = os.environ.get("GPU_QUEUE_DIR", os.path.expanduser("~/.local/state/gpu-queue"))
+DEFAULT_QUEUE_DIR = os.environ.get("GPU_GREENROOM_DIR", os.path.expanduser("~/.local/state/gpu-greenroom"))
 
 # Default job type configurations
 DEFAULT_JOB_TYPES = {
@@ -108,7 +108,7 @@ def cmd_worker(args):
         custom = json.loads(config_path.read_text())
         job_types.update(custom)
 
-    print(f"GPU Queue Worker starting")
+    print(f"GPU Greenroom Worker starting")
     print(f"  Queue dir: {args.queue_dir}")
     print(f"  Job types: {', '.join(job_types.keys())}")
     print(f"  Poll interval: {args.poll}s")
@@ -142,7 +142,7 @@ def cmd_recover(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        prog="gpu-queue",
+        prog="gpu-greenroom",
         description="Filesystem-backed GPU job queue with flock serialization",
     )
     parser.add_argument(

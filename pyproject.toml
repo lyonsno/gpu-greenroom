@@ -1,5 +1,5 @@
 [project]
-name = "gpu-queue"
+name = "gpu-greenroom"
 version = "0.1.0"
 description = "Filesystem-backed GPU job queue with flock serialization"
 requires-python = ">=3.11"
@@ -9,7 +9,7 @@ dependencies = []
 test = ["pytest>=8.0"]
 
 [project.scripts]
-gpu-queue = "gpu_queue.cli:main"
+gpu-greenroom = "gpu_queue.cli:main"
 
 [build-system]
 requires = ["setuptools>=68.0"]

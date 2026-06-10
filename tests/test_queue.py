@@ -379,6 +379,34 @@ class TestEffectiveRoute:
         assert state.effective_route is not None
         assert "/tmp/test.png" in state.effective_route
 
+    def test_param_cannot_override_input_path(self, queue):
+        """User params must not shadow reserved keys (M1 regression)."""
+        req = make_request(
+            job_type="echo",
+            input_path="/real/image.png",
+            input_path_override="INJECTED",  # sneaky param
+        )
+        # Manually set the param to try to override
+        req.params["input_path"] = "INJECTED"
+        queue.submit(req)
+        job_types = {"echo": ["echo", "{input_path}"]}
+        queue.run_one(job_types)
+        state = queue.get_job(req.job_id)
+        assert "INJECTED" not in state.effective_route
+        assert "/real/image.png" in state.effective_route
+
+    def test_param_cannot_override_output_dir(self, queue, tmp_path):
+        """User params must not shadow output_dir."""
+        real_out = str(tmp_path / "real_out")
+        req = make_request(job_type="echo", output_dir=real_out)
+        req.params["output_dir"] = "/tmp/evil"
+        queue.submit(req)
+        job_types = {"echo": ["echo", "{output_dir}"]}
+        queue.run_one(job_types)
+        state = queue.get_job(req.job_id)
+        assert "/tmp/evil" not in state.effective_route
+        assert real_out in state.effective_route
+
     def test_effective_route_distinct_from_request(self, queue):
         """Requested route vs effective route are separate fields."""
         req = make_request(job_type="echo", input_path="/my/image.png")

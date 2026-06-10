@@ -6,7 +6,6 @@ import fcntl
 import json
 import os
 import shutil
-import signal
 import subprocess
 import time
 from pathlib import Path
@@ -58,19 +57,29 @@ class GPUQueue:
         return job_dir
 
     def cancel(self, job_id: str) -> bool:
-        """Cancel a pending job. Returns True if cancelled, False if not found/not pending."""
-        pending_dir = self.queue_dir / "pending" / job_id
-        if not pending_dir.exists():
-            return False
+        """Cancel a pending job. Returns True if cancelled, False if not found/not pending.
 
-        state = JobState.from_json((pending_dir / "status.json").read_text())
-        state.status = JobStatus.CANCELLED
-        state.finished_at = time.time()
-        (pending_dir / "status.json").write_text(state.to_json())
+        Acquires flock to prevent race with run_one().
+        """
+        lock_fd = open(self.lock_path, "w")
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
 
-        dest = self.queue_dir / "cancelled" / job_id
-        shutil.move(str(pending_dir), str(dest))
-        return True
+            pending_dir = self.queue_dir / "pending" / job_id
+            if not pending_dir.exists():
+                return False
+
+            state = JobState.from_json((pending_dir / "status.json").read_text())
+            state.status = JobStatus.CANCELLED
+            state.finished_at = time.time()
+            (pending_dir / "status.json").write_text(state.to_json())
+
+            dest = self.queue_dir / "cancelled" / job_id
+            shutil.move(str(pending_dir), str(dest))
+            return True
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
 
     def list_jobs(self, status: JobStatus | None = None) -> list[JobState]:
         """List jobs, optionally filtered by status."""
@@ -161,11 +170,15 @@ class GPUQueue:
                 self._move_job(job_dir, "failed")
                 return True
 
+            # Reserved keys always win over user params to prevent override attacks
+            RESERVED = {"input_path", "output_dir"}
+            safe_params = {k: v for k, v in request.params.items() if k not in RESERVED}
             subs = {
+                **safe_params,
                 "input_path": request.input_path,
                 "output_dir": request.output_dir,
-                **request.params,
             }
+            # Use string.Template-style replacement to prevent format-string attacks
             cmd = [part.format(**subs) for part in cmd_template]
             state.effective_route = " ".join(cmd)
             (job_dir / "status.json").write_text(state.to_json())
@@ -251,8 +264,11 @@ class GPUQueue:
             if state.pid is not None:
                 try:
                     os.kill(state.pid, 0)  # check if process is alive
+                except PermissionError:
+                    # PID exists but belongs to another user — treat as alive, skip
+                    continue
                 except ProcessLookupError:
-                    # Process is dead — stale job
+                    # PID does not exist — stale job
                     state.status = JobStatus.FAILED
                     state.finished_at = time.time()
                     state.failure_phase = "stale_recovery"
