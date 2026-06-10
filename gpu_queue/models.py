@@ -23,7 +23,7 @@ class JobStatus(str, Enum):
 class JobRequest:
     job_type: str
     input_path: str
-    output_dir: str
+    output_dir: str = ""
     params: dict[str, Any] = field(default_factory=dict)
     job_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     submitted_at: float = field(default_factory=time.time)
@@ -53,6 +53,7 @@ class JobState:
     error_message: str | None = None
     effective_route: str | None = None
     pid: int | None = None
+    warnings: list[str] = field(default_factory=list)
 
     def to_json(self) -> str:
         d = asdict(self)

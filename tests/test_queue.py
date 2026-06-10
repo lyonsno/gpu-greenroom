@@ -687,3 +687,62 @@ class TestPauseResume:
         job_dir = queue.submit(req)
         assert job_dir.exists()
         assert queue.get_job(req.job_id).status == JobStatus.PENDING
+
+
+# --- Durable output directory ---
+
+class TestDurableOutputDir:
+    def test_outputs_dir_created(self, queue):
+        """Queue creates a durable outputs/ directory."""
+        assert (queue.queue_dir / "outputs").is_dir()
+
+    def test_default_output_dir_is_durable(self, queue):
+        """When output_dir is omitted, submit auto-generates a durable path."""
+        req = JobRequest(job_type="echo", input_path="/tmp/test.png")
+        queue.submit(req)
+        state = queue.get_job(req.job_id)
+        assert state.output_dir.startswith(str(queue.queue_dir / "outputs"))
+        assert req.job_id in state.output_dir
+        assert Path(state.output_dir).parent == queue.queue_dir / "outputs"
+
+    def test_explicit_output_dir_preserved(self, queue, tmp_path):
+        """Explicit output_dir is not overwritten."""
+        explicit = str(tmp_path / "my_output")
+        req = JobRequest(job_type="echo", input_path="/tmp/test.png", output_dir=explicit)
+        queue.submit(req)
+        state = queue.get_job(req.job_id)
+        assert state.output_dir == explicit
+
+    def test_volatile_output_dir_warns_in_status(self, queue):
+        """Output dir under /tmp or /private/tmp records a volatile_output warning."""
+        req = JobRequest(job_type="echo", input_path="/tmp/test.png", output_dir="/tmp/ephemeral")
+        queue.submit(req)
+        status_file = queue.queue_dir / "pending" / req.job_id / "status.json"
+        status = json.loads(status_file.read_text())
+        assert "volatile_output" in (status.get("warnings") or [])
+
+    def test_volatile_warning_in_receipt(self, queue):
+        """Volatile warning propagates to the receipt after execution."""
+        req = JobRequest(job_type="echo", input_path="/tmp/test.png", output_dir="/tmp/will-die")
+        queue.submit(req)
+        queue.run_one({"echo": ["echo", "hi"]})
+        receipt = json.loads((queue.queue_dir / "done" / req.job_id / "receipt.json").read_text())
+        assert "volatile_output" in (receipt.get("warnings") or [])
+
+    def test_durable_output_dir_no_warning(self, queue, tmp_path):
+        """Non-volatile paths produce no volatile_output warning."""
+        safe = str(tmp_path / "safe_output")
+        req = JobRequest(job_type="echo", input_path="/tmp/test.png", output_dir=safe)
+        queue.submit(req)
+        status_file = queue.queue_dir / "pending" / req.job_id / "status.json"
+        status = json.loads(status_file.read_text())
+        assert "volatile_output" not in (status.get("warnings") or [])
+
+    def test_default_output_survives_in_queue_dir(self, queue):
+        """Default output dir lives inside the queue dir, which is durable."""
+        req = JobRequest(job_type="echo", input_path="/tmp/test.png")
+        queue.submit(req)
+        queue.run_one({"echo": {"cmd": ["sh", "-c", "echo data > {output_dir}/result.txt"]}})
+        state = queue.get_job(req.job_id)
+        assert (Path(state.output_dir) / "result.txt").exists()
+        assert (Path(state.output_dir) / "result.txt").read_text().strip() == "data"

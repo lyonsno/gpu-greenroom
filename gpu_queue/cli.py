@@ -80,6 +80,8 @@ def cmd_submit(args):
     print(f"  Type: {request.job_type}")
     print(f"  Input: {request.input_path}")
     print(f"  Output: {request.output_dir}")
+    if not args.output_dir:
+        print(f"  (auto-assigned durable output dir)")
     if args.cwd:
         print(f"  Cwd: {args.cwd}")
     print(f"  Dir: {job_dir}")
@@ -202,7 +204,7 @@ def main():
     p_submit = sub.add_parser("submit", help="Submit a job")
     p_submit.add_argument("job_type", help="Job type (e.g. trellis2mlx, supermat)")
     p_submit.add_argument("input", help="Input file path")
-    p_submit.add_argument("output_dir", help="Output directory")
+    p_submit.add_argument("output_dir", nargs="?", default="", help="Output directory (default: durable path in queue dir)")
     p_submit.add_argument("-p", "--params", nargs="*", help="Key=value params (e.g. seed=42)")
     p_submit.add_argument("--cwd", help="Override working directory (e.g. for branch/worktree)")
     p_submit.set_defaults(func=cmd_submit)

@@ -25,9 +25,11 @@ class GPUQueue:
             cancelled/   - cancelled jobs
     """
 
+    VOLATILE_PREFIXES = ("/tmp", "/private/tmp", "/var/tmp")
+
     def __init__(self, queue_dir: str | Path):
         self.queue_dir = Path(queue_dir)
-        for sub in ("pending", "running", "done", "failed", "cancelled"):
+        for sub in ("pending", "running", "done", "failed", "cancelled", "outputs"):
             (self.queue_dir / sub).mkdir(parents=True, exist_ok=True)
 
     @property
@@ -49,13 +51,30 @@ class GPUQueue:
     def is_paused(self) -> bool:
         return self.pause_path.exists()
 
+    def _is_volatile(self, path: str) -> bool:
+        resolved = str(Path(path).resolve())
+        return any(resolved == p or resolved.startswith(p + "/")
+                    for p in self.VOLATILE_PREFIXES)
+
     def submit(self, request: JobRequest) -> Path:
-        """Submit a job. Returns the job directory path."""
+        """Submit a job. Returns the job directory path.
+
+        If output_dir is empty, auto-assigns a durable path under
+        queue_dir/outputs/<job_id>/. If output_dir is under /tmp or
+        /private/tmp, records a volatile_output warning.
+        """
+        if not request.output_dir:
+            request.output_dir = str(self.queue_dir / "outputs" / request.job_id)
+
         job_dir = self.queue_dir / "pending" / request.job_id
         job_dir.mkdir(parents=True, exist_ok=True)
 
         # Write request
         (job_dir / "request.json").write_text(request.to_json())
+
+        warnings = []
+        if self._is_volatile(request.output_dir):
+            warnings.append("volatile_output")
 
         # Write initial status
         state = JobState(
@@ -66,6 +85,7 @@ class GPUQueue:
             output_dir=request.output_dir,
             params=request.params,
             submitted_at=request.submitted_at,
+            warnings=warnings,
         )
         (job_dir / "status.json").write_text(state.to_json())
 
@@ -310,6 +330,7 @@ class GPUQueue:
                 "exit_code": state.exit_code,
                 "failure_phase": state.failure_phase,
                 "error_message": state.error_message,
+                "warnings": state.warnings if state.warnings else None,
             }
             (job_dir / "receipt.json").write_text(json.dumps(receipt, indent=2))
 

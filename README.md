@@ -16,11 +16,14 @@ uv pip install -e .
 ## Usage
 
 ```bash
-# Submit a job
+# Submit a job (output goes to durable dir in queue)
+gpu-greenroom submit trellis2mlx /path/to/image.png
+
+# Submit with explicit output dir
 gpu-greenroom submit trellis2mlx /path/to/image.png /path/to/output/
 
 # Submit with custom params
-gpu-greenroom submit trellis2mlx /path/to/image.png /tmp/out -p seed=99 resolution=768
+gpu-greenroom submit trellis2mlx /path/to/image.png /path/to/output/ -p seed=99 resolution=768
 
 # List queue
 gpu-greenroom list
@@ -52,6 +55,7 @@ gpu-greenroom recover
   gpu.lock              # flock file for mutual exclusion
   paused                # present when queue is paused (touch to pause, rm to resume)
   job_types.json        # optional: custom job type configs (overrides defaults)
+  outputs/              # durable output directory for jobs submitted without explicit output_dir
   pending/
     <job-id>/
       request.json      # what was submitted
@@ -140,4 +144,4 @@ Uses `flock(LOCK_EX | LOCK_NB)` on `gpu.lock`. Only one worker can run a job at 
 uv run --extra test python -m pytest tests/ -v
 ```
 
-64 tests covering serialization, failure receipts, stale recovery, cancel safety, FIFO order, param injection prevention, rich config (cwd/env/defaults), receipt route identity, configurable timeout, pause/resume, and CLI.
+72 tests covering serialization, failure receipts, stale recovery, cancel safety, FIFO order, param injection prevention, rich config (cwd/env/defaults), receipt route identity, configurable timeout, pause/resume, durable output dirs, volatile path warnings, and CLI.

@@ -103,6 +103,19 @@ class TestCLIPauseResume:
         assert rc == 0
 
 
+class TestCLISubmitDurableOutput:
+    def test_submit_without_output_dir(self, queue_dir):
+        """Submit without output_dir auto-assigns durable path."""
+        rc, out, _ = run_cli("submit", "trellis2mlx", "/tmp/test.png", queue_dir=queue_dir)
+        assert rc == 0
+        assert "auto-assigned durable" in out
+        # Job should exist in pending with an output under queue_dir/outputs/
+        pending = queue_dir / "pending"
+        job_dir = list(pending.iterdir())[0]
+        req = json.loads((job_dir / "request.json").read_text())
+        assert str(queue_dir / "outputs") in req["output_dir"]
+
+
 class TestCLIRecover:
     def test_recover_no_stale(self, queue_dir):
         rc, out, _ = run_cli("recover", queue_dir=queue_dir)
