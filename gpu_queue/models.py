@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, fields
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -34,7 +34,7 @@ class JobRequest:
     @classmethod
     def from_json(cls, text: str) -> JobRequest:
         d = json.loads(text)
-        return cls(**d)
+        return cls(**_known_fields(cls, d))
 
 
 @dataclass
@@ -64,4 +64,12 @@ class JobState:
     def from_json(cls, text: str) -> JobState:
         d = json.loads(text)
         d["status"] = JobStatus(d["status"])
-        return cls(**d)
+        if d.get("warnings") is None:
+            d["warnings"] = []
+        return cls(**_known_fields(cls, d))
+
+
+def _known_fields(cls: type, values: dict[str, Any]) -> dict[str, Any]:
+    """Keep persisted JSON forward-compatible with additive fields."""
+    names = {field.name for field in fields(cls)}
+    return {key: value for key, value in values.items() if key in names}

@@ -85,6 +85,21 @@ class TestSubmit:
         assert s2.output_dir == out2
         assert s1.output_dir != s2.output_dir
 
+    def test_list_tolerates_additive_status_fields(self, queue):
+        """Newer workers may add status fields; older list readers must not crash."""
+        req = make_request()
+        queue.submit(req)
+        status_file = queue.queue_dir / "pending" / req.job_id / "status.json"
+        status = json.loads(status_file.read_text())
+        status["worker_schema"] = "future-greenroom.v2"
+        status["warnings"] = ["volatile_output"]
+        status_file.write_text(json.dumps(status))
+
+        [state] = queue.list_jobs(JobStatus.PENDING)
+
+        assert state.job_id == req.job_id
+        assert state.warnings == ["volatile_output"]
+
 
 # --- Execution ---
 
