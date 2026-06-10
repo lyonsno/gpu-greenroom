@@ -181,6 +181,9 @@ class GPUQueue:
             return False
 
         try:
+            if self.is_paused():
+                return False
+
             job_dir = self._next_pending()
             if job_dir is None:
                 return False

@@ -688,6 +688,16 @@ class TestPauseResume:
         assert job_dir.exists()
         assert queue.get_job(req.job_id).status == JobStatus.PENDING
 
+    def test_pause_after_lock_still_skips(self, queue, echo_job_types):
+        """Pause between lock acquisition and job pickup still skips (post-flock recheck)."""
+        req = make_request()
+        queue.submit(req)
+        # Pause after submit — run_one should see it even after acquiring the lock
+        queue.pause()
+        ran = queue.run_one(echo_job_types)
+        assert ran is False
+        assert queue.get_job(req.job_id).status == JobStatus.PENDING
+
 
 # --- Durable output directory ---
 

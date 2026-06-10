@@ -128,8 +128,11 @@ def _load_job_types(queue_dir):
     job_types = dict(DEFAULT_JOB_TYPES)
     config_path = Path(queue_dir) / "job_types.json"
     if config_path.exists():
-        custom = json.loads(config_path.read_text())
-        job_types.update(custom)
+        try:
+            custom = json.loads(config_path.read_text())
+            job_types.update(custom)
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"Warning: could not load {config_path}: {e}")
     return job_types
 
 

@@ -116,6 +116,41 @@ class TestCLISubmitDurableOutput:
         assert str(queue_dir / "outputs") in req["output_dir"]
 
 
+class TestLoadJobTypes:
+    def test_loads_custom_types(self, queue_dir):
+        """_load_job_types merges custom config with defaults."""
+        from gpu_queue.cli import _load_job_types
+        queue_dir.mkdir(parents=True, exist_ok=True)
+        config = queue_dir / "job_types.json"
+        config.write_text(json.dumps({"custom_type": {"cmd": ["echo", "hi"]}}))
+        types = _load_job_types(str(queue_dir))
+        assert "custom_type" in types
+        assert "trellis2mlx" in types  # default preserved
+
+    def test_hot_reload_picks_up_changes(self, queue_dir):
+        """Calling _load_job_types again after file change returns new types."""
+        from gpu_queue.cli import _load_job_types
+        queue_dir.mkdir(parents=True, exist_ok=True)
+        config = queue_dir / "job_types.json"
+        config.write_text(json.dumps({"v1": {"cmd": ["echo", "v1"]}}))
+        types1 = _load_job_types(str(queue_dir))
+        assert "v1" in types1
+        assert "v2" not in types1
+
+        config.write_text(json.dumps({"v2": {"cmd": ["echo", "v2"]}}))
+        types2 = _load_job_types(str(queue_dir))
+        assert "v2" in types2
+
+    def test_malformed_json_falls_back(self, queue_dir):
+        """Malformed job_types.json doesn't crash, falls back to defaults."""
+        from gpu_queue.cli import _load_job_types
+        queue_dir.mkdir(parents=True, exist_ok=True)
+        config = queue_dir / "job_types.json"
+        config.write_text("{broken json")
+        types = _load_job_types(str(queue_dir))
+        assert "trellis2mlx" in types  # defaults survived
+
+
 class TestCLIRecover:
     def test_recover_no_stale(self, queue_dir):
         rc, out, _ = run_cli("recover", queue_dir=queue_dir)
