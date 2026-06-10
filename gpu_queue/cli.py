@@ -18,10 +18,13 @@ DEFAULT_QUEUE_DIR = os.environ.get("GPU_GREENROOM_DIR", os.path.expanduser("~/.l
 # Default job type configurations
 # Rich config: cmd, cwd, env, defaults
 # Bare list also accepted for simple cases
+_TRELLIS_ROOT = os.path.expanduser("~/dev/trellis2mlx")
+_PERCEPTASIA_ROOT = os.path.expanduser("~/dev/perceptasia")
+
 DEFAULT_JOB_TYPES = {
     "trellis2mlx": {
         "cmd": [
-            "python", "-u", "generate.py",
+            os.path.join(_TRELLIS_ROOT, ".venv/bin/python"), "-u", "generate.py",
             "--image", "{input_path}",
             "--output", "{output_dir}/output.glb",
             "--seed", "{seed}",
@@ -30,7 +33,7 @@ DEFAULT_JOB_TYPES = {
             "--texture-size", "{texture_size}",
             "--simplify-first",
         ],
-        "cwd": os.path.expanduser("~/dev/trellis2mlx"),
+        "cwd": _TRELLIS_ROOT,
         "env": {"PYTHONPATH": "."},
         "defaults": {
             "seed": "42",
@@ -41,11 +44,11 @@ DEFAULT_JOB_TYPES = {
     },
     "supermat": {
         "cmd": [
-            "python", "-u", "run_supermat.py",
+            os.path.join(_PERCEPTASIA_ROOT, ".venv/bin/python"), "-u", "run_supermat.py",
             "--image", "{input_path}",
             "--output-dir", "{output_dir}",
         ],
-        "cwd": os.path.expanduser("~/dev/perceptasia"),
+        "cwd": _PERCEPTASIA_ROOT,
         "env": {"PYTHONPATH": "."},
         "defaults": {},
     },

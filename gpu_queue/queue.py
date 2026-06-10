@@ -176,12 +176,14 @@ class GPUQueue:
                 job_cwd = None
                 job_env = None
                 job_defaults = {}
+                job_timeout = None
             else:
                 # Rich dict config
                 cmd_template = raw_config["cmd"]
                 job_cwd = raw_config.get("cwd")
                 job_env = raw_config.get("env")
                 job_defaults = raw_config.get("defaults", {})
+                job_timeout = raw_config.get("timeout")  # None = no timeout
 
             # Build substitution dict: defaults < user params < reserved keys
             RESERVED = {"input_path", "output_dir"}
@@ -192,6 +194,18 @@ class GPUQueue:
                 "input_path": request.input_path,
                 "output_dir": request.output_dir,
             }
+
+            # Detect ignored params: user-supplied keys not consumed by template
+            template_str = " ".join(cmd_template)
+            used_keys = set()
+            for key in subs:
+                if "{" + key + "}" in template_str:
+                    used_keys.add(key)
+            ignored_params = {
+                k: v for k, v in safe_params.items()
+                if k not in used_keys and k not in RESERVED
+            }
+
             cmd = [part.format(**subs) for part in cmd_template]
             state.effective_route = " ".join(cmd)
             (job_dir / "status.json").write_text(state.to_json())
@@ -216,7 +230,7 @@ class GPUQueue:
                         stderr=err_f,
                         cwd=job_cwd,
                         env=run_env,
-                        timeout=7200,  # 2 hour max
+                        timeout=job_timeout,
                     )
                 state.exit_code = proc.returncode
                 if proc.returncode == 0:
@@ -230,7 +244,7 @@ class GPUQueue:
             except subprocess.TimeoutExpired:
                 state.status = JobStatus.FAILED
                 state.failure_phase = "timeout"
-                state.error_message = "Job exceeded 2 hour timeout"
+                state.error_message = f"Job exceeded {job_timeout}s timeout"
                 state.exit_code = -1
                 dest_status = "failed"
             except Exception as e:
@@ -243,7 +257,7 @@ class GPUQueue:
             state.finished_at = time.time()
             (job_dir / "status.json").write_text(state.to_json())
 
-            # Write receipt
+            # Write receipt with full route identity
             receipt = {
                 "job_id": state.job_id,
                 "job_type": state.job_type,
@@ -251,6 +265,11 @@ class GPUQueue:
                 "input_path": state.input_path,
                 "output_dir": state.output_dir,
                 "effective_route": state.effective_route,
+                "effective_cwd": job_cwd,
+                "effective_env": job_env,
+                "effective_defaults": job_defaults,
+                "effective_timeout": job_timeout,
+                "ignored_params": ignored_params if ignored_params else None,
                 "started_at": state.started_at,
                 "finished_at": state.finished_at,
                 "exit_code": state.exit_code,

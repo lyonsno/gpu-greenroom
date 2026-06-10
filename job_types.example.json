@@ -1,0 +1,57 @@
+{
+  "trellis2mlx": {
+    "cmd": [
+      "/Users/noahlyons/dev/trellis2mlx/.venv/bin/python", "-u", "generate.py",
+      "--image", "{input_path}",
+      "--output", "{output_dir}/output.glb",
+      "--seed", "{seed}",
+      "--resolution", "{resolution}",
+      "--target-faces", "{target_faces}",
+      "--texture-size", "{texture_size}",
+      "--simplify-first"
+    ],
+    "cwd": "/Users/noahlyons/dev/trellis2mlx",
+    "env": {"PYTHONPATH": "."},
+    "defaults": {
+      "seed": "42",
+      "resolution": "512",
+      "target_faces": "200000",
+      "texture_size": "1024"
+    }
+  },
+  "supermat": {
+    "cmd": [
+      "/Users/noahlyons/dev/perceptasia/.venv/bin/python", "-u", "run_supermat.py",
+      "--image", "{input_path}",
+      "--output-dir", "{output_dir}"
+    ],
+    "cwd": "/Users/noahlyons/dev/perceptasia",
+    "env": {"PYTHONPATH": "."},
+    "defaults": {}
+  },
+  "moge": {
+    "cmd": [
+      "/Users/noahlyons/dev/perceptasia/.venv/bin/python", "-u", "run_moge.py",
+      "--image", "{input_path}",
+      "--output-dir", "{output_dir}"
+    ],
+    "cwd": "/Users/noahlyons/dev/perceptasia",
+    "env": {"PYTHONPATH": "."},
+    "defaults": {}
+  },
+  "pixal3d": {
+    "cmd": [
+      "/Users/noahlyons/dev/pixal3d-mlx/.venv/bin/python", "-u", "generate.py",
+      "--image", "{input_path}",
+      "--output", "{output_dir}/output.glb",
+      "--seed", "{seed}",
+      "--cascade", "{cascade}"
+    ],
+    "cwd": "/Users/noahlyons/dev/pixal3d-mlx",
+    "env": {"PYTHONPATH": "."},
+    "defaults": {
+      "seed": "42",
+      "cascade": "512"
+    }
+  }
+}

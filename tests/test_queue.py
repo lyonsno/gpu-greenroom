@@ -521,3 +521,100 @@ class TestRichJobTypeConfig:
         queue.submit(req)
         queue.run_one(echo_job_types)
         assert queue.get_job(req.job_id).status == JobStatus.DONE
+
+
+# --- Receipt route identity ---
+
+class TestReceiptRouteIdentity:
+    def test_receipt_records_effective_cwd(self, queue, tmp_path):
+        out = str(tmp_path / "out")
+        work_dir = str(tmp_path / "workdir")
+        os.makedirs(work_dir)
+        req = make_request(job_type="t", output_dir=out)
+        queue.submit(req)
+        job_types = {"t": {"cmd": ["echo", "hi"], "cwd": work_dir}}
+        queue.run_one(job_types)
+        receipt = json.loads((queue.queue_dir / "done" / req.job_id / "receipt.json").read_text())
+        assert receipt["effective_cwd"] == work_dir
+
+    def test_receipt_records_effective_env(self, queue, tmp_path):
+        out = str(tmp_path / "out")
+        req = make_request(job_type="t", output_dir=out)
+        queue.submit(req)
+        job_types = {"t": {"cmd": ["echo", "hi"], "env": {"FOO": "bar"}}}
+        queue.run_one(job_types)
+        receipt = json.loads((queue.queue_dir / "done" / req.job_id / "receipt.json").read_text())
+        assert receipt["effective_env"] == {"FOO": "bar"}
+
+    def test_receipt_records_effective_defaults(self, queue, tmp_path):
+        out = str(tmp_path / "out")
+        req = make_request(job_type="t", output_dir=out)
+        queue.submit(req)
+        job_types = {"t": {"cmd": ["echo", "{seed}"], "defaults": {"seed": "42"}}}
+        queue.run_one(job_types)
+        receipt = json.loads((queue.queue_dir / "done" / req.job_id / "receipt.json").read_text())
+        assert receipt["effective_defaults"] == {"seed": "42"}
+
+    def test_receipt_records_ignored_params(self, queue, tmp_path):
+        """Params submitted but not in template appear in receipt."""
+        out = str(tmp_path / "out")
+        req = make_request(job_type="t", output_dir=out, extra_thing="surprise")
+        queue.submit(req)
+        job_types = {"t": {"cmd": ["echo", "{input_path}"]}}
+        queue.run_one(job_types)
+        receipt = json.loads((queue.queue_dir / "done" / req.job_id / "receipt.json").read_text())
+        assert receipt["ignored_params"] is not None
+        assert "extra_thing" in receipt["ignored_params"]
+
+    def test_receipt_no_ignored_when_all_consumed(self, queue, tmp_path):
+        out = str(tmp_path / "out")
+        req = make_request(job_type="t", output_dir=out, seed="7")
+        queue.submit(req)
+        job_types = {"t": {"cmd": ["echo", "{seed}"]}}
+        queue.run_one(job_types)
+        receipt = json.loads((queue.queue_dir / "done" / req.job_id / "receipt.json").read_text())
+        assert receipt["ignored_params"] is None
+
+
+# --- Configurable timeout ---
+
+class TestConfigurableTimeout:
+    def test_no_timeout_by_default(self, queue, tmp_path):
+        """Rich config with no timeout field runs without time limit."""
+        out = str(tmp_path / "out")
+        req = make_request(job_type="t", output_dir=out)
+        queue.submit(req)
+        job_types = {"t": {"cmd": ["echo", "ok"]}}
+        queue.run_one(job_types)
+        state = queue.get_job(req.job_id)
+        assert state.status == JobStatus.DONE
+        receipt = json.loads((queue.queue_dir / "done" / req.job_id / "receipt.json").read_text())
+        assert receipt["effective_timeout"] is None
+
+    def test_explicit_timeout_recorded_in_receipt(self, queue, tmp_path):
+        out = str(tmp_path / "out")
+        req = make_request(job_type="t", output_dir=out)
+        queue.submit(req)
+        job_types = {"t": {"cmd": ["echo", "ok"], "timeout": 3600}}
+        queue.run_one(job_types)
+        receipt = json.loads((queue.queue_dir / "done" / req.job_id / "receipt.json").read_text())
+        assert receipt["effective_timeout"] == 3600
+
+    def test_timeout_triggers_failure(self, queue, tmp_path):
+        out = str(tmp_path / "out")
+        req = make_request(job_type="t", output_dir=out)
+        queue.submit(req)
+        # 0.1s timeout on a 10s sleep
+        job_types = {"t": {"cmd": ["sleep", "10"], "timeout": 0.1}}
+        queue.run_one(job_types)
+        state = queue.get_job(req.job_id)
+        assert state.status == JobStatus.FAILED
+        assert state.failure_phase == "timeout"
+
+    def test_bare_list_has_no_timeout(self, queue):
+        """Bare list job types run without timeout (no artificial limit)."""
+        req = make_request()
+        queue.submit(req)
+        queue.run_one({"echo": ["echo", "hi"]})
+        state = queue.get_job(req.job_id)
+        assert state.status == JobStatus.DONE
