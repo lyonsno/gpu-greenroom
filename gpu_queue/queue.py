@@ -185,9 +185,14 @@ class GPUQueue:
                 job_defaults = raw_config.get("defaults", {})
                 job_timeout = raw_config.get("timeout")  # None = no timeout
 
-            # Build substitution dict: defaults < user params < reserved keys
+            # Per-job overrides: cwd and env from params (removed before template subs)
+            OVERRIDE_KEYS = {"cwd", "env"}
             RESERVED = {"input_path", "output_dir"}
-            safe_params = {k: v for k, v in request.params.items() if k not in RESERVED}
+            if "cwd" in request.params:
+                job_cwd = request.params["cwd"]
+            if "env" in request.params and isinstance(request.params.get("env"), dict):
+                job_env = {**(job_env or {}), **request.params["env"]}
+            safe_params = {k: v for k, v in request.params.items() if k not in RESERVED and k not in OVERRIDE_KEYS}
             subs = {
                 **job_defaults,
                 **safe_params,

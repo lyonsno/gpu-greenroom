@@ -26,7 +26,7 @@ DEFAULT_JOB_TYPES = {
         "cmd": [
             os.path.join(_TRELLIS_ROOT, ".venv/bin/python"), "-u", "generate.py",
             "--image", "{input_path}",
-            "--output", "{output_dir}/output.glb",
+            "--output", "{output_dir}/seed-{seed}.glb",
             "--seed", "{seed}",
             "--resolution", "{resolution}",
             "--target-faces", "{target_faces}",
@@ -66,6 +66,8 @@ def cmd_submit(args):
         for p in args.params:
             k, v = p.split("=", 1)
             params[k] = v
+    if args.cwd:
+        params["cwd"] = args.cwd
 
     request = JobRequest(
         job_type=args.job_type,
@@ -78,6 +80,8 @@ def cmd_submit(args):
     print(f"  Type: {request.job_type}")
     print(f"  Input: {request.input_path}")
     print(f"  Output: {request.output_dir}")
+    if args.cwd:
+        print(f"  Cwd: {args.cwd}")
     print(f"  Dir: {job_dir}")
 
 
@@ -178,6 +182,7 @@ def main():
     p_submit.add_argument("input", help="Input file path")
     p_submit.add_argument("output_dir", help="Output directory")
     p_submit.add_argument("-p", "--params", nargs="*", help="Key=value params (e.g. seed=42)")
+    p_submit.add_argument("--cwd", help="Override working directory (e.g. for branch/worktree)")
     p_submit.set_defaults(func=cmd_submit)
 
     # list
