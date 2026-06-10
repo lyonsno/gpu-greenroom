@@ -123,16 +123,21 @@ def cmd_cancel(args):
         sys.exit(1)
 
 
+def _load_job_types(queue_dir):
+    """Load job types from defaults + config file. Called per-job so new types are picked up live."""
+    job_types = dict(DEFAULT_JOB_TYPES)
+    config_path = Path(queue_dir) / "job_types.json"
+    if config_path.exists():
+        custom = json.loads(config_path.read_text())
+        job_types.update(custom)
+    return job_types
+
+
 def cmd_worker(args):
     """Run the worker loop — picks and runs jobs sequentially."""
     queue = get_queue(args)
 
-    # Load job types from config file if it exists
-    job_types = dict(DEFAULT_JOB_TYPES)
-    config_path = Path(args.queue_dir) / "job_types.json"
-    if config_path.exists():
-        custom = json.loads(config_path.read_text())
-        job_types.update(custom)
+    job_types = _load_job_types(args.queue_dir)
 
     print(f"GPU Greenroom Worker starting")
     print(f"  Queue dir: {args.queue_dir}")
@@ -156,6 +161,7 @@ def cmd_worker(args):
             if was_paused:
                 print("Queue resumed.")
                 was_paused = False
+            job_types = _load_job_types(args.queue_dir)
             ran = queue.run_one(job_types)
             if ran:
                 # Check for more immediately
