@@ -142,8 +142,18 @@ def cmd_worker(args):
     if recovered:
         print(f"  Recovered {len(recovered)} stale job(s): {', '.join(recovered)}")
 
+    was_paused = False
     try:
         while True:
+            if queue.is_paused():
+                if not was_paused:
+                    print("Queue paused. Waiting for resume...")
+                    was_paused = True
+                time.sleep(args.poll)
+                continue
+            if was_paused:
+                print("Queue resumed.")
+                was_paused = False
             ran = queue.run_one(job_types)
             if ran:
                 # Check for more immediately
@@ -151,6 +161,18 @@ def cmd_worker(args):
             time.sleep(args.poll)
     except KeyboardInterrupt:
         print("\nWorker stopped.")
+
+
+def cmd_pause(args):
+    queue = get_queue(args)
+    queue.pause()
+    print("Queue paused. Worker will finish current job then wait.")
+
+
+def cmd_resume(args):
+    queue = get_queue(args)
+    queue.resume()
+    print("Queue resumed.")
 
 
 def cmd_recover(args):
@@ -204,6 +226,14 @@ def main():
     p_worker = sub.add_parser("worker", help="Run the worker loop")
     p_worker.add_argument("--poll", type=float, default=2.0, help="Poll interval in seconds")
     p_worker.set_defaults(func=cmd_worker)
+
+    # pause
+    p_pause = sub.add_parser("pause", help="Pause the queue (finish current job, then wait)")
+    p_pause.set_defaults(func=cmd_pause)
+
+    # resume
+    p_resume = sub.add_parser("resume", help="Resume a paused queue")
+    p_resume.set_defaults(func=cmd_resume)
 
     # recover
     p_recover = sub.add_parser("recover", help="Recover stale running jobs")

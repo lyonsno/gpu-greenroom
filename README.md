@@ -9,7 +9,7 @@ Heavy spatial-AI generation jobs (TRELLIS2MLX, Pixal3D, SuperMat, MoGe) share a 
 ## Install
 
 ```bash
-cd /private/tmp/gpu-greenroom
+cd ~/dev/gpu-greenroom
 uv pip install -e .
 ```
 
@@ -35,6 +35,12 @@ gpu-greenroom cancel <job-id>
 # Start the worker (runs jobs sequentially, polls every 2s)
 gpu-greenroom worker
 
+# Pause the queue (finishes current job, then waits)
+gpu-greenroom pause
+
+# Resume a paused queue
+gpu-greenroom resume
+
 # Recover stale jobs after crash
 gpu-greenroom recover
 ```
@@ -44,6 +50,7 @@ gpu-greenroom recover
 ```
 ~/.local/state/gpu-greenroom/
   gpu.lock              # flock file for mutual exclusion
+  paused                # present when queue is paused (touch to pause, rm to resume)
   job_types.json        # optional: custom job type configs (overrides defaults)
   pending/
     <job-id>/
@@ -133,4 +140,4 @@ Uses `flock(LOCK_EX | LOCK_NB)` on `gpu.lock`. Only one worker can run a job at 
 uv run --extra test python -m pytest tests/ -v
 ```
 
-52 tests covering serialization, failure receipts, stale recovery, cancel safety, FIFO order, param injection prevention, rich config (cwd/env/defaults), receipt route identity, configurable timeout, and CLI.
+64 tests covering serialization, failure receipts, stale recovery, cancel safety, FIFO order, param injection prevention, rich config (cwd/env/defaults), receipt route identity, configurable timeout, pause/resume, and CLI.

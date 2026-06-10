@@ -628,3 +628,62 @@ class TestConfigurableTimeout:
         queue.run_one({"echo": ["echo", "hi"]})
         state = queue.get_job(req.job_id)
         assert state.status == JobStatus.DONE
+
+
+# --- Pause/resume ---
+
+class TestPauseResume:
+    def test_pause_creates_marker(self, queue):
+        queue.pause()
+        assert queue.is_paused()
+        assert queue.pause_path.exists()
+
+    def test_resume_removes_marker(self, queue):
+        queue.pause()
+        queue.resume()
+        assert not queue.is_paused()
+        assert not queue.pause_path.exists()
+
+    def test_resume_when_not_paused_is_noop(self, queue):
+        queue.resume()  # should not raise
+        assert not queue.is_paused()
+
+    def test_pause_is_idempotent(self, queue):
+        queue.pause()
+        queue.pause()
+        assert queue.is_paused()
+
+    def test_run_one_skips_when_paused(self, queue, echo_job_types):
+        """Paused worker must not pick up new jobs."""
+        req = make_request()
+        queue.submit(req)
+        queue.pause()
+        ran = queue.run_one(echo_job_types)
+        assert ran is False
+        state = queue.get_job(req.job_id)
+        assert state.status == JobStatus.PENDING  # still pending, not consumed
+
+    def test_run_one_resumes_after_unpause(self, queue, echo_job_types):
+        req = make_request()
+        queue.submit(req)
+        queue.pause()
+        assert queue.run_one(echo_job_types) is False
+        queue.resume()
+        assert queue.run_one(echo_job_types) is True
+        assert queue.get_job(req.job_id).status == JobStatus.DONE
+
+    def test_pause_does_not_affect_cancel(self, queue):
+        """Cancel still works while paused."""
+        req = make_request()
+        queue.submit(req)
+        queue.pause()
+        assert queue.cancel(req.job_id) is True
+        assert queue.get_job(req.job_id).status == JobStatus.CANCELLED
+
+    def test_pause_does_not_affect_submit(self, queue):
+        """Submit still works while paused."""
+        queue.pause()
+        req = make_request()
+        job_dir = queue.submit(req)
+        assert job_dir.exists()
+        assert queue.get_job(req.job_id).status == JobStatus.PENDING

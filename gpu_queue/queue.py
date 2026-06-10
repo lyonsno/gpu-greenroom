@@ -34,6 +34,21 @@ class GPUQueue:
     def lock_path(self) -> Path:
         return self.queue_dir / "gpu.lock"
 
+    @property
+    def pause_path(self) -> Path:
+        return self.queue_dir / "paused"
+
+    def pause(self) -> None:
+        """Pause the queue. The worker finishes its current job then waits."""
+        self.pause_path.touch()
+
+    def resume(self) -> None:
+        """Resume a paused queue."""
+        self.pause_path.unlink(missing_ok=True)
+
+    def is_paused(self) -> bool:
+        return self.pause_path.exists()
+
     def submit(self, request: JobRequest) -> Path:
         """Submit a job. Returns the job directory path."""
         job_dir = self.queue_dir / "pending" / request.job_id
@@ -134,6 +149,9 @@ class GPUQueue:
 
         Returns True if a job was run, False if queue was empty.
         """
+        if self.is_paused():
+            return False
+
         lock_fd = open(self.lock_path, "w")
         try:
             # Non-blocking lock attempt

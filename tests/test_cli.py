@@ -15,7 +15,7 @@ def run_cli(*args, queue_dir=None):
     if queue_dir:
         cmd.extend(["--queue-dir", str(queue_dir)])
     cmd.extend(args)
-    result = subprocess.run(cmd, capture_output=True, text=True, cwd="/private/tmp/gpu-greenroom")
+    result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(Path(__file__).resolve().parent.parent))
     return result.returncode, result.stdout, result.stderr
 
 
@@ -82,6 +82,25 @@ class TestCLICancel:
     def test_cancel_nonexistent(self, queue_dir):
         rc, out, _ = run_cli("cancel", "nonexistent", queue_dir=queue_dir)
         assert rc == 1
+
+
+class TestCLIPauseResume:
+    def test_pause_cli(self, queue_dir):
+        rc, out, _ = run_cli("pause", queue_dir=queue_dir)
+        assert rc == 0
+        assert "paused" in out.lower()
+        assert (queue_dir / "paused").exists()
+
+    def test_resume_cli(self, queue_dir):
+        run_cli("pause", queue_dir=queue_dir)
+        rc, out, _ = run_cli("resume", queue_dir=queue_dir)
+        assert rc == 0
+        assert "resumed" in out.lower()
+        assert not (queue_dir / "paused").exists()
+
+    def test_resume_when_not_paused(self, queue_dir):
+        rc, out, _ = run_cli("resume", queue_dir=queue_dir)
+        assert rc == 0
 
 
 class TestCLIRecover:
