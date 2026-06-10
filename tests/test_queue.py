@@ -12,11 +12,9 @@ Evidence harness contract (from Kynormous council pressure):
 import fcntl
 import json
 import os
-import subprocess
 import tempfile
 import time
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
@@ -406,6 +404,18 @@ class TestEffectiveRoute:
         state = queue.get_job(req.job_id)
         assert "/tmp/evil" not in state.effective_route
         assert real_out in state.effective_route
+
+    def test_param_value_braces_not_expanded(self, queue, tmp_path):
+        """Param values containing {braces} must not be format-expanded."""
+        out = str(tmp_path / "out")
+        req = make_request(job_type="echo", output_dir=out)
+        req.params["seed"] = "{input_path}"  # sneaky value
+        queue.submit(req)
+        job_types = {"echo": {"cmd": ["sh", "-c", "echo {seed} > {output_dir}/val.txt"]}}
+        queue.run_one(job_types)
+        result = (Path(out) / "val.txt").read_text().strip()
+        # Should be the literal string {input_path}, not the expanded path
+        assert result == "{input_path}"
 
     def test_effective_route_distinct_from_request(self, queue):
         """Requested route vs effective route are separate fields."""

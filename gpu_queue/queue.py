@@ -206,7 +206,19 @@ class GPUQueue:
                 if k not in used_keys and k not in RESERVED
             }
 
-            cmd = [part.format(**subs) for part in cmd_template]
+            # Safe substitution: replace all placeholders in one pass to prevent
+            # chained expansion (e.g. param value "{input_path}" must stay literal)
+            import re
+
+            def safe_substitute(template: str, mapping: dict) -> str:
+                def replacer(match):
+                    key = match.group(1)
+                    if key in mapping:
+                        return str(mapping[key])
+                    return match.group(0)  # leave unrecognized placeholders as-is
+                return re.sub(r'\{(\w+)\}', replacer, template)
+
+            cmd = [safe_substitute(part, subs) for part in cmd_template]
             state.effective_route = " ".join(cmd)
             (job_dir / "status.json").write_text(state.to_json())
 
@@ -288,44 +300,52 @@ class GPUQueue:
     def recover_stale(self) -> list[str]:
         """Check for stale running jobs (process no longer alive) and move to failed.
 
+        Acquires flock to prevent race with run_one().
         Returns list of recovered job IDs.
         """
-        recovered = []
-        running_dir = self.queue_dir / "running"
-        if not running_dir.exists():
-            return recovered
+        lock_fd = open(self.lock_path, "w")
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
 
-        for job_dir in running_dir.iterdir():
-            status_file = job_dir / "status.json"
-            if not status_file.exists():
-                continue
-            state = JobState.from_json(status_file.read_text())
-            if state.pid is not None:
-                try:
-                    os.kill(state.pid, 0)  # check if process is alive
-                except PermissionError:
-                    # PID exists but belongs to another user — treat as alive, skip
+            recovered = []
+            running_dir = self.queue_dir / "running"
+            if not running_dir.exists():
+                return recovered
+
+            for job_dir in list(running_dir.iterdir()):
+                status_file = job_dir / "status.json"
+                if not status_file.exists():
                     continue
-                except ProcessLookupError:
-                    # PID does not exist — stale job
-                    state.status = JobStatus.FAILED
-                    state.finished_at = time.time()
-                    state.failure_phase = "stale_recovery"
-                    state.error_message = f"Process {state.pid} no longer alive; recovered by stale detection"
-                    state.exit_code = -1
-                    (status_file).write_text(state.to_json())
+                state = JobState.from_json(status_file.read_text())
+                if state.pid is not None:
+                    try:
+                        os.kill(state.pid, 0)  # check if process is alive
+                    except PermissionError:
+                        # PID exists but belongs to another user — treat as alive, skip
+                        continue
+                    except ProcessLookupError:
+                        # PID does not exist — stale job
+                        state.status = JobStatus.FAILED
+                        state.finished_at = time.time()
+                        state.failure_phase = "stale_recovery"
+                        state.error_message = f"Process {state.pid} no longer alive; recovered by stale detection"
+                        state.exit_code = -1
+                        (status_file).write_text(state.to_json())
 
-                    receipt = {
-                        "job_id": state.job_id,
-                        "job_type": state.job_type,
-                        "status": "failed",
-                        "failure_phase": "stale_recovery",
-                        "error_message": state.error_message,
-                        "started_at": state.started_at,
-                        "finished_at": state.finished_at,
-                    }
-                    (job_dir / "receipt.json").write_text(json.dumps(receipt, indent=2))
+                        receipt = {
+                            "job_id": state.job_id,
+                            "job_type": state.job_type,
+                            "status": "failed",
+                            "failure_phase": "stale_recovery",
+                            "error_message": state.error_message,
+                            "started_at": state.started_at,
+                            "finished_at": state.finished_at,
+                        }
+                        (job_dir / "receipt.json").write_text(json.dumps(receipt, indent=2))
 
-                    self._move_job(job_dir, "failed")
-                    recovered.append(state.job_id)
-        return recovered
+                        self._move_job(job_dir, "failed")
+                        recovered.append(state.job_id)
+            return recovered
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
