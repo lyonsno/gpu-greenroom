@@ -158,9 +158,9 @@ class GPUQueue:
             state.started_at = time.time()
             state.pid = os.getpid()
 
-            # Resolve command template
-            cmd_template = job_types.get(request.job_type)
-            if cmd_template is None:
+            # Resolve job type config — supports bare list or rich dict
+            raw_config = job_types.get(request.job_type)
+            if raw_config is None:
                 state.status = JobStatus.FAILED
                 state.finished_at = time.time()
                 state.failure_phase = "dispatch"
@@ -170,21 +170,39 @@ class GPUQueue:
                 self._move_job(job_dir, "failed")
                 return True
 
-            # Reserved keys always win over user params to prevent override attacks
+            if isinstance(raw_config, list):
+                # Bare list: backwards compat
+                cmd_template = raw_config
+                job_cwd = None
+                job_env = None
+                job_defaults = {}
+            else:
+                # Rich dict config
+                cmd_template = raw_config["cmd"]
+                job_cwd = raw_config.get("cwd")
+                job_env = raw_config.get("env")
+                job_defaults = raw_config.get("defaults", {})
+
+            # Build substitution dict: defaults < user params < reserved keys
             RESERVED = {"input_path", "output_dir"}
             safe_params = {k: v for k, v in request.params.items() if k not in RESERVED}
             subs = {
+                **job_defaults,
                 **safe_params,
                 "input_path": request.input_path,
                 "output_dir": request.output_dir,
             }
-            # Use string.Template-style replacement to prevent format-string attacks
             cmd = [part.format(**subs) for part in cmd_template]
             state.effective_route = " ".join(cmd)
             (job_dir / "status.json").write_text(state.to_json())
 
             # Ensure output directory exists
             os.makedirs(request.output_dir, exist_ok=True)
+
+            # Build subprocess environment
+            run_env = None
+            if job_env:
+                run_env = {**os.environ, **job_env}
 
             # Execute
             stdout_path = job_dir / "stdout.log"
@@ -196,6 +214,8 @@ class GPUQueue:
                         cmd,
                         stdout=out_f,
                         stderr=err_f,
+                        cwd=job_cwd,
+                        env=run_env,
                         timeout=7200,  # 2 hour max
                     )
                 state.exit_code = proc.returncode

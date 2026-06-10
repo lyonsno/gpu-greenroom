@@ -418,3 +418,106 @@ class TestEffectiveRoute:
         assert state.job_type == "echo"
         assert "echo" in state.effective_route
         assert "/my/image.png" in state.effective_route
+
+
+# --- Rich job type config ---
+
+class TestRichJobTypeConfig:
+    def test_dict_config_with_cmd(self, queue, tmp_path):
+        """Job types can be dicts with cmd, cwd, env, defaults."""
+        out = str(tmp_path / "out")
+        req = make_request(job_type="rich", output_dir=out)
+        queue.submit(req)
+        job_types = {
+            "rich": {
+                "cmd": ["echo", "hello from {input_path}"],
+            },
+        }
+        queue.run_one(job_types)
+        state = queue.get_job(req.job_id)
+        assert state.status == JobStatus.DONE
+
+    def test_cwd_is_respected(self, queue, tmp_path):
+        """cwd field sets the working directory for the subprocess."""
+        out = str(tmp_path / "out")
+        work_dir = str(tmp_path / "workdir")
+        os.makedirs(work_dir)
+        req = make_request(job_type="cwd_test", output_dir=out)
+        queue.submit(req)
+        job_types = {
+            "cwd_test": {
+                "cmd": ["sh", "-c", "pwd > {output_dir}/cwd.txt"],
+                "cwd": work_dir,
+            },
+        }
+        queue.run_one(job_types)
+        assert (Path(out) / "cwd.txt").read_text().strip() == work_dir
+
+    def test_env_is_passed(self, queue, tmp_path):
+        """env dict merges into subprocess environment."""
+        out = str(tmp_path / "out")
+        req = make_request(job_type="env_test", output_dir=out)
+        queue.submit(req)
+        job_types = {
+            "env_test": {
+                "cmd": ["sh", "-c", "echo $MY_TEST_VAR > {output_dir}/env.txt"],
+                "env": {"MY_TEST_VAR": "greenroom_works"},
+            },
+        }
+        queue.run_one(job_types)
+        assert (Path(out) / "env.txt").read_text().strip() == "greenroom_works"
+
+    def test_defaults_fill_missing_params(self, queue, tmp_path):
+        """defaults provide fallback values for unspecified params."""
+        out = str(tmp_path / "out")
+        req = make_request(job_type="defaults_test", output_dir=out)
+        # No seed param specified
+        queue.submit(req)
+        job_types = {
+            "defaults_test": {
+                "cmd": ["sh", "-c", "echo {seed} > {output_dir}/seed.txt"],
+                "defaults": {"seed": "42"},
+            },
+        }
+        queue.run_one(job_types)
+        assert (Path(out) / "seed.txt").read_text().strip() == "42"
+
+    def test_user_params_override_defaults(self, queue, tmp_path):
+        """User-supplied params take precedence over defaults."""
+        out = str(tmp_path / "out")
+        req = make_request(job_type="defaults_test", output_dir=out, seed="99")
+        queue.submit(req)
+        job_types = {
+            "defaults_test": {
+                "cmd": ["sh", "-c", "echo {seed} > {output_dir}/seed.txt"],
+                "defaults": {"seed": "42"},
+            },
+        }
+        queue.run_one(job_types)
+        assert (Path(out) / "seed.txt").read_text().strip() == "99"
+
+    def test_cwd_with_env_and_defaults(self, queue, tmp_path):
+        """All config fields work together."""
+        out = str(tmp_path / "out")
+        work_dir = str(tmp_path / "workdir")
+        os.makedirs(work_dir)
+        req = make_request(job_type="full", output_dir=out)
+        queue.submit(req)
+        job_types = {
+            "full": {
+                "cmd": ["sh", "-c", "echo $REPO:{seed}:$(pwd) > {output_dir}/combo.txt"],
+                "cwd": work_dir,
+                "env": {"REPO": "/dev/trellis2mlx"},
+                "defaults": {"seed": "7"},
+            },
+        }
+        queue.run_one(job_types)
+        result = (Path(out) / "combo.txt").read_text().strip()
+        assert result == f"/dev/trellis2mlx:7:{work_dir}"
+
+    def test_bare_list_still_works(self, queue, echo_job_types):
+        """Backwards compat: bare list job types still work."""
+        req = make_request()
+        queue.submit(req)
+        queue.run_one(echo_job_types)
+        assert queue.get_job(req.job_id).status == JobStatus.DONE

@@ -16,18 +16,39 @@ from .queue import GPUQueue
 DEFAULT_QUEUE_DIR = os.environ.get("GPU_GREENROOM_DIR", os.path.expanduser("~/.local/state/gpu-greenroom"))
 
 # Default job type configurations
+# Rich config: cmd, cwd, env, defaults
+# Bare list also accepted for simple cases
 DEFAULT_JOB_TYPES = {
-    "trellis2mlx": [
-        "python", "generate.py",
-        "--image", "{input_path}",
-        "--output", "{output_dir}/output.glb",
-        "--seed", "{seed}",
-    ],
-    "supermat": [
-        "python", "run_supermat.py",
-        "--image", "{input_path}",
-        "--output-dir", "{output_dir}",
-    ],
+    "trellis2mlx": {
+        "cmd": [
+            "python", "-u", "generate.py",
+            "--image", "{input_path}",
+            "--output", "{output_dir}/output.glb",
+            "--seed", "{seed}",
+            "--resolution", "{resolution}",
+            "--target-faces", "{target_faces}",
+            "--texture-size", "{texture_size}",
+            "--simplify-first",
+        ],
+        "cwd": os.path.expanduser("~/dev/trellis2mlx"),
+        "env": {"PYTHONPATH": "."},
+        "defaults": {
+            "seed": "42",
+            "resolution": "512",
+            "target_faces": "200000",
+            "texture_size": "1024",
+        },
+    },
+    "supermat": {
+        "cmd": [
+            "python", "-u", "run_supermat.py",
+            "--image", "{input_path}",
+            "--output-dir", "{output_dir}",
+        ],
+        "cwd": os.path.expanduser("~/dev/perceptasia"),
+        "env": {"PYTHONPATH": "."},
+        "defaults": {},
+    },
 }
 
 
@@ -42,10 +63,6 @@ def cmd_submit(args):
         for p in args.params:
             k, v = p.split("=", 1)
             params[k] = v
-
-    # Default seed if not specified for trellis2mlx
-    if args.job_type == "trellis2mlx" and "seed" not in params:
-        params["seed"] = "42"
 
     request = JobRequest(
         job_type=args.job_type,
