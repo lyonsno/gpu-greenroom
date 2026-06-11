@@ -1,10 +1,12 @@
 # gpu-greenroom
 
-Filesystem-backed GPU job queue with flock serialization. One GPU job at a time, strict FIFO, crash-safe receipts.
+Filesystem-backed GPU job queue with flock serialization and durable smoke evidence custody. One GPU job at a time, strict FIFO, crash-safe receipts, and default outputs that survive worker crashes and machine reboots.
 
 ## Problem
 
 Heavy spatial-AI generation jobs (TRELLIS2MLX, Pixal3D, SuperMat, MoGe) share a single Mac GPU. Running multiple jobs concurrently risks kernel panics, Metal scheduler deadlocks, and OOM crashes. gpu-greenroom serializes GPU-bound work so only one job runs at a time.
+
+Greenroom is also an evidence surface. A completed smoke is only useful if its primary artifacts, logs, route identity, seed, input image, and effective config remain inspectable after the box falls over. Do not put proof-bearing GLBs, render witnesses, or generated assets under `/tmp`, `/private/tmp`, `/var/tmp`, or cleanup worktrees. Those paths are disposable diagnostics, not smoke custody.
 
 ## Install
 
@@ -16,14 +18,14 @@ uv pip install -e .
 ## Usage
 
 ```bash
-# Submit a job (output goes to durable dir in queue)
+# Submit a job; output auto-goes to durable queue_dir/outputs/<job-id>/
 gpu-greenroom submit trellis2mlx /path/to/image.png
 
-# Submit with explicit output dir
-gpu-greenroom submit trellis2mlx /path/to/image.png /path/to/output/
+# Submit with explicit durable output dir
+gpu-greenroom submit trellis2mlx /path/to/image.png ~/.local/state/gpu-greenroom/outputs/manual/trellis-smoke-2026-06-11/
 
-# Submit with custom params
-gpu-greenroom submit trellis2mlx /path/to/image.png /path/to/output/ -p seed=99 resolution=768
+# Submit with custom params; provenance is recorded in request/status/receipt
+gpu-greenroom submit trellis2mlx /path/to/image.png -p seed=99 resolution=512 texture_size=4096
 
 # List queue
 gpu-greenroom list
@@ -47,6 +49,33 @@ gpu-greenroom resume
 # Recover stale jobs after crash
 gpu-greenroom recover
 ```
+
+## Durable smoke output contract
+
+For proof-bearing smokes, prefer omitting `output_dir`. Greenroom then assigns:
+
+```text
+<queue-dir>/outputs/<job-id>/
+```
+
+With the default queue directory, that is:
+
+```text
+~/.local/state/gpu-greenroom/outputs/<job-id>/
+```
+
+This is the normal path for Trellis2MLX/Pixal3D smoke runs where the GLB, texture outputs, renders, or witness files need to survive reboot and be reviewed later.
+
+Explicit output directories are allowed, but they are caller custody. Before submitting a proof-bearing job with an explicit output path, make sure the path is durable and recorded in the source note, manifest, issue, or operator handoff that asked for the run. Good explicit bases look like:
+
+```text
+~/.local/state/gpu-greenroom/outputs/<project>/<run-id>/
+/Users/noahlyons/dev/<project>/artifacts/<run-id>/
+```
+
+Bad evidence bases include `/tmp`, `/private/tmp`, `/var/tmp`, and worktrees under cleanup locations such as `/private/tmp/<repo>-<slice>`. Greenroom does not reject them because they are useful for quick disposable diagnostics, but it marks the job with `volatile_output` in `status.json` and `receipt.json`. Treat that warning as: this output is not acceptable as proof unless it has been copied or regenerated into a durable path before the volatile location disappears.
+
+Logs and receipts are not replacements for primary artifacts. After a kernel panic or reboot, a volatile-output job may still leave enough queue metadata to prove route identity, input provenance, seed, timing, and approximate output stats, but the generated GLB or render may be gone. That is recovery evidence, not a completed smoke artifact.
 
 ## Queue directory layout
 
@@ -80,6 +109,8 @@ gpu-greenroom recover
 ```
 
 Override the queue directory with `GPU_GREENROOM_DIR` or `--queue-dir`.
+
+If you override the queue directory for evidence-bearing work, choose a durable filesystem location. A queue under `/tmp` makes the queue records and default outputs volatile together.
 
 ## Job type config
 
@@ -123,6 +154,8 @@ Every completed or failed job gets a `receipt.json`:
   "error_message": null
 }
 ```
+
+The receipt records the effective route, cwd, defaults, timeout, ignored params, warnings, and output directory that actually ran. Use the receipt to verify seed provenance and image provenance, but inspect the output artifact itself before calling a visual smoke successful.
 
 ## Failure phases
 
