@@ -154,6 +154,40 @@ class GPUQueue:
         jobs.sort(key=lambda x: x[0])
         return jobs[0][1]
 
+    def _write_metadata_sidecar(self, request: JobRequest, state: JobState):
+        """Write metadata.json into output_dir for asset browser consumption."""
+        out = Path(request.output_dir)
+        if not out.is_dir():
+            return
+
+        # Derive a human-readable name from input filename if not provided
+        name = request.params.get("name", "")
+        if not name:
+            inp = Path(request.input_path)
+            name = inp.stem  # e.g. "dragon" from "dragon.png"
+
+        # Collect output files
+        output_files = [
+            f.name for f in sorted(out.iterdir())
+            if f.is_file() and not f.name.startswith(".")
+            and f.name != "metadata.json"
+        ]
+
+        metadata = {
+            "name": name,
+            "job_type": request.job_type,
+            "job_id": request.job_id,
+            "input_path": request.input_path,
+            "input_name": Path(request.input_path).name,
+            "params": request.params,
+            "output_files": output_files,
+            "created_at": state.finished_at,
+            "duration_s": round(state.finished_at - state.started_at, 1)
+            if state.started_at and state.finished_at else None,
+        }
+
+        (out / "metadata.json").write_text(json.dumps(metadata, indent=2))
+
     def _move_job(self, job_dir: Path, dest_status: str) -> Path:
         """Move a job directory to a new status folder."""
         dest = self.queue_dir / dest_status / job_dir.name
@@ -336,6 +370,10 @@ class GPUQueue:
                 "warnings": state.warnings if state.warnings else None,
             }
             (job_dir / "receipt.json").write_text(json.dumps(receipt, indent=2))
+
+            # Write metadata sidecar into output_dir for asset browsers
+            if state.status == JobStatus.DONE:
+                self._write_metadata_sidecar(request, state)
 
             self._move_job(job_dir, dest_status)
             return True

@@ -771,3 +771,64 @@ class TestDurableOutputDir:
         state = queue.get_job(req.job_id)
         assert (Path(state.output_dir) / "result.txt").exists()
         assert (Path(state.output_dir) / "result.txt").read_text().strip() == "data"
+
+
+class TestMetadataSidecar:
+    def test_metadata_written_on_success(self, queue, tmp_path):
+        """Successful job writes metadata.json into output_dir."""
+        out_dir = str(tmp_path / "output")
+        req = make_request(
+            job_type="write_output",
+            input_path="/home/user/images/dragon.png",
+            output_dir=out_dir,
+            seed="42",
+            resolution="512",
+        )
+        queue.submit(req)
+        queue.run_one({"write_output": ["sh", "-c", "echo result > {output_dir}/result.txt"]})
+        meta_path = Path(out_dir) / "metadata.json"
+        assert meta_path.exists()
+        meta = json.loads(meta_path.read_text())
+        assert meta["name"] == "dragon"
+        assert meta["job_type"] == "write_output"
+        assert meta["job_id"] == req.job_id
+        assert meta["input_name"] == "dragon.png"
+        assert meta["params"]["seed"] == "42"
+        assert meta["params"]["resolution"] == "512"
+        assert "result.txt" in meta["output_files"]
+        assert "metadata.json" not in meta["output_files"]
+        assert meta["created_at"] is not None
+        assert meta["duration_s"] is not None
+
+    def test_metadata_not_written_on_failure(self, queue, tmp_path):
+        """Failed job does not write metadata.json."""
+        out_dir = str(tmp_path / "output")
+        os.makedirs(out_dir, exist_ok=True)
+        req = make_request(job_type="failing", output_dir=out_dir)
+        queue.submit(req)
+        queue.run_one({"failing": ["false"]})
+        assert not (Path(out_dir) / "metadata.json").exists()
+
+    def test_metadata_uses_name_param(self, queue, tmp_path):
+        """User-provided name param overrides input filename."""
+        out_dir = str(tmp_path / "output")
+        req = make_request(
+            job_type="write_output",
+            input_path="/tmp/IMG_0042.png",
+            output_dir=out_dir,
+            name="golden-goblet",
+        )
+        queue.submit(req)
+        queue.run_one({"write_output": ["sh", "-c", "echo ok > {output_dir}/out.glb"]})
+        meta = json.loads((Path(out_dir) / "metadata.json").read_text())
+        assert meta["name"] == "golden-goblet"
+
+    def test_metadata_includes_duration(self, queue, tmp_path):
+        """Duration is computed from started_at and finished_at."""
+        out_dir = str(tmp_path / "output")
+        req = make_request(job_type="write_output", output_dir=out_dir)
+        queue.submit(req)
+        queue.run_one({"write_output": ["sh", "-c", "echo x > {output_dir}/x.txt"]})
+        meta = json.loads((Path(out_dir) / "metadata.json").read_text())
+        assert isinstance(meta["duration_s"], (int, float))
+        assert meta["duration_s"] >= 0
