@@ -119,6 +119,35 @@ class TestCLIPauseResume:
         rc, out, _ = run_cli("resume", queue_dir=queue_dir)
         assert rc == 0
 
+    def test_request_checkpoint_pause_cli(self, queue_dir):
+        run_cli("submit", "trellis2mlx", "/tmp/test.png", str(queue_dir / "out"), queue_dir=queue_dir)
+        job_id = list((queue_dir / "pending").iterdir())[0].name
+
+        rc, out, err = run_cli("request-checkpoint-pause", job_id, queue_dir=queue_dir)
+
+        assert rc == 0, err
+        assert "Checkpoint pause requested" in out
+        stop_file = queue_dir / "out" / "_control" / "checkpoint-stop"
+        request_receipt = queue_dir / "pending" / job_id / "_control" / "checkpoint_pause_request.json"
+        assert stop_file.exists()
+        assert request_receipt.exists()
+
+        rc, list_out, _ = run_cli("list", "--json", queue_dir=queue_dir)
+        payload = json.loads(list_out)
+        [row] = payload["rows"]
+        assert row["route_job"]["resumability"]["pauseRequested"] is True
+        assert row["route_job"]["native"]["checkpoint_pause_request_receipt"] == str(request_receipt)
+
+    def test_request_checkpoint_pause_cli_refuses_non_trellis_job(self, queue_dir):
+        run_cli("submit", "echo", "/tmp/test.png", str(queue_dir / "out"), queue_dir=queue_dir)
+        job_id = list((queue_dir / "pending").iterdir())[0].name
+
+        rc, out, _ = run_cli("request-checkpoint-pause", job_id, queue_dir=queue_dir)
+
+        assert rc == 1
+        assert "does not advertise cooperative checkpoint pause" in out
+        assert not (queue_dir / "out" / "_control" / "checkpoint-stop").exists()
+
 
 class TestCLISubmitDurableOutput:
     def test_submit_without_output_dir(self, queue_dir):

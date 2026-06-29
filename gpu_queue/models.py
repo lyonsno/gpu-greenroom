@@ -60,6 +60,7 @@ class JobState:
     checkpoint_dir: str | None = None
     checkpoint_stop_file: str | None = None
     checkpoint_yield: dict[str, Any] | None = None
+    checkpoint_pause_request: dict[str, Any] | None = None
     warnings: list[str] = field(default_factory=list)
 
     def to_json(self) -> str:

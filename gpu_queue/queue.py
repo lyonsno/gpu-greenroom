@@ -34,6 +34,7 @@ class GPUQueue:
     ROUTE_JOB_SCHEMA = "kaminos.route-job.v0"
     TRELLIS_CHECKPOINT_YIELD_SCHEMA = "trellis2mlx.checkpoint_yield.v1"
     TRELLIS_CHECKPOINT_YIELD_EXIT_CODE = 75
+    CHECKPOINT_PAUSE_REQUEST_SCHEMA = "gpu-greenroom.checkpoint-pause-request.v1"
     PRIORITY_RANKS = {
         "preview": 0,
         "hero": 1,
@@ -244,6 +245,7 @@ class GPUQueue:
             return self._degraded_index_row(job_dir, status_dir, raw, exc)
 
         schedule = self._read_schedule(job_dir, state)
+        pause_request = self._read_checkpoint_pause_request(job_dir)
         return {
             "schema": self.INDEX_ROW_SCHEMA,
             "job_id": state.job_id,
@@ -260,7 +262,8 @@ class GPUQueue:
             "process_group_id": state.process_group_id,
             "schedule": schedule,
             "parse_error": None,
-            "route_job": self._route_job_for_state(state, schedule, job_dir, status_dir),
+            "checkpoint_pause_request": pause_request,
+            "route_job": self._route_job_for_state(state, schedule, job_dir, status_dir, pause_request),
         }
 
     def _degraded_index_row(
@@ -315,6 +318,7 @@ class GPUQueue:
         schedule: dict[str, Any],
         job_dir: Path,
         status_dir: str,
+        checkpoint_pause_request: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         input_artifacts = []
         if state.input_path:
@@ -335,17 +339,22 @@ class GPUQueue:
                 "root": state.output_dir,
                 "mode": "caller-owned",
             },
-            "resumability": self._resumability_for_state(state),
+            "resumability": self._resumability_for_state(state, checkpoint_pause_request),
             "native": {
                 "greenroom_job_id": state.job_id,
                 "status_dir": status_dir,
                 "job_dir": str(job_dir),
                 "output_dir": state.output_dir,
+                **self._native_checkpoint_pause_request_fields(checkpoint_pause_request),
                 **self._native_checkpoint_fields(state),
             },
         }
 
-    def _resumability_for_state(self, state: JobState) -> dict[str, Any]:
+    def _resumability_for_state(
+        self,
+        state: JobState,
+        checkpoint_pause_request: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         if state.checkpoint_yield:
             receipt = state.checkpoint_yield
             resumability = {
@@ -355,12 +364,22 @@ class GPUQueue:
                 "nextStage": receipt.get("next_stage"),
                 "resumeSupported": bool(receipt.get("resume_supported")),
                 "checkpointReceipt": receipt.get("receipt_path"),
+                "pauseRequested": bool(checkpoint_pause_request),
             }
             if receipt.get("resume_blocker"):
                 resumability["resumeBlocker"] = receipt.get("resume_blocker")
             if receipt.get("resume_command_hint"):
                 resumability["resumeCommandHint"] = receipt.get("resume_command_hint")
             return resumability
+        if checkpoint_pause_request:
+            return {
+                "kind": "cooperative-checkpoint",
+                "state": "pause_requested",
+                "pauseRequested": True,
+                "resumeSupported": False,
+                "checkpointStopFile": checkpoint_pause_request.get("checkpoint_stop_file"),
+                "pauseRequestReceipt": checkpoint_pause_request.get("receipt_path"),
+            }
         return {"kind": "unknown"}
 
     def _native_checkpoint_fields(self, state: JobState) -> dict[str, Any]:
@@ -372,6 +391,34 @@ class GPUQueue:
         if state.checkpoint_yield and state.checkpoint_yield.get("receipt_path"):
             fields["checkpoint_yield_receipt"] = state.checkpoint_yield["receipt_path"]
         return fields
+
+    def _native_checkpoint_pause_request_fields(
+        self,
+        checkpoint_pause_request: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        if not checkpoint_pause_request:
+            return {}
+        fields = {
+            "checkpoint_pause_requested": True,
+        }
+        if checkpoint_pause_request.get("receipt_path"):
+            fields["checkpoint_pause_request_receipt"] = checkpoint_pause_request["receipt_path"]
+        if checkpoint_pause_request.get("checkpoint_stop_file"):
+            fields["checkpoint_stop_file"] = checkpoint_pause_request["checkpoint_stop_file"]
+        return fields
+
+    def _read_checkpoint_pause_request(self, job_dir: Path) -> dict[str, Any] | None:
+        receipt_path = job_dir / "_control" / "checkpoint_pause_request.json"
+        try:
+            receipt = json.loads(receipt_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            return None
+        if receipt.get("schema") != self.CHECKPOINT_PAUSE_REQUEST_SCHEMA:
+            return None
+        if receipt.get("status") != "requested":
+            return None
+        receipt.setdefault("receipt_path", str(receipt_path))
+        return receipt
 
     def _load_checkpoint_yield_receipt(self, checkpoint_dir: str | None) -> dict[str, Any] | None:
         if not checkpoint_dir:
@@ -419,6 +466,80 @@ class GPUQueue:
             return None
         jobs.sort(key=lambda x: (x[0], x[1], x[2], x[3].name))
         return jobs[0][3]
+
+    def request_checkpoint_pause(self, job_id: str) -> dict[str, Any] | None:
+        """Request cooperative checkpoint-and-exit for a pending or running job.
+
+        This writes the job's stop file and a request receipt. It does not kill,
+        suspend, reorder, or directly modify terminal jobs.
+        """
+        located = self._find_checkpoint_pause_target(job_id)
+        if located is None:
+            return None
+        job_dir, status_dir = located
+
+        request_file = job_dir / "request.json"
+        status_file = job_dir / "status.json"
+        state = JobState.from_json(status_file.read_text())
+        request = JobRequest.from_json(request_file.read_text()) if request_file.exists() else None
+
+        if not self._cooperative_checkpoint_pause_capable(state.job_type):
+            raise ValueError(f"Job type {state.job_type!r} does not advertise cooperative checkpoint pause")
+
+        if request is not None:
+            control_paths = self._job_control_paths(request)
+        else:
+            control_paths = {
+                "checkpoint_dir": state.checkpoint_dir,
+                "checkpoint_stop_file": state.checkpoint_stop_file,
+            }
+        checkpoint_stop_file = control_paths.get("checkpoint_stop_file") or state.checkpoint_stop_file
+        checkpoint_dir = control_paths.get("checkpoint_dir") or state.checkpoint_dir
+        if not checkpoint_stop_file:
+            raise ValueError(f"Job {job_id} has no checkpoint stop file")
+
+        stop_path = Path(checkpoint_stop_file)
+        stop_path.parent.mkdir(parents=True, exist_ok=True)
+        requested_at = time.time()
+
+        receipt_path = job_dir / "_control" / "checkpoint_pause_request.json"
+        receipt = {
+            "schema": self.CHECKPOINT_PAUSE_REQUEST_SCHEMA,
+            "status": "requested",
+            "job_id": job_id,
+            "job_type": state.job_type,
+            "job_status_at_request": state.status.value,
+            "requested_at": requested_at,
+            "checkpoint_dir": checkpoint_dir,
+            "checkpoint_stop_file": str(stop_path),
+            "receipt_path": str(receipt_path),
+            "request_semantics": "cooperative_stop_after_next_checkpoint",
+        }
+        receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_receipt = receipt_path.with_suffix(receipt_path.suffix + ".tmp")
+        tmp_receipt.write_text(json.dumps(receipt, indent=2) + "\n")
+        os.replace(tmp_receipt, receipt_path)
+
+        tmp_stop = stop_path.with_suffix(stop_path.suffix + ".tmp")
+        tmp_stop.write_text(json.dumps(receipt, indent=2) + "\n")
+        os.replace(tmp_stop, stop_path)
+
+        if state.status == JobStatus.PENDING:
+            state.checkpoint_dir = checkpoint_dir
+            state.checkpoint_stop_file = str(stop_path)
+            state.checkpoint_pause_request = receipt
+            status_file.write_text(state.to_json())
+        return receipt
+
+    def _find_checkpoint_pause_target(self, job_id: str) -> tuple[Path, str] | None:
+        for status_dir in ("running", "pending"):
+            job_dir = self.queue_dir / status_dir / job_id
+            if (job_dir / "status.json").exists():
+                return job_dir, status_dir
+        return None
+
+    def _cooperative_checkpoint_pause_capable(self, job_type: str) -> bool:
+        return job_type == "trellis2mlx" or job_type.startswith("trellis2mlx.")
 
     def _write_metadata_sidecar(self, request: JobRequest, state: JobState):
         """Write metadata.json into output_dir for asset browser consumption."""
@@ -660,6 +781,7 @@ class GPUQueue:
                 "checkpoint_dir": state.checkpoint_dir,
                 "checkpoint_stop_file": state.checkpoint_stop_file,
                 "checkpoint_yield": state.checkpoint_yield,
+                "checkpoint_pause_request": state.checkpoint_pause_request,
                 "started_at": state.started_at,
                 "finished_at": state.finished_at,
                 "exit_code": state.exit_code,

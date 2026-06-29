@@ -192,6 +192,21 @@ def cmd_resume(args):
     print("Queue resumed.")
 
 
+def cmd_request_checkpoint_pause(args):
+    queue = get_queue(args)
+    try:
+        receipt = queue.request_checkpoint_pause(args.job_id)
+    except ValueError as exc:
+        print(str(exc))
+        sys.exit(1)
+    if receipt is None:
+        print(f"Could not request checkpoint pause for {args.job_id} (not found, not pending/running, or already terminal)")
+        sys.exit(1)
+    print(f"Checkpoint pause requested for {args.job_id}")
+    print(f"  Stop file: {receipt['checkpoint_stop_file']}")
+    print(f"  Receipt: {receipt['receipt_path']}")
+
+
 def cmd_recover(args):
     queue = get_queue(args)
     recovered = queue.recover_stale()
@@ -252,6 +267,14 @@ def main():
     # resume
     p_resume = sub.add_parser("resume", help="Resume a paused queue")
     p_resume.set_defaults(func=cmd_resume)
+
+    # request-checkpoint-pause
+    p_checkpoint_pause = sub.add_parser(
+        "request-checkpoint-pause",
+        help="Request cooperative stop after the next checkpoint boundary",
+    )
+    p_checkpoint_pause.add_argument("job_id")
+    p_checkpoint_pause.set_defaults(func=cmd_request_checkpoint_pause)
 
     # recover
     p_recover = sub.add_parser("recover", help="Recover stale running jobs")

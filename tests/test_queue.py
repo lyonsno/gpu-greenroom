@@ -839,6 +839,83 @@ class TestPauseResume:
         assert queue.get_job(req.job_id).status == JobStatus.PENDING
 
 
+# --- Cooperative checkpoint pause request ---
+
+class TestCheckpointPauseRequest:
+    def test_request_checkpoint_pause_for_pending_trellis_job_creates_stop_file_and_receipt(self, queue, tmp_path):
+        out = str(tmp_path / "out")
+        req = make_request(job_type="trellis2mlx", output_dir=out)
+        queue.submit(req)
+
+        receipt = queue.request_checkpoint_pause(req.job_id)
+
+        stop_file = Path(out) / "_control" / "checkpoint-stop"
+        request_receipt = queue.queue_dir / "pending" / req.job_id / "_control" / "checkpoint_pause_request.json"
+        assert stop_file.exists()
+        assert request_receipt.exists()
+        assert receipt["schema"] == "gpu-greenroom.checkpoint-pause-request.v1"
+        assert receipt["status"] == "requested"
+        assert receipt["job_id"] == req.job_id
+        assert receipt["job_status_at_request"] == "pending"
+        assert receipt["checkpoint_stop_file"] == str(stop_file)
+        assert receipt["request_semantics"] == "cooperative_stop_after_next_checkpoint"
+
+        [row] = queue.index_jobs()
+        assert row["checkpoint_pause_request"]["status"] == "requested"
+        assert row["route_job"]["resumability"]["kind"] == "cooperative-checkpoint"
+        assert row["route_job"]["resumability"]["pauseRequested"] is True
+        assert row["route_job"]["native"]["checkpoint_pause_request_receipt"] == str(request_receipt)
+
+    def test_request_checkpoint_pause_refuses_non_trellis_job(self, queue, tmp_path):
+        out = str(tmp_path / "out")
+        req = make_request(job_type="echo", output_dir=out)
+        queue.submit(req)
+
+        with pytest.raises(ValueError, match="does not advertise cooperative checkpoint pause"):
+            queue.request_checkpoint_pause(req.job_id)
+
+        assert not (Path(out) / "_control" / "checkpoint-stop").exists()
+
+    def test_request_checkpoint_pause_for_running_job_uses_sidecar_without_status_rewrite(self, queue, tmp_path):
+        out = str(tmp_path / "out")
+        req = make_request(job_type="trellis2mlx", output_dir=out)
+        queue.submit(req)
+        pending_dir = queue.queue_dir / "pending" / req.job_id
+        running_dir = queue.queue_dir / "running" / req.job_id
+        import shutil
+        shutil.move(str(pending_dir), str(running_dir))
+
+        state = JobState.from_json((running_dir / "status.json").read_text())
+        state.status = JobStatus.RUNNING
+        state.started_at = time.time()
+        state.worker_pid = 12345
+        state.checkpoint_dir = str(Path(out) / "checkpoints")
+        state.checkpoint_stop_file = str(Path(out) / "_control" / "checkpoint-stop")
+        (running_dir / "status.json").write_text(state.to_json())
+
+        receipt = queue.request_checkpoint_pause(req.job_id)
+
+        status_after = json.loads((running_dir / "status.json").read_text())
+        assert "checkpoint_pause_request" not in status_after or status_after["checkpoint_pause_request"] is None
+        assert status_after["worker_pid"] == 12345
+        assert Path(receipt["checkpoint_stop_file"]).exists()
+        assert (running_dir / "_control" / "checkpoint_pause_request.json").exists()
+
+        [row] = queue.index_jobs()
+        assert row["checkpoint_pause_request"]["status"] == "requested"
+        assert row["route_job"]["resumability"]["pauseRequested"] is True
+
+    def test_request_checkpoint_pause_returns_none_for_missing_or_terminal_job(self, queue, echo_job_types):
+        assert queue.request_checkpoint_pause("missing-job") is None
+
+        req = make_request(job_type="trellis2mlx")
+        queue.submit(req)
+        queue.run_one({"trellis2mlx": ["echo", "done"]})
+
+        assert queue.get_job(req.job_id).status == JobStatus.DONE
+        assert queue.request_checkpoint_pause(req.job_id) is None
+
+
 # --- Durable output directory ---
 
 class TestDurableOutputDir:
