@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
+from typing import Any
 
 from .models import JobRequest, JobState, JobStatus
 
@@ -26,6 +27,17 @@ class GPUQueue:
     """
 
     VOLATILE_PREFIXES = ("/tmp", "/private/tmp", "/var/tmp")
+    STATUS_DIRS = ("pending", "running", "done", "failed", "cancelled")
+    SCHEDULE_SCHEMA = "gpu-greenroom.schedule.v1"
+    INDEX_ROW_SCHEMA = "gpu-greenroom.index-row.v1"
+    QUEUE_INDEX_SCHEMA = "gpu-greenroom.queue-index.v1"
+    ROUTE_JOB_SCHEMA = "kaminos.route-job.v0"
+    PRIORITY_RANKS = {
+        "preview": 0,
+        "hero": 1,
+        "normal": 2,
+        "background": 3,
+    }
 
     def __init__(self, queue_dir: str | Path):
         self.queue_dir = Path(queue_dir)
@@ -56,6 +68,44 @@ class GPUQueue:
         return any(resolved == p or resolved.startswith(p + "/")
                     for p in self.VOLATILE_PREFIXES)
 
+    def _priority_rank(self, priority_class: str | None) -> int:
+        return self.PRIORITY_RANKS.get(priority_class or "normal", self.PRIORITY_RANKS["normal"])
+
+    def _default_schedule(self, request_or_state: JobRequest | JobState) -> dict[str, Any]:
+        params = getattr(request_or_state, "params", {}) or {}
+        priority_class = str(params.get("priority_class") or params.get("priorityClass") or "normal")
+        return {
+            "schema": self.SCHEDULE_SCHEMA,
+            "priority_class": priority_class,
+            "submitted_at": getattr(request_or_state, "submitted_at", 0.0),
+        }
+
+    def _write_schedule(self, job_dir: Path, request: JobRequest) -> dict[str, Any]:
+        schedule = self._default_schedule(request)
+        (job_dir / "schedule.json").write_text(json.dumps(schedule, indent=2))
+        return schedule
+
+    def _read_schedule(self, job_dir: Path, state: JobState | None = None) -> dict[str, Any]:
+        schedule_file = job_dir / "schedule.json"
+        if schedule_file.exists():
+            try:
+                schedule = json.loads(schedule_file.read_text())
+            except (json.JSONDecodeError, OSError):
+                schedule = {}
+        else:
+            schedule = {}
+
+        fallback = self._default_schedule(state) if state is not None else {
+            "schema": self.SCHEDULE_SCHEMA,
+            "priority_class": "normal",
+            "submitted_at": 0.0,
+        }
+        return {
+            "schema": schedule.get("schema") or self.SCHEDULE_SCHEMA,
+            "priority_class": schedule.get("priority_class") or schedule.get("priorityClass") or fallback["priority_class"],
+            "submitted_at": schedule.get("submitted_at") or schedule.get("submittedAt") or fallback["submitted_at"],
+        }
+
     def submit(self, request: JobRequest) -> Path:
         """Submit a job. Returns the job directory path.
 
@@ -71,6 +121,7 @@ class GPUQueue:
 
         # Write request
         (job_dir / "request.json").write_text(request.to_json())
+        self._write_schedule(job_dir, request)
 
         warnings = []
         if self._is_volatile(request.output_dir):
@@ -119,7 +170,7 @@ class GPUQueue:
     def list_jobs(self, status: JobStatus | None = None) -> list[JobState]:
         """List jobs, optionally filtered by status."""
         results = []
-        dirs = ["pending", "running", "done", "failed", "cancelled"]
+        dirs = list(self.STATUS_DIRS)
         if status:
             dirs = [status.value]
         for sub in dirs:
@@ -129,30 +180,178 @@ class GPUQueue:
             for job_dir in sorted(sub_dir.iterdir()):
                 status_file = job_dir / "status.json"
                 if status_file.exists():
-                    results.append(JobState.from_json(status_file.read_text()))
+                    try:
+                        results.append(JobState.from_json(status_file.read_text()))
+                    except (KeyError, ValueError, TypeError, json.JSONDecodeError):
+                        continue
         return results
+
+    def queue_index_payload(self, status: JobStatus | None = None) -> dict[str, Any]:
+        return {
+            "schema": self.QUEUE_INDEX_SCHEMA,
+            "queue_dir": str(self.queue_dir),
+            "rows": self.index_jobs(status),
+        }
+
+    def index_jobs(self, status: JobStatus | None = None) -> list[dict[str, Any]]:
+        """Return a tolerant JSON index for control-plane consumers.
+
+        Unlike list_jobs(), malformed or legacy status rows are preserved as
+        degraded evidence so Kaminos can show that a route exists without
+        pretending the old row matches the current receipt model.
+        """
+        rows: list[dict[str, Any]] = []
+        dirs = [status.value] if status else list(self.STATUS_DIRS)
+        for sub in dirs:
+            sub_dir = self.queue_dir / sub
+            if not sub_dir.exists():
+                continue
+            for job_dir in sorted(sub_dir.iterdir()):
+                status_file = job_dir / "status.json"
+                if not status_file.exists():
+                    continue
+                rows.append(self._index_row(job_dir, sub, status_file))
+        return rows
+
+    def _index_row(self, job_dir: Path, status_dir: str, status_file: Path) -> dict[str, Any]:
+        try:
+            raw = json.loads(status_file.read_text())
+        except (json.JSONDecodeError, OSError) as exc:
+            return self._degraded_index_row(job_dir, status_dir, {}, exc)
+
+        try:
+            state = JobState.from_json(json.dumps(raw))
+        except (KeyError, ValueError, TypeError) as exc:
+            return self._degraded_index_row(job_dir, status_dir, raw, exc)
+
+        schedule = self._read_schedule(job_dir, state)
+        return {
+            "schema": self.INDEX_ROW_SCHEMA,
+            "job_id": state.job_id,
+            "status": state.status.value,
+            "status_dir": status_dir,
+            "job_type": state.job_type,
+            "submitted_at": state.submitted_at,
+            "started_at": state.started_at,
+            "finished_at": state.finished_at,
+            "output_dir": state.output_dir,
+            "effective_route": state.effective_route,
+            "worker_pid": state.worker_pid,
+            "child_pid": state.child_pid,
+            "process_group_id": state.process_group_id,
+            "schedule": schedule,
+            "parse_error": None,
+            "route_job": self._route_job_for_state(state, schedule, job_dir, status_dir),
+        }
+
+    def _degraded_index_row(
+        self,
+        job_dir: Path,
+        status_dir: str,
+        raw: dict[str, Any],
+        exc: BaseException,
+    ) -> dict[str, Any]:
+        job_id = raw.get("job_id") or raw.get("jobId") or job_dir.name
+        job_type = raw.get("job_type") or raw.get("jobType")
+        schedule = self._read_schedule(job_dir)
+        return {
+            "schema": self.INDEX_ROW_SCHEMA,
+            "job_id": job_id,
+            "status": "degraded",
+            "status_dir": status_dir,
+            "job_type": job_type,
+            "submitted_at": raw.get("submitted_at") or raw.get("submittedAt"),
+            "started_at": raw.get("started_at") or raw.get("startedAt"),
+            "finished_at": raw.get("finished_at") or raw.get("finishedAt"),
+            "output_dir": raw.get("output_dir") or raw.get("outputDir"),
+            "effective_route": raw.get("effective_route") or raw.get("effectiveRoute"),
+            "schedule": schedule,
+            "parse_error": str(exc),
+            "legacy_status": raw,
+            "route_job": {
+                "schema": self.ROUTE_JOB_SCHEMA,
+                "id": job_id,
+                "routeId": job_type or "unknown",
+                "executor": {
+                    "kind": "native-greenroom",
+                    "id": "gpu-greenroom",
+                    "nativeQueueDir": str(self.queue_dir),
+                },
+                "priorityClass": schedule["priority_class"],
+                "status": "degraded",
+                "inputArtifacts": [],
+                "outputPolicy": None,
+                "resumability": {"kind": "unknown"},
+                "native": {
+                    "greenroom_job_id": job_id,
+                    "status_dir": status_dir,
+                    "job_dir": str(job_dir),
+                },
+            },
+        }
+
+    def _route_job_for_state(
+        self,
+        state: JobState,
+        schedule: dict[str, Any],
+        job_dir: Path,
+        status_dir: str,
+    ) -> dict[str, Any]:
+        input_artifacts = []
+        if state.input_path:
+            input_artifacts.append({"role": "input", "path": state.input_path})
+        return {
+            "schema": self.ROUTE_JOB_SCHEMA,
+            "id": state.job_id,
+            "routeId": state.job_type,
+            "executor": {
+                "kind": "native-greenroom",
+                "id": "gpu-greenroom",
+                "nativeQueueDir": str(self.queue_dir),
+            },
+            "priorityClass": schedule["priority_class"],
+            "status": state.status.value,
+            "inputArtifacts": input_artifacts,
+            "outputPolicy": {
+                "root": state.output_dir,
+                "mode": "caller-owned",
+            },
+            "resumability": {"kind": "unknown"},
+            "native": {
+                "greenroom_job_id": state.job_id,
+                "status_dir": status_dir,
+                "job_dir": str(job_dir),
+                "output_dir": state.output_dir,
+            },
+        }
 
     def get_job(self, job_id: str) -> JobState | None:
         """Get a specific job's state."""
-        for sub in ("pending", "running", "done", "failed", "cancelled"):
+        for sub in self.STATUS_DIRS:
             status_file = self.queue_dir / sub / job_id / "status.json"
             if status_file.exists():
                 return JobState.from_json(status_file.read_text())
         return None
 
     def _next_pending(self) -> Path | None:
-        """Get the oldest pending job directory."""
+        """Get the next pending job directory by schedule priority then age."""
         pending = self.queue_dir / "pending"
         jobs = []
         for job_dir in pending.iterdir():
             status_file = job_dir / "status.json"
             if status_file.exists():
                 state = JobState.from_json(status_file.read_text())
-                jobs.append((state.submitted_at, job_dir))
+                schedule = self._read_schedule(job_dir, state)
+                jobs.append((
+                    self._priority_rank(schedule["priority_class"]),
+                    schedule["submitted_at"],
+                    state.submitted_at,
+                    job_dir,
+                ))
         if not jobs:
             return None
-        jobs.sort(key=lambda x: x[0])
-        return jobs[0][1]
+        jobs.sort(key=lambda x: (x[0], x[1], x[2], x[3].name))
+        return jobs[0][3]
 
     def _write_metadata_sidecar(self, request: JobRequest, state: JobState):
         """Write metadata.json into output_dir for asset browser consumption."""
@@ -232,6 +431,7 @@ class GPUQueue:
             state.status = JobStatus.RUNNING
             state.started_at = time.time()
             state.pid = os.getpid()
+            state.worker_pid = os.getpid()
 
             # Resolve job type config — supports bare list or rich dict
             raw_config = job_types.get(request.job_type)
@@ -316,24 +516,36 @@ class GPUQueue:
 
             try:
                 with open(stdout_path, "w") as out_f, open(stderr_path, "w") as err_f:
-                    proc = subprocess.run(
+                    proc = subprocess.Popen(
                         cmd,
                         stdout=out_f,
                         stderr=err_f,
                         cwd=job_cwd,
                         env=run_env,
-                        timeout=job_timeout,
+                        start_new_session=True,
                     )
-                state.exit_code = proc.returncode
-                if proc.returncode == 0:
+                    state.child_pid = proc.pid
+                    try:
+                        state.process_group_id = os.getpgid(proc.pid)
+                    except OSError:
+                        state.process_group_id = proc.pid
+                    (job_dir / "status.json").write_text(state.to_json())
+                    returncode = proc.wait(timeout=job_timeout)
+                state.exit_code = returncode
+                if returncode == 0:
                     state.status = JobStatus.DONE
                     dest_status = "done"
                 else:
                     state.status = JobStatus.FAILED
                     state.failure_phase = "execution"
-                    state.error_message = f"Process exited with code {proc.returncode}"
+                    state.error_message = f"Process exited with code {returncode}"
                     dest_status = "failed"
             except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
                 state.status = JobStatus.FAILED
                 state.failure_phase = "timeout"
                 state.error_message = f"Job exceeded {job_timeout}s timeout"
@@ -362,6 +574,9 @@ class GPUQueue:
                 "effective_defaults": job_defaults,
                 "effective_timeout": job_timeout,
                 "ignored_params": ignored_params if ignored_params else None,
+                "worker_pid": state.worker_pid,
+                "child_pid": state.child_pid,
+                "process_group_id": state.process_group_id,
                 "started_at": state.started_at,
                 "finished_at": state.finished_at,
                 "exit_code": state.exit_code,

@@ -90,6 +90,10 @@ def cmd_submit(args):
 def cmd_list(args):
     queue = get_queue(args)
     status_filter = JobStatus(args.status) if args.status else None
+    if args.json_output:
+        print(json.dumps(queue.queue_index_payload(status_filter), indent=2))
+        return
+
     jobs = queue.list_jobs(status_filter)
 
     if not jobs:
@@ -221,6 +225,7 @@ def main():
     # list
     p_list = sub.add_parser("list", help="List jobs")
     p_list.add_argument("-s", "--status", choices=["pending", "running", "done", "failed", "cancelled"])
+    p_list.add_argument("--json", action="store_true", dest="json_output", help="Print tolerant queue index JSON")
     p_list.set_defaults(func=cmd_list)
 
     # status

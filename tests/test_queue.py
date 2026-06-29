@@ -100,6 +100,35 @@ class TestSubmit:
         assert state.job_id == req.job_id
         assert state.warnings == ["volatile_output"]
 
+    def test_submit_writes_default_schedule_metadata(self, queue):
+        req = make_request()
+        job_dir = queue.submit(req)
+
+        schedule = json.loads((job_dir / "schedule.json").read_text())
+
+        assert schedule["schema"] == "gpu-greenroom.schedule.v1"
+        assert schedule["priority_class"] == "normal"
+        assert schedule["submitted_at"] == req.submitted_at
+
+    def test_tolerant_index_reports_legacy_status_as_degraded(self, queue):
+        legacy_dir = queue.queue_dir / "failed" / "legacy-provider-route"
+        legacy_dir.mkdir(parents=True)
+        (legacy_dir / "status.json").write_text(json.dumps({
+            "jobId": "legacy-provider-route",
+            "jobType": "kaminos.orb-inner-engine.provider-route",
+            "status": "failed",
+            "bundleRoot": "/tmp/bundle",
+        }))
+
+        [row] = queue.index_jobs()
+
+        assert row["schema"] == "gpu-greenroom.index-row.v1"
+        assert row["job_id"] == "legacy-provider-route"
+        assert row["status_dir"] == "failed"
+        assert row["status"] == "degraded"
+        assert row["parse_error"]
+        assert row["legacy_status"]["jobId"] == "legacy-provider-route"
+
 
 # --- Execution ---
 
@@ -128,6 +157,33 @@ class TestExecution:
         receipt = json.loads(receipt_path.read_text())
         assert receipt["status"] == "done"
         assert receipt["effective_route"] is not None
+
+    def test_run_records_worker_and_child_process_identity(self, queue, echo_job_types):
+        req = make_request()
+        queue.submit(req)
+        queue.run_one(echo_job_types)
+
+        status = json.loads((queue.queue_dir / "done" / req.job_id / "status.json").read_text())
+        receipt = json.loads((queue.queue_dir / "done" / req.job_id / "receipt.json").read_text())
+
+        assert isinstance(status["worker_pid"], int)
+        assert isinstance(status["child_pid"], int)
+        assert isinstance(status["process_group_id"], int)
+        assert receipt["worker_pid"] == status["worker_pid"]
+        assert receipt["child_pid"] == status["child_pid"]
+        assert receipt["process_group_id"] == status["process_group_id"]
+
+    def test_index_exposes_native_greenroom_route_job_shape(self, queue, echo_job_types):
+        req = make_request(job_type="write_output")
+        queue.submit(req)
+        queue.run_one(echo_job_types)
+
+        [row] = queue.index_jobs()
+
+        assert row["route_job"]["schema"] == "kaminos.route-job.v0"
+        assert row["route_job"]["executor"]["kind"] == "native-greenroom"
+        assert row["route_job"]["native"]["greenroom_job_id"] == req.job_id
+        assert row["route_job"]["priorityClass"] == "normal"
 
     def test_run_captures_stdout(self, queue, echo_job_types):
         req = make_request(input_path="/tmp/myimage.png")

@@ -53,6 +53,9 @@ class JobState:
     error_message: str | None = None
     effective_route: str | None = None
     pid: int | None = None
+    worker_pid: int | None = None
+    child_pid: int | None = None
+    process_group_id: int | None = None
     warnings: list[str] = field(default_factory=list)
 
     def to_json(self) -> str:

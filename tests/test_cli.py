@@ -62,6 +62,23 @@ class TestCLIList:
         assert "pending" in out
         assert "trellis2mlx" in out
 
+    def test_list_json_reports_degraded_legacy_rows(self, queue_dir):
+        legacy = queue_dir / "failed" / "legacy-provider-route"
+        legacy.mkdir(parents=True)
+        (legacy / "status.json").write_text(json.dumps({
+            "jobId": "legacy-provider-route",
+            "jobType": "kaminos.orb-inner-engine.provider-route",
+            "status": "failed",
+        }))
+
+        rc, out, _ = run_cli("list", "--json", queue_dir=queue_dir)
+
+        assert rc == 0
+        payload = json.loads(out)
+        assert payload["schema"] == "gpu-greenroom.queue-index.v1"
+        assert payload["rows"][0]["job_id"] == "legacy-provider-route"
+        assert payload["rows"][0]["status"] == "degraded"
+
 
 class TestCLIStatus:
     def test_status_nonexistent(self, queue_dir):
