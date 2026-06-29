@@ -27,11 +27,13 @@ class GPUQueue:
     """
 
     VOLATILE_PREFIXES = ("/tmp", "/private/tmp", "/var/tmp")
-    STATUS_DIRS = ("pending", "running", "done", "failed", "cancelled")
+    STATUS_DIRS = ("pending", "running", "done", "failed", "checkpoint_paused", "cancelled")
     SCHEDULE_SCHEMA = "gpu-greenroom.schedule.v1"
     INDEX_ROW_SCHEMA = "gpu-greenroom.index-row.v1"
     QUEUE_INDEX_SCHEMA = "gpu-greenroom.queue-index.v1"
     ROUTE_JOB_SCHEMA = "kaminos.route-job.v0"
+    TRELLIS_CHECKPOINT_YIELD_SCHEMA = "trellis2mlx.checkpoint_yield.v1"
+    TRELLIS_CHECKPOINT_YIELD_EXIT_CODE = 75
     PRIORITY_RANKS = {
         "preview": 0,
         "hero": 1,
@@ -41,7 +43,7 @@ class GPUQueue:
 
     def __init__(self, queue_dir: str | Path):
         self.queue_dir = Path(queue_dir)
-        for sub in ("pending", "running", "done", "failed", "cancelled", "outputs"):
+        for sub in ("pending", "running", "done", "failed", "checkpoint_paused", "cancelled", "outputs"):
             (self.queue_dir / sub).mkdir(parents=True, exist_ok=True)
 
     @property
@@ -78,6 +80,23 @@ class GPUQueue:
             "schema": self.SCHEDULE_SCHEMA,
             "priority_class": priority_class,
             "submitted_at": getattr(request_or_state, "submitted_at", 0.0),
+        }
+
+    def _job_control_paths(self, request: JobRequest) -> dict[str, str]:
+        params = request.params or {}
+        checkpoint_dir = (
+            params.get("checkpoint_dir")
+            or params.get("checkpointDir")
+            or str(Path(request.output_dir) / "checkpoints")
+        )
+        checkpoint_stop_file = (
+            params.get("checkpoint_stop_file")
+            or params.get("checkpointStopFile")
+            or str(Path(request.output_dir) / "_control" / "checkpoint-stop")
+        )
+        return {
+            "checkpoint_dir": str(checkpoint_dir),
+            "checkpoint_stop_file": str(checkpoint_stop_file),
         }
 
     def _write_schedule(self, job_dir: Path, request: JobRequest) -> dict[str, Any]:
@@ -316,14 +335,62 @@ class GPUQueue:
                 "root": state.output_dir,
                 "mode": "caller-owned",
             },
-            "resumability": {"kind": "unknown"},
+            "resumability": self._resumability_for_state(state),
             "native": {
                 "greenroom_job_id": state.job_id,
                 "status_dir": status_dir,
                 "job_dir": str(job_dir),
                 "output_dir": state.output_dir,
+                **self._native_checkpoint_fields(state),
             },
         }
+
+    def _resumability_for_state(self, state: JobState) -> dict[str, Any]:
+        if state.checkpoint_yield:
+            receipt = state.checkpoint_yield
+            resumability = {
+                "kind": "cooperative-checkpoint",
+                "state": receipt.get("status"),
+                "completedStage": receipt.get("completed_stage"),
+                "nextStage": receipt.get("next_stage"),
+                "resumeSupported": bool(receipt.get("resume_supported")),
+                "checkpointReceipt": receipt.get("receipt_path"),
+            }
+            if receipt.get("resume_blocker"):
+                resumability["resumeBlocker"] = receipt.get("resume_blocker")
+            if receipt.get("resume_command_hint"):
+                resumability["resumeCommandHint"] = receipt.get("resume_command_hint")
+            return resumability
+        return {"kind": "unknown"}
+
+    def _native_checkpoint_fields(self, state: JobState) -> dict[str, Any]:
+        fields: dict[str, Any] = {}
+        if state.checkpoint_dir:
+            fields["checkpoint_dir"] = state.checkpoint_dir
+        if state.checkpoint_stop_file:
+            fields["checkpoint_stop_file"] = state.checkpoint_stop_file
+        if state.checkpoint_yield and state.checkpoint_yield.get("receipt_path"):
+            fields["checkpoint_yield_receipt"] = state.checkpoint_yield["receipt_path"]
+        return fields
+
+    def _load_checkpoint_yield_receipt(self, checkpoint_dir: str | None) -> dict[str, Any] | None:
+        if not checkpoint_dir:
+            return None
+        receipt_path = Path(checkpoint_dir) / "_control" / "checkpoint_yield.json"
+        try:
+            receipt = json.loads(receipt_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            return None
+        if receipt.get("schema") != self.TRELLIS_CHECKPOINT_YIELD_SCHEMA:
+            return None
+        if receipt.get("status") != "paused_at_checkpoint":
+            return None
+        if receipt.get("exit_code") != self.TRELLIS_CHECKPOINT_YIELD_EXIT_CODE:
+            return None
+        if not receipt.get("completed_stage"):
+            return None
+        receipt.setdefault("receipt_path", str(receipt_path))
+        return receipt
 
     def get_job(self, job_id: str) -> JobState | None:
         """Get a specific job's state."""
@@ -432,6 +499,9 @@ class GPUQueue:
             state.started_at = time.time()
             state.pid = os.getpid()
             state.worker_pid = os.getpid()
+            control_paths = self._job_control_paths(request)
+            state.checkpoint_dir = control_paths["checkpoint_dir"]
+            state.checkpoint_stop_file = control_paths["checkpoint_stop_file"]
 
             # Resolve job type config — supports bare list or rich dict
             raw_config = job_types.get(request.job_type)
@@ -473,6 +543,8 @@ class GPUQueue:
                 **safe_params,
                 "input_path": request.input_path,
                 "output_dir": request.output_dir,
+                "job_id": request.job_id,
+                **control_paths,
             }
 
             # Detect ignored params: user-supplied keys not consumed by template
@@ -535,6 +607,14 @@ class GPUQueue:
                 if returncode == 0:
                     state.status = JobStatus.DONE
                     dest_status = "done"
+                elif returncode == self.TRELLIS_CHECKPOINT_YIELD_EXIT_CODE and (
+                    checkpoint_yield := self._load_checkpoint_yield_receipt(state.checkpoint_dir)
+                ):
+                    state.status = JobStatus.CHECKPOINT_PAUSED
+                    state.checkpoint_yield = checkpoint_yield
+                    state.failure_phase = None
+                    state.error_message = None
+                    dest_status = "checkpoint_paused"
                 else:
                     state.status = JobStatus.FAILED
                     state.failure_phase = "execution"
@@ -577,6 +657,9 @@ class GPUQueue:
                 "worker_pid": state.worker_pid,
                 "child_pid": state.child_pid,
                 "process_group_id": state.process_group_id,
+                "checkpoint_dir": state.checkpoint_dir,
+                "checkpoint_stop_file": state.checkpoint_stop_file,
+                "checkpoint_yield": state.checkpoint_yield,
                 "started_at": state.started_at,
                 "finished_at": state.finished_at,
                 "exit_code": state.exit_code,

@@ -268,6 +268,75 @@ class TestFailure:
         receipt = json.loads(receipt_path.read_text())
         assert receipt["effective_route"] is not None
 
+    def test_exit_75_without_checkpoint_receipt_stays_failed(self, queue, tmp_path):
+        """Exit 75 alone is not evidence of cooperative checkpoint yield."""
+        out = str(tmp_path / "out")
+        req = make_request(job_type="bare_75", output_dir=out)
+        queue.submit(req)
+
+        queue.run_one({"bare_75": ["sh", "-c", "exit 75"]})
+
+        state = queue.get_job(req.job_id)
+        assert state.status == JobStatus.FAILED
+        assert state.exit_code == 75
+        receipt = json.loads((queue.queue_dir / "failed" / req.job_id / "receipt.json").read_text())
+        assert receipt["status"] == "failed"
+        assert receipt["failure_phase"] == "execution"
+
+    def test_trellis_checkpoint_yield_exit_moves_to_checkpoint_paused(self, queue, tmp_path):
+        """Exit 75 plus Trellis yield receipt is a paused checkpoint, not failure."""
+        out = str(tmp_path / "out")
+        req = make_request(job_type="trellis_yield", output_dir=out)
+        queue.submit(req)
+
+        write_yield_receipt = (
+            "import json, pathlib; "
+            "p = pathlib.Path('{checkpoint_dir}') / '_control'; "
+            "p.mkdir(parents=True, exist_ok=True); "
+            "r = {"
+            "'schema': 'trellis2mlx.checkpoint_yield.v1', "
+            "'status': 'paused_at_checkpoint', "
+            "'completed_stage': 'texture', "
+            "'next_stage': 'texture_bake', "
+            "'checkpoint_dir': '{checkpoint_dir}', "
+            "'receipt_path': str(p / 'checkpoint_yield.json'), "
+            "'exit_code': 75, "
+            "'pause_semantics': 'cooperative_checkpoint_and_exit', "
+            "'resume_supported': True, "
+            "'resume_command_hint': ['python', 'generate.py', '--resume', '{checkpoint_dir}']"
+            "}; "
+            "(p / 'checkpoint_yield.json').write_text(json.dumps(r))"
+        )
+        queue.run_one({
+            "trellis_yield": [
+                "sh",
+                "-c",
+                f"python -c \"{write_yield_receipt}\"; exit 75",
+            ],
+        })
+
+        state = queue.get_job(req.job_id)
+        assert state.status == JobStatus.CHECKPOINT_PAUSED
+        assert state.exit_code == 75
+        assert state.failure_phase is None
+        assert state.checkpoint_yield["completed_stage"] == "texture"
+        assert state.checkpoint_yield["resume_supported"] is True
+
+        paused_dir = queue.queue_dir / "checkpoint_paused" / req.job_id
+        receipt = json.loads((paused_dir / "receipt.json").read_text())
+        assert receipt["status"] == "checkpoint_paused"
+        assert receipt["checkpoint_yield"]["schema"] == "trellis2mlx.checkpoint_yield.v1"
+        assert receipt["checkpoint_yield"]["completed_stage"] == "texture"
+
+        [row] = queue.index_jobs()
+        route_job = row["route_job"]
+        assert row["status"] == "checkpoint_paused"
+        assert route_job["status"] == "checkpoint_paused"
+        assert route_job["resumability"]["kind"] == "cooperative-checkpoint"
+        assert route_job["resumability"]["completedStage"] == "texture"
+        assert route_job["resumability"]["resumeSupported"] is True
+        assert route_job["native"]["checkpoint_yield_receipt"].endswith("_control/checkpoint_yield.json")
+
 
 # --- Serialization (two jobs must not overlap) ---
 

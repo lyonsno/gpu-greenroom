@@ -134,6 +134,18 @@ class TestCLISubmitDurableOutput:
 
 
 class TestLoadJobTypes:
+    def test_default_trellis_job_type_passes_checkpoint_yield_args(self, queue_dir):
+        """Native Trellis jobs should expose cooperative checkpoint-yield controls."""
+        from gpu_queue.cli import _load_job_types
+
+        types = _load_job_types(str(queue_dir))
+        trellis_cmd = types["trellis2mlx"]["cmd"]
+
+        assert "--save-checkpoints" in trellis_cmd
+        assert "{checkpoint_dir}" in trellis_cmd
+        assert "--checkpoint-stop-file" in trellis_cmd
+        assert "{checkpoint_stop_file}" in trellis_cmd
+
     def test_loads_custom_types(self, queue_dir):
         """_load_job_types merges custom config with defaults."""
         from gpu_queue.cli import _load_job_types

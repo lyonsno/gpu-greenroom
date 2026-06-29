@@ -32,6 +32,8 @@ DEFAULT_JOB_TYPES = {
             "--target-faces", "{target_faces}",
             "--texture-size", "{texture_size}",
             "--simplify-first",
+            "--save-checkpoints", "{checkpoint_dir}",
+            "--checkpoint-stop-file", "{checkpoint_stop_file}",
         ],
         "cwd": _TRELLIS_ROOT,
         "env": {"PYTHONPATH": "."},
@@ -224,7 +226,7 @@ def main():
 
     # list
     p_list = sub.add_parser("list", help="List jobs")
-    p_list.add_argument("-s", "--status", choices=["pending", "running", "done", "failed", "cancelled"])
+    p_list.add_argument("-s", "--status", choices=["pending", "running", "done", "failed", "checkpoint_paused", "cancelled"])
     p_list.add_argument("--json", action="store_true", dest="json_output", help="Print tolerant queue index JSON")
     p_list.set_defaults(func=cmd_list)
 

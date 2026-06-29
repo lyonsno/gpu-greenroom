@@ -16,6 +16,7 @@ class JobStatus(str, Enum):
     RUNNING = "running"
     DONE = "done"
     FAILED = "failed"
+    CHECKPOINT_PAUSED = "checkpoint_paused"
     CANCELLED = "cancelled"
 
 
@@ -56,6 +57,9 @@ class JobState:
     worker_pid: int | None = None
     child_pid: int | None = None
     process_group_id: int | None = None
+    checkpoint_dir: str | None = None
+    checkpoint_stop_file: str | None = None
+    checkpoint_yield: dict[str, Any] | None = None
     warnings: list[str] = field(default_factory=list)
 
     def to_json(self) -> str:
