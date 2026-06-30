@@ -123,6 +123,16 @@ Mac/MPS runner needs different settings, the route is still candidate-only. A
 started subprocess is not accepted Greenroom evidence until the receipt or log
 proves the local route identity.
 
+Evidence from a Greenroom run speaks only for the exact route and phase that
+completed: repo/branch/commit, runner command, model/checkpoint family, backend,
+device, dtype, implementation port, cleanup/export path, and last completed
+artifact. Do not generalize a receipt across Microsoft CUDA, a third-party
+Mac/MPS port, an MLX reimplementation, or any other route unless that route was
+run or a named equivalence test proves the comparison. If a job fails after an
+intermediate phase, the evidence stops at the last trustworthy phase; later
+pipeline claims remain hypotheses until a receipt or inspected artifact proves
+them.
+
 TRELLIS.2 on Apple Silicon is the current scar. Preserve and prove the local
 Mac route's `ATTN_BACKEND=sdpa` / `SPARSE_ATTN_BACKEND=sdpa` identity where
 that route applies. Accepting upstream `flash_attn` or a later MPS device
