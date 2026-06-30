@@ -133,6 +133,24 @@ intermediate phase, the evidence stops at the last trustworthy phase; later
 pipeline claims remain hypotheses until a receipt or inspected artifact proves
 them.
 
+Failed runs carry an extra gate before any output from the run can support a
+positive claim:
+
+- **Known-good route mismatch audit:** `passed/failed/not-run`, naming the
+  known-good local route compared. `passed` means the failure happened on the
+  same runner/env/device/backend/export path already known to work elsewhere.
+  `failed` means the Greenroom route differs from that path, or did not prove
+  it matched that path.
+- **Failed-run evidence use:** `none/negative-only/bounded-positive`, default
+  `negative-only`. If the run failed because of route, device, backend, path,
+  or export mismatch, write: `Greenroom route unaccepted; failure is evidence
+  against this wrapper/config, not evidence about model, topology, cleanup, or
+  official-route parity.`
+
+Do not use failed-run output to compare model quality, topology parity, cleanup
+effectiveness, export quality, or official behavior until the mismatch audit
+passes or an explicitly named equivalence test exists.
+
 TRELLIS.2 on Apple Silicon is the current scar. Preserve and prove the local
 Mac route's `ATTN_BACKEND=sdpa` / `SPARSE_ATTN_BACKEND=sdpa` identity where
 that route applies. Accepting upstream `flash_attn` or a later MPS device
