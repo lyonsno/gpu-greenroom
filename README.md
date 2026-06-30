@@ -99,6 +99,35 @@ See `job_types.example.json` for TRELLIS2MLX, SuperMat, MoGe, and Pixal3D templa
 
 Bare command lists are also accepted for simple cases: `{"echo": ["echo", "{input_path}"]}`.
 
+## Route identity shield
+
+A Greenroom route is the local route that actually works on this machine, not
+just an upstream/default command that happens to launch. Before adding,
+reviewing, or approving a `job_types.json` route, preserve the effective runner,
+environment, device, backend, and fallback knobs that made the route safe.
+
+For each new or reviewed job type, record these four lines in the review,
+return packet, or closeout:
+
+- **Known-good local runner checked:** `yes/no/path`, including nearby wrappers
+  like `generate.py`, `batch_generate.sh`, repo READMEs, or prior receipts.
+- **Effective env/device/backend preserved:** exact env or args for device,
+  dtype, backend, fallback knobs, and any forbidden default that was avoided.
+- **First receipt/log proves backend/device:** stdout/status snippet showing the
+  effective route identity before treating a heavy run as accepted.
+- **Heavy run accepted before proof:** `no` by default; if `yes`, explain why
+  the missing identity proof cannot lie about route/backend.
+
+If a route launches with upstream/CUDA/default backend identity while a local
+Mac/MPS runner needs different settings, the route is still candidate-only. A
+started subprocess is not accepted Greenroom evidence until the receipt or log
+proves the local route identity.
+
+TRELLIS.2 on Apple Silicon is the current scar. Preserve and prove the local
+Mac route's `ATTN_BACKEND=sdpa` / `SPARSE_ATTN_BACKEND=sdpa` identity where
+that route applies. Accepting upstream `flash_attn` or a later MPS device
+mismatch as incidental is a route-identity failure, not a model failure.
+
 ## Receipt schema
 
 Every completed or failed job gets a `receipt.json`:
