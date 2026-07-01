@@ -53,5 +53,25 @@
       "seed": "42",
       "cascade": "512"
     }
+  },
+  "sf3d_weight_convert": {
+    "cmd": [
+      "/Users/noahlyons/dev/sf3d/.venv/bin/python", "-u", "tools/convert_weights.py",
+      "--model-path", "{input_path}",
+      "--output", "{output_dir}/{output_name}",
+      "--dtype", "{dtype}"
+    ],
+    "cwd": "/Users/noahlyons/dev/sf3d-webgpu",
+    "env": {
+      "PYTHONPATH": ".",
+      "SF3D_REPO": "/Users/noahlyons/dev/sf3d",
+      "CUDA_VISIBLE_DEVICES": "",
+      "TOKENIZERS_PARALLELISM": "false"
+    },
+    "defaults": {
+      "dtype": "fp16",
+      "output_name": "weights.bin"
+    },
+    "timeout": 1800
   }
 }

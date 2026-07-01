@@ -150,6 +150,30 @@ class TestLoadJobTypes:
         types = _load_job_types(str(queue_dir))
         assert "trellis2mlx" in types  # defaults survived
 
+    def test_default_sf3d_weight_convert_route_is_cpu_asset_prep(self, queue_dir):
+        from gpu_queue.cli import _load_job_types
+
+        types = _load_job_types(str(queue_dir))
+        route = types["sf3d_weight_convert"]
+
+        assert route["cmd"] == [
+            "/Users/noahlyons/dev/sf3d/.venv/bin/python",
+            "-u",
+            "tools/convert_weights.py",
+            "--model-path",
+            "{input_path}",
+            "--output",
+            "{output_dir}/{output_name}",
+            "--dtype",
+            "{dtype}",
+        ]
+        assert route["cwd"] == "/Users/noahlyons/dev/sf3d-webgpu"
+        assert route["env"]["PYTHONPATH"] == "."
+        assert route["env"]["SF3D_REPO"] == "/Users/noahlyons/dev/sf3d"
+        assert route["env"]["CUDA_VISIBLE_DEVICES"] == ""
+        assert route["defaults"] == {"dtype": "fp16", "output_name": "weights.bin"}
+        assert route["timeout"] == 1800
+
 
 class TestCLIRecover:
     def test_recover_no_stale(self, queue_dir):

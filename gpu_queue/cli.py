@@ -20,6 +20,8 @@ DEFAULT_QUEUE_DIR = os.environ.get("GPU_GREENROOM_DIR", os.path.expanduser("~/.l
 # Bare list also accepted for simple cases
 _TRELLIS_ROOT = os.path.expanduser("~/dev/trellis2mlx")
 _PERCEPTASIA_ROOT = os.path.expanduser("~/dev/perceptasia")
+_SF3D_ROOT = os.path.expanduser("~/dev/sf3d")
+_SF3D_WEBGPU_ROOT = os.path.expanduser("~/dev/sf3d-webgpu")
 
 DEFAULT_JOB_TYPES = {
     "trellis2mlx": {
@@ -51,6 +53,26 @@ DEFAULT_JOB_TYPES = {
         "cwd": _PERCEPTASIA_ROOT,
         "env": {"PYTHONPATH": "."},
         "defaults": {},
+    },
+    "sf3d_weight_convert": {
+        "cmd": [
+            os.path.join(_SF3D_ROOT, ".venv/bin/python"), "-u", "tools/convert_weights.py",
+            "--model-path", "{input_path}",
+            "--output", "{output_dir}/{output_name}",
+            "--dtype", "{dtype}",
+        ],
+        "cwd": _SF3D_WEBGPU_ROOT,
+        "env": {
+            "PYTHONPATH": ".",
+            "SF3D_REPO": _SF3D_ROOT,
+            "CUDA_VISIBLE_DEVICES": "",
+            "TOKENIZERS_PARALLELISM": "false",
+        },
+        "defaults": {
+            "dtype": "fp16",
+            "output_name": "weights.bin",
+        },
+        "timeout": 1800,
     },
 }
 

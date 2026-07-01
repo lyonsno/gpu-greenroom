@@ -25,6 +25,9 @@ gpu-greenroom submit trellis2mlx /path/to/image.png /path/to/output/
 # Submit with custom params
 gpu-greenroom submit trellis2mlx /path/to/image.png /path/to/output/ -p seed=99 resolution=768
 
+# CPU model asset prep / weight conversion still goes through Greenroom
+gpu-greenroom submit sf3d_weight_convert stabilityai/stable-fast-3d /Users/noahlyons/dev/sf3d-webgpu/public -p output_name=weights.bin dtype=fp16
+
 # List queue
 gpu-greenroom list
 gpu-greenroom list -s pending
@@ -95,7 +98,19 @@ Each job type is a dict with:
 | `defaults` | no | Default param values. User params override defaults. Reserved keys (`input_path`, `output_dir`) always win. |
 | `timeout` | no | Timeout in seconds. `null`/absent = no timeout. |
 
-See `job_types.example.json` for TRELLIS2MLX, SuperMat, MoGe, and Pixal3D templates.
+See `job_types.example.json` for TRELLIS2MLX, SuperMat, MoGe, Pixal3D, and SF3D weight-conversion templates.
+
+CPU-bound model asset prep belongs here too when it imports heavyweight model
+stacks, loads multi-GB checkpoints, or writes large durable outputs. It may not
+be image inference, but it is still resource-governed model work. For SF3D
+WebGPU weights, use `sf3d_weight_convert` instead of running
+`tools/convert_weights.py` directly from an agent shell. The model id or local
+checkpoint path is the submit input, the output directory is where
+`weights.bin`, `weights.json`, and `tets/` are written, and the receipt records
+the effective cwd/env/defaults/timeout. The route runs the converter from
+`~/dev/sf3d-webgpu` with `SF3D_REPO=~/dev/sf3d`, because the WebGPU repo owns the
+converter and public asset outputs while the SF3D repo supplies the Python model
+environment.
 
 Bare command lists are also accepted for simple cases: `{"echo": ["echo", "{input_path}"]}`.
 
