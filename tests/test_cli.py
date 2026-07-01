@@ -62,6 +62,43 @@ class TestCLIList:
         assert "pending" in out
         assert "trellis2mlx" in out
 
+    def test_list_degrades_malformed_status_row(self, queue_dir):
+        run_cli("submit", "trellis2mlx", "/tmp/test.png", "/tmp/out", queue_dir=queue_dir)
+        malformed_dir = queue_dir / "done" / "legacy-bad-status"
+        malformed_dir.mkdir(parents=True)
+        (malformed_dir / "status.json").write_text("{broken json")
+
+        rc, out, _ = run_cli("list", queue_dir=queue_dir)
+
+        assert rc == 0
+        assert "pending" in out
+        assert "trellis2mlx" in out
+        assert "legacy-bad-status" in out
+        assert "malformed" in out
+        assert "status.json" in out
+
+    def test_list_json_degrades_malformed_status_row(self, queue_dir):
+        run_cli("submit", "trellis2mlx", "/tmp/test.png", "/tmp/out", queue_dir=queue_dir)
+        malformed_dir = queue_dir / "done" / "legacy-bad-status"
+        malformed_dir.mkdir(parents=True)
+        malformed_status = malformed_dir / "status.json"
+        malformed_status.write_text("{broken json")
+
+        rc, out, _ = run_cli("list", "--json", queue_dir=queue_dir)
+
+        assert rc == 0
+        payload = json.loads(out)
+        assert payload["schema"] == "gpu-greenroom.queue-index.v1"
+        assert payload["queue_dir"] == str(queue_dir)
+        rows = payload["rows"]
+        assert any(row["status"] == "pending" for row in rows)
+        bad = next(row for row in rows if row["job_id"] == "legacy-bad-status")
+        assert bad["status"] == "malformed"
+        assert bad["degraded"] is True
+        assert bad["status_dir"] == "done"
+        assert bad["status_path"] == str(malformed_status)
+        assert bad["parse_error"]
+
 
 class TestCLIStatus:
     def test_status_nonexistent(self, queue_dir):

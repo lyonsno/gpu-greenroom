@@ -380,6 +380,24 @@ class TestList:
         assert len(done) == 1
         assert len(pending) == 1
 
+    def test_list_degrades_malformed_historical_status(self, queue):
+        req = make_request()
+        queue.submit(req)
+        malformed_dir = queue.queue_dir / "done" / "legacy-bad-status"
+        malformed_dir.mkdir(parents=True)
+        malformed_status = malformed_dir / "status.json"
+        malformed_status.write_text("{broken json")
+
+        all_jobs = queue.list_jobs()
+
+        assert any(job.job_id == req.job_id for job in all_jobs)
+        bad = next(job for job in all_jobs if job.job_id == "legacy-bad-status")
+        assert bad.degraded is True
+        assert bad.status_dir == "done"
+        assert bad.status_path == str(malformed_status)
+        assert "parse_error" in bad.warnings
+        assert bad.parse_error
+
 
 # --- Effective route visibility ---
 

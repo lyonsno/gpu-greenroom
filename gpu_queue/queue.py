@@ -127,10 +127,34 @@ class GPUQueue:
             if not sub_dir.exists():
                 continue
             for job_dir in sorted(sub_dir.iterdir()):
+                if not job_dir.is_dir():
+                    continue
                 status_file = job_dir / "status.json"
                 if status_file.exists():
-                    results.append(JobState.from_json(status_file.read_text()))
+                    try:
+                        results.append(JobState.from_json(status_file.read_text()))
+                    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+                        results.append(self._degraded_status_row(job_dir, status_file, sub, exc))
         return results
+
+    def _degraded_status_row(self, job_dir: Path, status_file: Path, status_dir: str, exc: Exception) -> JobState:
+        """Return an inspectable row for legacy/broken status files.
+
+        Listing is a visibility surface; a malformed historical row should not
+        hide healthy queue state or require mutating the queue to inspect it.
+        """
+        return JobState(
+            job_id=job_dir.name,
+            status="malformed",
+            job_type="malformed",
+            input_path=str(status_file),
+            output_dir="",
+            warnings=["parse_error"],
+            degraded=True,
+            status_dir=status_dir,
+            status_path=str(status_file),
+            parse_error=f"{type(exc).__name__}: {exc}",
+        )
 
     def get_job(self, job_id: str) -> JobState | None:
         """Get a specific job's state."""

@@ -92,6 +92,15 @@ def cmd_list(args):
     status_filter = JobStatus(args.status) if args.status else None
     jobs = queue.list_jobs(status_filter)
 
+    if args.json:
+        payload = {
+            "schema": "gpu-greenroom.queue-index.v1",
+            "queue_dir": str(Path(args.queue_dir)),
+            "rows": [json.loads(job.to_json()) for job in jobs],
+        }
+        print(json.dumps(payload, indent=2))
+        return
+
     if not jobs:
         print("No jobs found.")
         return
@@ -102,6 +111,10 @@ def cmd_list(args):
             elapsed = f" ({job.finished_at - job.started_at:.1f}s)"
         elif job.started_at:
             elapsed = f" ({time.time() - job.started_at:.1f}s running)"
+        if job.degraded:
+            detail = job.status_path or job.input_path
+            print(f"  {job.job_id}  {'malformed':10s}  {job.job_type:12s}  {detail}  {job.parse_error or 'parse_error'}")
+            continue
         print(f"  {job.job_id}  {job.status.value:10s}  {job.job_type:12s}  {os.path.basename(job.input_path)}{elapsed}")
 
 
@@ -221,6 +234,7 @@ def main():
     # list
     p_list = sub.add_parser("list", help="List jobs")
     p_list.add_argument("-s", "--status", choices=["pending", "running", "done", "failed", "cancelled"])
+    p_list.add_argument("--json", action="store_true", help="Emit structured queue index JSON")
     p_list.set_defaults(func=cmd_list)
 
     # status

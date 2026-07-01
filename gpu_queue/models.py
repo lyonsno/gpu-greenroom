@@ -40,7 +40,7 @@ class JobRequest:
 @dataclass
 class JobState:
     job_id: str
-    status: JobStatus
+    status: JobStatus | str
     job_type: str
     input_path: str
     output_dir: str
@@ -54,10 +54,14 @@ class JobState:
     effective_route: str | None = None
     pid: int | None = None
     warnings: list[str] = field(default_factory=list)
+    degraded: bool = False
+    status_dir: str | None = None
+    status_path: str | None = None
+    parse_error: str | None = None
 
     def to_json(self) -> str:
         d = asdict(self)
-        d["status"] = self.status.value
+        d["status"] = self.status.value if isinstance(self.status, JobStatus) else self.status
         return json.dumps(d, indent=2)
 
     @classmethod
