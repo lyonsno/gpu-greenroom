@@ -100,6 +100,29 @@ class TestSubmit:
         assert state.job_id == req.job_id
         assert state.warnings == ["volatile_output"]
 
+    def test_list_tolerates_legacy_camelcase_status(self, queue):
+        """Old Greenroom route statuses must not break incident-response listing."""
+        job_id = "legacy-provider-job"
+        job_dir = queue.queue_dir / "failed" / job_id
+        job_dir.mkdir(parents=True)
+        (job_dir / "status.json").write_text(json.dumps({
+            "updatedAt": "2026-06-25T23:05:07.004Z",
+            "jobId": job_id,
+            "jobType": "kaminos.orb-inner-engine.provider-route",
+            "status": "failed",
+            "providerId": "local-image.ideogram4",
+            "bundleRoot": "/tmp/legacy-output",
+            "endedAt": "2026-06-25T23:13:56.969Z",
+        }))
+
+        [state] = queue.list_jobs(JobStatus.FAILED)
+
+        assert state.job_id == job_id
+        assert state.job_type == "kaminos.orb-inner-engine.provider-route"
+        assert state.status == JobStatus.FAILED
+        assert state.output_dir == "/tmp/legacy-output"
+        assert state.input_path == ""
+
 
 # --- Execution ---
 

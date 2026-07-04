@@ -62,7 +62,7 @@ class JobState:
 
     @classmethod
     def from_json(cls, text: str) -> JobState:
-        d = json.loads(text)
+        d = _normalize_job_state_json(json.loads(text))
         d["status"] = JobStatus(d["status"])
         if d.get("warnings") is None:
             d["warnings"] = []
@@ -73,3 +73,43 @@ def _known_fields(cls: type, values: dict[str, Any]) -> dict[str, Any]:
     """Keep persisted JSON forward-compatible with additive fields."""
     names = {field.name for field in fields(cls)}
     return {key: value for key, value in values.items() if key in names}
+
+
+def _normalize_job_state_json(values: dict[str, Any]) -> dict[str, Any]:
+    """Normalize persisted status rows across Greenroom schema revisions."""
+    normalized = dict(values)
+
+    aliases = {
+        "job_id": ("jobId",),
+        "job_type": ("jobType",),
+        "input_path": ("inputPath",),
+        "output_dir": ("outputDir", "bundleRoot"),
+        "submitted_at": ("submittedAt",),
+        "started_at": ("startedAt",),
+        "finished_at": ("finishedAt",),
+        "exit_code": ("exitCode",),
+        "failure_phase": ("failurePhase",),
+        "error_message": ("errorMessage",),
+        "effective_route": ("effectiveRoute",),
+    }
+
+    for canonical, legacy_keys in aliases.items():
+        if canonical in normalized:
+            continue
+        for legacy_key in legacy_keys:
+            if legacy_key in normalized:
+                normalized[canonical] = normalized[legacy_key]
+                break
+
+    # Older provider-route status rows did not include all queue-native fields.
+    # Listing and status inspection should degrade, not crash, during incidents.
+    normalized.setdefault("input_path", "")
+    normalized.setdefault("output_dir", "")
+    normalized.setdefault("params", {})
+    normalized.setdefault("submitted_at", 0.0)
+
+    for numeric_key in ("submitted_at", "started_at", "finished_at"):
+        if isinstance(normalized.get(numeric_key), str):
+            normalized.pop(numeric_key)
+
+    return normalized

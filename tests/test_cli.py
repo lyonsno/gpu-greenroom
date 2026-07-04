@@ -62,6 +62,23 @@ class TestCLIList:
         assert "pending" in out
         assert "trellis2mlx" in out
 
+    def test_list_shows_legacy_camelcase_status(self, queue_dir):
+        job_id = "legacy-provider-job"
+        job_dir = queue_dir / "failed" / job_id
+        job_dir.mkdir(parents=True)
+        (job_dir / "status.json").write_text(json.dumps({
+            "jobId": job_id,
+            "jobType": "kaminos.orb-inner-engine.provider-route",
+            "status": "failed",
+            "bundleRoot": "/tmp/legacy-output",
+        }))
+
+        rc, out, err = run_cli("list", queue_dir=queue_dir)
+
+        assert rc == 0, err
+        assert "failed" in out
+        assert "kaminos.orb-inner-engine.provider-route" in out
+
 
 class TestCLIStatus:
     def test_status_nonexistent(self, queue_dir):
