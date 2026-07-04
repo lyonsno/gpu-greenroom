@@ -117,6 +117,18 @@ class TestCLISubmitDurableOutput:
 
 
 class TestLoadJobTypes:
+    def test_default_trellis_route_consumes_steps(self, queue_dir):
+        """Submitted Trellis steps must reach the effective command."""
+        from gpu_queue.cli import _load_job_types
+        queue_dir.mkdir(parents=True, exist_ok=True)
+        types = _load_job_types(str(queue_dir))
+        trellis = types["trellis2mlx"]
+        cmd = trellis["cmd"]
+        assert "--steps" in cmd
+        steps_index = cmd.index("--steps")
+        assert cmd[steps_index + 1] == "{steps}"
+        assert "steps" in trellis["defaults"]
+
     def test_loads_custom_types(self, queue_dir):
         """_load_job_types merges custom config with defaults."""
         from gpu_queue.cli import _load_job_types

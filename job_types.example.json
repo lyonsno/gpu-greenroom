@@ -6,6 +6,7 @@
       "--output", "{output_dir}/output.glb",
       "--seed", "{seed}",
       "--resolution", "{resolution}",
+      "--steps", "{steps}",
       "--target-faces", "{target_faces}",
       "--texture-size", "{texture_size}",
       "--simplify-first"
@@ -15,6 +16,7 @@
     "defaults": {
       "seed": "42",
       "resolution": "512",
+      "steps": "12",
       "target_faces": "200000",
       "texture_size": "1024"
     }

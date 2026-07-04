@@ -29,6 +29,7 @@ DEFAULT_JOB_TYPES = {
             "--output", "{output_dir}/seed-{seed}.glb",
             "--seed", "{seed}",
             "--resolution", "{resolution}",
+            "--steps", "{steps}",
             "--target-faces", "{target_faces}",
             "--texture-size", "{texture_size}",
             "--simplify-first",
@@ -38,6 +39,7 @@ DEFAULT_JOB_TYPES = {
         "defaults": {
             "seed": "42",
             "resolution": "512",
+            "steps": "12",
             "target_faces": "200000",
             "texture_size": "1024",
         },
