@@ -692,6 +692,52 @@ class TestRichJobTypeConfig:
 
 
 class TestKaminosBrowserPreviewRunner:
+    def test_parser_accepts_explicit_browser_mode_but_defaults_to_fixture(self):
+        from gpu_queue.runners import kaminos_browser_preview as runner
+
+        parser = runner.build_parser()
+        fixture_args = parser.parse_args(["--input-path", "/tmp/in.png", "--output-dir", "/tmp/out"])
+        browser_args = parser.parse_args([
+            "--input-path", "/tmp/in.png",
+            "--output-dir", "/tmp/out",
+            "--mode", "browser",
+            "--kaminos-url", "http://127.0.0.1:8090/",
+        ])
+
+        assert fixture_args.mode == "fixture"
+        assert browser_args.mode == "browser"
+        assert browser_args.kaminos_url == "http://127.0.0.1:8090/"
+
+    def test_browser_route_row_uses_source_data_url_and_preserves_identity(self, tmp_path):
+        from gpu_queue.runners import kaminos_browser_preview as runner
+
+        source = tmp_path / "source.png"
+        source.write_bytes(b"not-a-real-png-but-still-an-input-identity")
+        source_identity = {
+            "kind": "image-inbox",
+            "rootId": "image-inbox",
+            "sha256": "sha256:source",
+            "label": "source.png",
+            "url": "/api/read?root=image-inbox&path=source.png",
+        }
+
+        row = runner._build_browser_route_row(
+            source_path=source,
+            route_id="moge.depth-normal.webgpu-local.v0",
+            request_id="req:moge-preview-browser",
+            job_id="greenroom-job-1",
+            source_identity=source_identity,
+            module_base_url="http://127.0.0.1:5173/",
+        )
+
+        route_config = row["route_job"]["metadata"]["routeConfig"]
+        assert row["route_job"]["routeId"] == "moge.depth-normal.webgpu-local.v0"
+        assert route_config["greenroomJobId"] == "greenroom-job-1"
+        assert route_config["moduleBaseUrl"] == "http://127.0.0.1:5173/"
+        assert route_config["sourceImageIdentity"]["rootId"] == "image-inbox"
+        assert route_config["sourceImageIdentity"]["sha256"] == "sha256:source"
+        assert route_config["sourceImageIdentity"]["url"].startswith("data:image/png;base64,")
+
     def test_default_runner_writes_kaminos_route_result(self, queue, tmp_path):
         from gpu_queue.cli import _load_job_types
 

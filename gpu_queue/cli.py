@@ -67,6 +67,10 @@ DEFAULT_JOB_TYPES = {
             "--module-base-url", "{module_base_url}",
             "--kit-version", "{kit_version}",
             "--mode", "{runner_mode}",
+            "--kaminos-root", "{kaminos_root}",
+            "--kaminos-url", "{kaminos_url}",
+            "--chrome-path", "{chrome_path}",
+            "--browser-timeout-s", "{browser_timeout_s}",
         ],
         "defaults": {
             "result_dir": "",
@@ -76,6 +80,10 @@ DEFAULT_JOB_TYPES = {
             "module_base_url": "",
             "kit_version": "unknown",
             "runner_mode": "fixture",
+            "kaminos_root": "",
+            "kaminos_url": "",
+            "chrome_path": "",
+            "browser_timeout_s": "120",
         },
     },
 }
