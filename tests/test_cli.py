@@ -175,6 +175,22 @@ class TestLoadJobTypes:
         assert "--checkpoint-stop-file" in trellis_cmd
         assert "{checkpoint_stop_file}" in trellis_cmd
 
+    def test_default_kaminos_browser_preview_job_type_is_registered(self, queue_dir):
+        """Kaminos browser preview jobs should be runnable without a local job_types.json."""
+        from gpu_queue.cli import _load_job_types
+
+        types = _load_job_types(str(queue_dir))
+        config = types["kaminos-moge-webgpu-browser-preview"]
+        cmd = config["cmd"]
+
+        assert "gpu_queue.runners.kaminos_browser_preview" in cmd
+        assert "--input-path" in cmd
+        assert "{input_path}" in cmd
+        assert "--result-dir" in cmd
+        assert "{result_dir}" in cmd
+        assert "--source-identity-json" in cmd
+        assert "{source_image_identity}" in cmd
+
     def test_loads_custom_types(self, queue_dir):
         """_load_job_types merges custom config with defaults."""
         from gpu_queue.cli import _load_job_types

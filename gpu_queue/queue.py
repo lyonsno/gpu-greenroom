@@ -683,11 +683,16 @@ class GPUQueue:
             # chained expansion (e.g. param value "{input_path}" must stay literal)
             import re
 
+            def substitution_value(value: Any) -> str:
+                if isinstance(value, (dict, list)):
+                    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+                return str(value)
+
             def safe_substitute(template: str, mapping: dict) -> str:
                 def replacer(match):
                     key = match.group(1)
                     if key in mapping:
-                        return str(mapping[key])
+                        return substitution_value(mapping[key])
                     return match.group(0)  # leave unrecognized placeholders as-is
                 return re.sub(r'\{(\w+)\}', replacer, template)
 

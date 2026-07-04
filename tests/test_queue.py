@@ -557,6 +557,24 @@ class TestEffectiveRoute:
         # Should be the literal string {input_path}, not the expanded path
         assert result == "{input_path}"
 
+    def test_dict_param_templates_as_json_not_python_repr(self, queue, tmp_path):
+        """Nested route identity must survive argv substitution as parseable JSON."""
+        out = str(tmp_path / "out")
+        req = make_request(job_type="echo", output_dir=out)
+        req.params["source_image_identity"] = {
+            "kind": "row",
+            "rootId": "image-inbox",
+            "sha256": "sha256:source",
+        }
+        queue.submit(req)
+        job_types = {"echo": {"cmd": ["sh", "-c", "printf '%s' '{source_image_identity}' > {output_dir}/identity.json"]}}
+
+        queue.run_one(job_types)
+
+        identity = json.loads((Path(out) / "identity.json").read_text())
+        assert identity["rootId"] == "image-inbox"
+        assert identity["sha256"] == "sha256:source"
+
     def test_effective_route_distinct_from_request(self, queue):
         """Requested route vs effective route are separate fields."""
         req = make_request(job_type="echo", input_path="/my/image.png")
@@ -671,6 +689,59 @@ class TestRichJobTypeConfig:
         queue.submit(req)
         queue.run_one(echo_job_types)
         assert queue.get_job(req.job_id).status == JobStatus.DONE
+
+
+class TestKaminosBrowserPreviewRunner:
+    def test_default_runner_writes_kaminos_route_result(self, queue, tmp_path):
+        from gpu_queue.cli import _load_job_types
+
+        source = tmp_path / "source.png"
+        source.write_bytes(b"greenroom-kaminos-preview-source")
+        out = tmp_path / "greenroom-output"
+        result_dir = tmp_path / "route-results"
+        req = make_request(
+            job_type="kaminos-moge-webgpu-browser-preview",
+            input_path=str(source),
+            output_dir=str(out),
+            route_id="moge.depth-normal.webgpu-local.v0",
+            request_id="req:moge-preview-smoke",
+            result_dir=str(result_dir),
+            source_image_identity={
+                "kind": "row",
+                "rootId": "image-inbox",
+                "sha256": "sha256:source",
+                "label": "source.png",
+            },
+            kit_version="0.1.5",
+        )
+        queue.submit(req)
+
+        ran = queue.run_one(_load_job_types(str(queue.queue_dir)))
+
+        assert ran is True
+        state = queue.get_job(req.job_id)
+        assert state.status == JobStatus.DONE
+        result_path = result_dir / "moge.depth-normal.webgpu-local.v0__req-moge-preview-smoke.json"
+        assert result_path.exists()
+        result = json.loads(result_path.read_text())
+        assert result["schema"] == "kaminos.webgpu-route-result.v0"
+        assert result["requestId"] == "req:moge-preview-smoke"
+        assert result["routeId"] == "moge.depth-normal.webgpu-local.v0"
+        assert result["status"] == "fallback"
+        assert result["request"]["routeConfig"]["sourceImageIdentity"]["rootId"] == "image-inbox"
+        receipt = result["receipt"]
+        assert receipt["schema"] == "kaminos.webgpu-route-receipt.v0"
+        assert receipt["status"] == "fallback"
+        assert "fixture/no-model" in receipt["fallbackReason"]
+        assert receipt["kernel"]["kitVersion"] == "0.1.5"
+        assert receipt["inputs"][0]["sha256"] == "sha256:source"
+        assert [artifact["role"] for artifact in receipt["outputs"]] == ["depth", "normal", "pointmap"]
+        assert all(artifact["status"] == "real" for artifact in receipt["outputs"])
+        assert all(artifact["previewDataUrl"].startswith("data:image/png;base64,") for artifact in receipt["outputs"])
+        sidecar = json.loads((out / "greenroom-browser-webgpu-preview.json").read_text())
+        assert sidecar["result_path"] == str(result_path)
+        greenroom_receipt = json.loads((queue.queue_dir / "done" / req.job_id / "receipt.json").read_text())
+        assert "source_image_identity" not in (greenroom_receipt.get("ignored_params") or {})
 
 
 # --- Receipt route identity ---

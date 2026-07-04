@@ -54,6 +54,30 @@ DEFAULT_JOB_TYPES = {
         "env": {"PYTHONPATH": "."},
         "defaults": {},
     },
+    "kaminos-moge-webgpu-browser-preview": {
+        "cmd": [
+            sys.executable, "-m", "gpu_queue.runners.kaminos_browser_preview",
+            "--input-path", "{input_path}",
+            "--output-dir", "{output_dir}",
+            "--result-dir", "{result_dir}",
+            "--request-id", "{request_id}",
+            "--route-id", "{route_id}",
+            "--job-id", "{job_id}",
+            "--source-identity-json", "{source_image_identity}",
+            "--module-base-url", "{module_base_url}",
+            "--kit-version", "{kit_version}",
+            "--mode", "{runner_mode}",
+        ],
+        "defaults": {
+            "result_dir": "",
+            "request_id": "",
+            "route_id": "moge.depth-normal.webgpu-local.v0",
+            "source_image_identity": "{}",
+            "module_base_url": "",
+            "kit_version": "unknown",
+            "runner_mode": "fixture",
+        },
+    },
 }
 
 
