@@ -150,6 +150,61 @@ class TestLoadJobTypes:
         types = _load_job_types(str(queue_dir))
         assert "trellis2mlx" in types  # defaults survived
 
+    def test_default_sam3_isolate_route_preserves_identity_knobs(self, queue_dir):
+        """SAM3 isolation must expose the route identity needed for receipts."""
+        from gpu_queue.cli import _load_job_types
+        types = _load_job_types(str(queue_dir))
+
+        route = types["sam3_isolate"]
+        cmd = " ".join(route["cmd"])
+
+        assert "-m gpu_queue.sam3_isolate" in cmd
+        assert "--model {model}" in cmd
+        assert "--prompts {prompts}" in cmd
+        assert "--boxes {boxes}" in cmd
+        assert "--threshold {threshold}" in cmd
+        assert route["defaults"]["model"] == "mlx-community/sam3.1-bf16"
+        assert route["defaults"]["prompts"] == "object"
+
+
+class TestSAM3IsolateScript:
+    def test_missing_input_writes_failure_receipt_before_model_load(self, tmp_path):
+        """A pre-model failure must still leave a durable isolation receipt."""
+        out_dir = tmp_path / "sam3_out"
+        cmd = [
+            sys.executable,
+            "-m",
+            "gpu_queue.sam3_isolate",
+            "--image",
+            str(tmp_path / "missing.png"),
+            "--output-dir",
+            str(out_dir),
+            "--prompts",
+            "curved metal strip|orange inner machinery",
+            "--boxes",
+            "0,0,32,32",
+            "--model",
+            "mlx-community/sam3.1-bf16",
+        ]
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            cwd=str(Path(__file__).resolve().parent.parent),
+        )
+
+        assert result.returncode == 1
+        receipt_path = out_dir / "isolation-receipt.json"
+        assert receipt_path.exists()
+        receipt = json.loads(receipt_path.read_text())
+        assert receipt["ok"] is False
+        assert receipt["phase"] == "load_image"
+        assert receipt["model"] == "mlx-community/sam3.1-bf16"
+        assert receipt["prompts"] == ["curved metal strip", "orange inner machinery"]
+        assert receipt["boxes"] == [[0.0, 0.0, 32.0, 32.0]]
+        assert receipt["outputs"] == {}
+
 
 class TestCLIRecover:
     def test_recover_no_stale(self, queue_dir):

@@ -20,6 +20,8 @@ DEFAULT_QUEUE_DIR = os.environ.get("GPU_GREENROOM_DIR", os.path.expanduser("~/.l
 # Bare list also accepted for simple cases
 _TRELLIS_ROOT = os.path.expanduser("~/dev/trellis2mlx")
 _PERCEPTASIA_ROOT = os.path.expanduser("~/dev/perceptasia")
+_GREENROOM_ROOT = str(Path(__file__).resolve().parent.parent)
+_MLX_VLM_PYTHON = os.path.expanduser("~/dev/mlx-vlm/.venv/bin/python")
 
 DEFAULT_JOB_TYPES = {
     "trellis2mlx": {
@@ -51,6 +53,30 @@ DEFAULT_JOB_TYPES = {
         "cwd": _PERCEPTASIA_ROOT,
         "env": {"PYTHONPATH": "."},
         "defaults": {},
+    },
+    "sam3_isolate": {
+        "cmd": [
+            _MLX_VLM_PYTHON, "-u", "-m", "gpu_queue.sam3_isolate",
+            "--image", "{input_path}",
+            "--output-dir", "{output_dir}",
+            "--model", "{model}",
+            "--prompts", "{prompts}",
+            "--boxes", "{boxes}",
+            "--threshold", "{threshold}",
+            "--max-results", "{max_results}",
+            "--feather", "{feather}",
+        ],
+        "cwd": _GREENROOM_ROOT,
+        "env": {"PYTHONPATH": _GREENROOM_ROOT},
+        "defaults": {
+            "model": "mlx-community/sam3.1-bf16",
+            "prompts": "object",
+            "boxes": "",
+            "threshold": "0.15",
+            "max_results": "4",
+            "feather": "1.25",
+        },
+        "timeout": 300,
     },
 }
 

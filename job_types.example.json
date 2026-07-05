@@ -29,6 +29,30 @@
     "env": {"PYTHONPATH": "."},
     "defaults": {}
   },
+  "sam3_isolate": {
+    "cmd": [
+      "/Users/noahlyons/dev/mlx-vlm/.venv/bin/python", "-u", "-m", "gpu_queue.sam3_isolate",
+      "--image", "{input_path}",
+      "--output-dir", "{output_dir}",
+      "--model", "{model}",
+      "--prompts", "{prompts}",
+      "--boxes", "{boxes}",
+      "--threshold", "{threshold}",
+      "--max-results", "{max_results}",
+      "--feather", "{feather}"
+    ],
+    "cwd": "/Users/noahlyons/dev/gpu-greenroom",
+    "env": {"PYTHONPATH": "/Users/noahlyons/dev/gpu-greenroom"},
+    "defaults": {
+      "model": "mlx-community/sam3.1-bf16",
+      "prompts": "object",
+      "boxes": "",
+      "threshold": "0.15",
+      "max_results": "4",
+      "feather": "1.25"
+    },
+    "timeout": 300
+  },
   "moge": {
     "cmd": [
       "/Users/noahlyons/dev/perceptasia/.venv/bin/python", "-u", "run_moge.py",

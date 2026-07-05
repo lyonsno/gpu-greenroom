@@ -4,7 +4,7 @@ Filesystem-backed GPU job queue with flock serialization. One GPU job at a time,
 
 ## Problem
 
-Heavy spatial-AI generation jobs (TRELLIS2MLX, Pixal3D, SuperMat, MoGe) share a single Mac GPU. Running multiple jobs concurrently risks kernel panics, Metal scheduler deadlocks, and OOM crashes. gpu-greenroom serializes GPU-bound work so only one job runs at a time.
+Heavy spatial-AI generation jobs (TRELLIS2MLX, Pixal3D, SuperMat, MoGe, SAM3 isolation) share a single Mac GPU. Running multiple jobs concurrently risks kernel panics, Metal scheduler deadlocks, and OOM crashes. gpu-greenroom serializes GPU-bound work so only one job runs at a time.
 
 ## Install
 
@@ -24,6 +24,10 @@ gpu-greenroom submit trellis2mlx /path/to/image.png /path/to/output/
 
 # Submit with custom params
 gpu-greenroom submit trellis2mlx /path/to/image.png /path/to/output/ -p seed=99 resolution=768
+
+# Isolate semantic elements into masks/RGBA cutouts
+gpu-greenroom submit sam3_isolate /path/to/image.png /path/to/output/ \
+  -p 'prompts=curved metal ribbon|orange inner machinery' 'boxes=0,0,285,512'
 
 # List queue
 gpu-greenroom list
@@ -95,9 +99,27 @@ Each job type is a dict with:
 | `defaults` | no | Default param values. User params override defaults. Reserved keys (`input_path`, `output_dir`) always win. |
 | `timeout` | no | Timeout in seconds. `null`/absent = no timeout. |
 
-See `job_types.example.json` for TRELLIS2MLX, SuperMat, MoGe, and Pixal3D templates.
+See `job_types.example.json` for TRELLIS2MLX, SAM3 isolation, SuperMat, MoGe, and Pixal3D templates.
 
 Bare command lists are also accepted for simple cases: `{"echo": ["echo", "{input_path}"]}`.
+
+### `sam3_isolate`
+
+`sam3_isolate` runs the local MLX SAM3 route and writes alpha-bearing component
+sources for downstream mesh generation or visual baking. It produces
+`isolation-receipt.json`, `overlay.png`, `mask-XX.png`, `cutout-XX.png`, and
+`cutouts-checker-contact.png`.
+
+Common params:
+
+| Param | Default | Description |
+|-------|---------|-------------|
+| `model` | `mlx-community/sam3.1-bf16` | Local SAM model id. |
+| `prompts` | `object` | One prompt or a `|`-separated prompt list. |
+| `boxes` | empty | Optional `x1,y1,x2,y2` box or `|`-separated boxes. |
+| `threshold` | `0.15` | SAM score threshold. |
+| `max_results` | `4` | Number of ranked masks/cutouts to write. |
+| `feather` | `1.25` | Gaussian blur radius for cutout alpha edges. |
 
 ## Route identity shield
 
