@@ -69,6 +69,27 @@ class TestCLIStatus:
         assert rc == 1
         assert "not found" in out
 
+    def test_status_without_job_id_prints_queue_overview_json(self, queue_dir):
+        run_cli("submit", "trellis2mlx", "/tmp/test.png", "/tmp/out", queue_dir=queue_dir)
+        rc, out, _ = run_cli("status", "--json", queue_dir=queue_dir)
+        assert rc == 0
+
+        data = json.loads(out)
+        assert data["schema"] == "gpu-greenroom.queue-status.v0"
+        assert data["queue_dir"] == str(queue_dir)
+        assert data["paused"] is False
+        assert data["counts"]["pending"] == 1
+        assert data["counts"]["running"] == 0
+        assert data["counts"]["done"] == 0
+        assert data["next_pending"]["job_type"] == "trellis2mlx"
+
+    def test_status_without_job_id_prints_queue_overview_text(self, queue_dir):
+        rc, out, _ = run_cli("status", queue_dir=queue_dir)
+        assert rc == 0
+        assert "Queue:" in out
+        assert "pending" in out
+        assert "Next:" in out
+
 
 class TestCLICancel:
     def test_cancel_pending(self, queue_dir):
@@ -149,6 +170,49 @@ class TestLoadJobTypes:
         config.write_text("{broken json")
         types = _load_job_types(str(queue_dir))
         assert "trellis2mlx" in types  # defaults survived
+
+
+class TestCLIJobTypes:
+    def test_job_types_json_lists_defaults_and_custom_routes(self, queue_dir):
+        queue_dir.mkdir(parents=True, exist_ok=True)
+        (queue_dir / "job_types.json").write_text(json.dumps({
+            "custom_type": {
+                "cmd": ["echo", "{input_path}"],
+                "cwd": "/tmp/custom",
+                "env": {"CUSTOM_BACKEND": "local"},
+                "defaults": {"seed": "7"},
+            }
+        }))
+
+        rc, out, _ = run_cli("job-types", "--json", queue_dir=queue_dir)
+        assert rc == 0
+
+        data = json.loads(out)
+        assert data["schema"] == "gpu-greenroom.job-types.v0"
+        assert data["queue_dir"] == str(queue_dir)
+        assert data["config_path"] == str(queue_dir / "job_types.json")
+        names = {route["name"] for route in data["job_types"]}
+        assert {"trellis2mlx", "supermat", "custom_type"} <= names
+
+        custom = next(route for route in data["job_types"] if route["name"] == "custom_type")
+        assert custom["source"] == "config"
+        assert custom["cwd"] == "/tmp/custom"
+        assert custom["env_keys"] == ["CUSTOM_BACKEND"]
+        assert custom["default_keys"] == ["seed"]
+        assert custom["cmd_preview"] == "echo {input_path}"
+
+    def test_job_types_text_is_discoverable(self, queue_dir):
+        rc, out, _ = run_cli("job-types", queue_dir=queue_dir)
+        assert rc == 0
+        assert "Job types:" in out
+        assert "trellis2mlx" in out
+        assert "default" in out
+
+    def test_routes_alias_lists_job_types(self, queue_dir):
+        rc, out, _ = run_cli("routes", "--json", queue_dir=queue_dir)
+        assert rc == 0
+        data = json.loads(out)
+        assert data["schema"] == "gpu-greenroom.job-types.v0"
 
 
 class TestCLIRecover:

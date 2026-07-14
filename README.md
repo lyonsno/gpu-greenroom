@@ -29,8 +29,17 @@ gpu-greenroom submit trellis2mlx /path/to/image.png /path/to/output/ -p seed=99 
 gpu-greenroom list
 gpu-greenroom list -s pending
 
+# Queue overview
+gpu-greenroom status
+gpu-greenroom status --json
+
 # Check job status
 gpu-greenroom status <job-id>
+
+# Discover configured routes/job types
+gpu-greenroom job-types
+gpu-greenroom job-types --json
+gpu-greenroom routes --json
 
 # Cancel a pending job
 gpu-greenroom cancel <job-id>
