@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from gpu_queue.models import JobRequest, JobStatus
 from gpu_queue.queue import GPUQueue
+from gpu_queue.cli import _load_job_types
 
 DEFAULT_QUEUE_DIR = os.environ.get(
     "GPU_GREENROOM_DIR",
@@ -148,6 +149,38 @@ def poll_job(queue: GPUQueue, job_id: str, timeout: float = 600) -> dict | None:
     return None
 
 
+def run_submitted_job_if_next(queue: GPUQueue, job_id: str, job_types: dict) -> None:
+    """Run the submitted job in-process when it is next in FIFO.
+
+    This makes single-run benchmark queues self-contained while preserving FIFO:
+    if another job is ahead of ours or the lock is held, we leave execution to a
+    separately running Greenroom worker instead of jumping the queue.
+    """
+    pending = sorted(
+        queue.list_jobs(JobStatus.PENDING),
+        key=lambda state: state.submitted_at,
+    )
+    if not pending or pending[0].job_id != job_id:
+        if pending:
+            print(
+                f"  Waiting for external worker; next pending job is {pending[0].job_id}",
+                file=sys.stderr,
+            )
+        return
+
+    print(f"  Running {job_id} in-process under Greenroom flock", file=sys.stderr)
+    ran = queue.run_one(job_types)
+    if not ran:
+        print(
+            f"  Greenroom worker did not run {job_id}; lock may be held or queue paused",
+            file=sys.stderr,
+        )
+
+
+def _job_file(queue: GPUQueue, subdir: str, job_id: str, filename: str) -> Path:
+    return Path(queue.queue_dir) / subdir / job_id / filename
+
+
 def collect_result(queue: GPUQueue, job_id: str) -> dict | None:
     """Read the benchmark JSON from a completed job's output dir."""
     state = queue.get_job(job_id)
@@ -164,7 +197,7 @@ def collect_result(queue: GPUQueue, job_id: str) -> dict | None:
 
     # Also check stdout for JSON (some jobs write to stdout)
     for sub in ("done", "failed"):
-        stdout_path = Path(DEFAULT_QUEUE_DIR) / sub / job_id / "stdout.log"
+        stdout_path = _job_file(queue, sub, job_id, "stdout.log")
         if stdout_path.exists():
             try:
                 text = stdout_path.read_text().strip()
@@ -179,7 +212,7 @@ def collect_result(queue: GPUQueue, job_id: str) -> dict | None:
 def collect_receipt(queue: GPUQueue, job_id: str) -> dict | None:
     """Read the greenroom receipt for a job."""
     for sub in ("done", "failed", "cancelled"):
-        receipt_path = Path(DEFAULT_QUEUE_DIR) / sub / job_id / "receipt.json"
+        receipt_path = _job_file(queue, sub, job_id, "receipt.json")
         if receipt_path.exists():
             try:
                 return json.loads(receipt_path.read_text())
@@ -283,6 +316,7 @@ def main():
         return
 
     queue = GPUQueue(args.queue_dir)
+    job_types = _load_job_types(args.queue_dir)
 
     # Collect hardware info and git commits
     hardware = get_hardware_info()
@@ -327,6 +361,11 @@ def main():
         job_id = request.job_id
         print(f"  Job ID: {job_id}", file=sys.stderr)
         print(f"  Output: {job_output}", file=sys.stderr)
+
+        # Execute directly when this benchmark job is next in FIFO. This keeps
+        # private benchmark queues self-contained without requiring a background
+        # worker, while still refusing to jump ahead of existing queued work.
+        run_submitted_job_if_next(queue, job_id, job_types)
 
         # Poll for completion
         status = poll_job(queue, job_id, timeout=args.timeout)

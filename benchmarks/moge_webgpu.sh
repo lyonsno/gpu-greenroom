@@ -13,7 +13,7 @@ set -euo pipefail
 
 MOGE_WEBGPU_DIR="${MOGE_WEBGPU_DIR:-$HOME/dev/moge-webgpu}"
 PORT="${BENCHMARK_PORT:-5181}"
-RUNS=5
+RUNS=10
 OUTPUT_DIR=""
 
 while [[ $# -gt 0 ]]; do
@@ -28,11 +28,11 @@ done
 echo "WebGPU MoGe-2 benchmark -- port=$PORT, runs=$RUNS" >&2
 echo "moge-webgpu dir: $MOGE_WEBGPU_DIR" >&2
 
-# Ensure no stale server on our port
+# Do not kill an unrelated process. Greenroom serializes GPU work, not TCP
+# ownership; an occupied benchmark port is a route/setup failure.
 if lsof -ti :"$PORT" >/dev/null 2>&1; then
-    echo "Port $PORT already in use, killing existing process" >&2
-    kill $(lsof -ti :"$PORT") 2>/dev/null || true
-    sleep 1
+    echo "ERROR: Port $PORT is already in use; choose BENCHMARK_PORT or --port" >&2
+    exit 1
 fi
 
 # Start dev server in background

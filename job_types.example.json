@@ -91,7 +91,7 @@
       "--output-dir", "{output_dir}"
     ],
     "defaults": {
-      "runs": "5"
+      "runs": "10"
     },
     "timeout": 600
   }
