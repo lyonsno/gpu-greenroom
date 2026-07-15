@@ -215,6 +215,47 @@ class TestCLIInteractiveLease:
         assert rc == 2
         assert "positive" in err
 
+    def test_preclosed_stdin_never_claims_effective(self, queue_dir):
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "gpu_queue.cli",
+                "--queue-dir",
+                str(queue_dir),
+                "lease",
+                "acquire",
+                "--lease-id",
+                "spoke-cli-preclosed",
+                "--holder",
+                "spoke",
+                "--purpose",
+                "final-asr",
+            ],
+            cwd=str(Path(__file__).resolve().parent.parent),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+
+        assert result.returncode == 0
+        events = [json.loads(line) for line in result.stdout.splitlines()]
+        assert [event["state"] for event in events] == [
+            "requested",
+            "released-unacquired",
+        ]
+        assert all(event["effective_at"] is None for event in events)
+
+        receipt_path = (
+            queue_dir / "leases" / "spoke-cli-preclosed" / "receipt.json"
+        )
+        receipt = json.loads(receipt_path.read_text())
+        assert receipt["state"] == "released-unacquired"
+        assert receipt["last_trustworthy_event"] == (
+            "request-cancelled-before-acquisition"
+        )
+
     def test_holder_emits_requested_then_effective_and_releases_on_stdin_eof(
         self, queue_dir
     ):

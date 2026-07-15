@@ -243,6 +243,9 @@ def cmd_lease_acquire(args):
         _emit_lease_event(lease.request())
         requested = True
         while not stop.is_set():
+            if _stdin_closed(0):
+                stop.set()
+                break
             if lease.acquire(blocking=False):
                 _emit_lease_event(lease.snapshot())
                 break
