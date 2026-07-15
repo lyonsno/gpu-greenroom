@@ -92,7 +92,14 @@ class InteractiveLease:
         return self.snapshot()
 
     def acquire(self, *, blocking: bool = True) -> bool:
-        """Acquire ``gpu.lock`` and persist effectiveness only after flock succeeds."""
+        """Claim ``gpu.lock`` and immediately publish effectiveness."""
+        if not self.claim_lock(blocking=blocking):
+            return False
+        self.publish_effective()
+        return True
+
+    def claim_lock(self, *, blocking: bool = True) -> bool:
+        """Claim ``gpu.lock`` without publishing an effective lease yet."""
         if self._receipt is None:
             self.request()
         if self._lock_fd is not None:
@@ -118,14 +125,26 @@ class InteractiveLease:
             raise
 
         self._lock_fd = lock_fd
+        return True
+
+    def publish_effective(self) -> dict:
+        """Persist effectiveness after the caller accepts the claimed lock."""
+        if self._lock_fd is None:
+            raise InteractiveLeaseError("cannot publish effective without gpu.lock")
         assert self._receipt is not None
+        if self._receipt["state"] == "effective":
+            return self.snapshot()
+        if self._receipt["state"] != "requested":
+            raise InteractiveLeaseError(
+                f"cannot publish effective from state {self._receipt['state']}"
+            )
         self._receipt.update(
             state="effective",
             effective_at=time.time(),
             last_trustworthy_event="gpu-lock-acquired",
         )
         self._write_receipt()
-        return True
+        return self.snapshot()
 
     def release(self) -> dict:
         """Release the kernel lock without claiming acquisition when none occurred."""
@@ -143,13 +162,18 @@ class InteractiveLease:
                 self._lock_fd.close()
                 self._lock_fd = None
 
+        was_effective = self._receipt["effective_at"] is not None
         self._receipt.update(
-            state="released" if had_lock else "released-unacquired",
+            state="released" if was_effective else "released-unacquired",
             released_at=time.time(),
             last_trustworthy_event=(
                 "gpu-lock-released"
-                if had_lock
-                else "request-cancelled-before-acquisition"
+                if was_effective
+                else (
+                    "gpu-lock-released-before-effective-publication"
+                    if had_lock
+                    else "request-cancelled-before-acquisition"
+                )
             ),
         )
         self._write_receipt()

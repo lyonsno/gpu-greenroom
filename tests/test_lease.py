@@ -162,3 +162,28 @@ def test_terminal_lease_identity_cannot_reacquire(tmp_path):
 
     with pytest.raises(InteractiveLeaseError, match="terminal"):
         lease.acquire(blocking=False)
+
+
+def test_lock_claim_does_not_publish_effective_until_committed(tmp_path):
+    from gpu_queue.lease import InteractiveLease
+
+    lease = InteractiveLease(
+        tmp_path / "queue",
+        lease_id="spoke-utterance-7",
+        holder="spoke",
+        purpose="final-asr",
+    )
+    lease.request()
+
+    assert lease.claim_lock(blocking=False) is True
+    claimed = _receipt(lease)
+    assert claimed["state"] == "requested"
+    assert claimed["effective_at"] is None
+    assert claimed["last_trustworthy_event"] == "request-persisted"
+
+    lease.publish_effective()
+    effective = _receipt(lease)
+    assert effective["state"] == "effective"
+    assert effective["effective_at"] is not None
+    assert effective["last_trustworthy_event"] == "gpu-lock-acquired"
+    lease.release()

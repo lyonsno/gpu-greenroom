@@ -256,6 +256,34 @@ class TestCLIInteractiveLease:
             "request-cancelled-before-acquisition"
         )
 
+    def test_cancellation_after_lock_claim_prevents_effective_publication(
+        self, queue_dir
+    ):
+        from gpu_queue.cli import _claim_lease_once
+        from gpu_queue.lease import InteractiveLease
+
+        lease = InteractiveLease(
+            queue_dir,
+            lease_id="spoke-cli-cancel-after-claim",
+            holder="spoke",
+            purpose="final-asr",
+        )
+        lease.request()
+        cancellation_checks = iter((False, True))
+
+        outcome = _claim_lease_once(
+            lease,
+            cancelled=lambda: next(cancellation_checks),
+        )
+
+        assert outcome == "cancelled"
+        receipt = json.loads(lease.receipt_path.read_text())
+        assert receipt["state"] == "released-unacquired"
+        assert receipt["effective_at"] is None
+        assert receipt["last_trustworthy_event"] == (
+            "gpu-lock-released-before-effective-publication"
+        )
+
     def test_holder_emits_requested_then_effective_and_releases_on_stdin_eof(
         self, queue_dir
     ):

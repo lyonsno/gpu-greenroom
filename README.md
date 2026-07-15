@@ -185,9 +185,12 @@ Every completed or failed job gets a `receipt.json`:
 Uses `flock(LOCK_EX | LOCK_NB)` on `gpu.lock`. Only one worker can run a job at a time. If the lock is held, `run_one()` returns immediately without queuing or blocking. Cancel also acquires the lock to prevent races.
 
 Interactive leases use that same lock. A lease writes `requested` before it
-attempts acquisition and writes `effective` only after `flock` succeeds. While
-the holder process remains alive and owns the file descriptor, workers cannot
-start another job. Orderly stdin EOF or `SIGINT`/`SIGTERM` writes `released`;
+attempts acquisition. The CLI claims the lock without publishing effectiveness,
+rechecks stdin and signal cancellation while holding the file descriptor, and
+writes `effective` only when the claim is still wanted. Cancellation in that
+boundary releases the lock as `released-unacquired` with no effective timestamp.
+While the effective holder process remains alive and owns the file descriptor,
+workers cannot start another job. Orderly stdin EOF or `SIGINT`/`SIGTERM` writes `released`;
 process death still releases the kernel lock automatically. A receipt left at
 `effective` by `SIGKILL` is historical evidence that acquisition happened, not
 proof that exclusion remains live: its `current_authority` explicitly requires
@@ -203,4 +206,4 @@ model, render, or command-buffer boundaries is a separate consumer contract.
 uv run --extra test python -m pytest tests/ -v
 ```
 
-98 tests covering serialization, failure receipts, stale recovery, cancel safety, FIFO order, param injection prevention, rich config (cwd/env/defaults), receipt route identity, configurable timeout, pause/resume, interactive lease truthfulness and process-death release, durable output dirs, volatile path warnings, and CLI.
+101 tests covering serialization, failure receipts, stale recovery, cancel safety, FIFO order, param injection prevention, rich config (cwd/env/defaults), receipt route identity, configurable timeout, pause/resume, interactive lease truthfulness and process-death release, durable output dirs, volatile path warnings, and CLI.

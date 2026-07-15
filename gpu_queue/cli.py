@@ -220,6 +220,19 @@ def _positive_float(value: str) -> float:
     return parsed
 
 
+def _claim_lease_once(lease: InteractiveLease, *, cancelled) -> str:
+    """Attempt one cancelable lock claim without publishing false effectiveness."""
+    if cancelled():
+        return "cancelled"
+    if not lease.claim_lock(blocking=False):
+        return "blocked"
+    if cancelled():
+        lease.release()
+        return "cancelled"
+    lease.publish_effective()
+    return "effective"
+
+
 def cmd_lease_acquire(args):
     """Request a lease, hold the GPU flock, and release on EOF or a signal."""
     lease = InteractiveLease(
@@ -242,11 +255,18 @@ def cmd_lease_acquire(args):
     try:
         _emit_lease_event(lease.request())
         requested = True
-        while not stop.is_set():
-            if _stdin_closed(0):
+
+        def cancelled():
+            if stop.is_set() or _stdin_closed(0):
                 stop.set()
+                return True
+            return False
+
+        while not stop.is_set():
+            outcome = _claim_lease_once(lease, cancelled=cancelled)
+            if outcome == "cancelled":
                 break
-            if lease.acquire(blocking=False):
+            if outcome == "effective":
                 _emit_lease_event(lease.snapshot())
                 break
             if _stdin_closed(args.poll_seconds):
