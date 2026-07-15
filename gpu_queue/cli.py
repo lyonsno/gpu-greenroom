@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
-"""GPU Greenroom CLI — submit, list, status, cancel, run worker."""
+"""GPU Greenroom CLI — queue work and hold interactive GPU leases."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import select
+import signal
 import sys
+import threading
 import time
 from pathlib import Path
 
 from .models import JobRequest, JobStatus
+from .lease import InteractiveLease, InteractiveLeaseError
 from .queue import GPUQueue
 
 DEFAULT_QUEUE_DIR = os.environ.get("GPU_GREENROOM_DIR", os.path.expanduser("~/.local/state/gpu-greenroom"))
@@ -197,6 +201,68 @@ def cmd_recover(args):
         print("No stale jobs found.")
 
 
+def _emit_lease_event(event: dict) -> None:
+    print(json.dumps(event, sort_keys=True), flush=True)
+
+
+def _stdin_closed(wait_seconds: float) -> bool:
+    """Return true on stdin EOF while keeping terminal and pipe callers nonblocking."""
+    readable, _, _ = select.select([sys.stdin], [], [], wait_seconds)
+    if not readable:
+        return False
+    return os.read(sys.stdin.fileno(), 4096) == b""
+
+
+def _positive_float(value: str) -> float:
+    parsed = float(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be positive")
+    return parsed
+
+
+def cmd_lease_acquire(args):
+    """Request a lease, hold the GPU flock, and release on EOF or a signal."""
+    lease = InteractiveLease(
+        args.queue_dir,
+        lease_id=args.lease_id,
+        holder=args.holder,
+        purpose=args.purpose,
+        receipt_path=args.receipt_path,
+    )
+    stop = threading.Event()
+
+    def request_stop(_signum, _frame):
+        stop.set()
+
+    previous_handlers = {}
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        previous_handlers[signum] = signal.signal(signum, request_stop)
+
+    requested = False
+    try:
+        _emit_lease_event(lease.request())
+        requested = True
+        while not stop.is_set():
+            if lease.acquire(blocking=False):
+                _emit_lease_event(lease.snapshot())
+                break
+            if _stdin_closed(args.poll_seconds):
+                stop.set()
+
+        while lease.is_effective and not stop.is_set():
+            if _stdin_closed(args.poll_seconds):
+                stop.set()
+    except InteractiveLeaseError as exc:
+        print(f"Interactive lease failed: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+        if requested:
+            _emit_lease_event(lease.release())
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="gpu-greenroom",
@@ -250,11 +316,34 @@ def main():
     p_recover = sub.add_parser("recover", help="Recover stale running jobs")
     p_recover.set_defaults(func=cmd_recover)
 
+    # interactive lease
+    p_lease = sub.add_parser("lease", help="Hold gpu.lock for interactive work")
+    lease_sub = p_lease.add_subparsers(dest="lease_command", required=True)
+    p_lease_acquire = lease_sub.add_parser(
+        "acquire", help="Request and hold an interactive GPU lease"
+    )
+    p_lease_acquire.add_argument("--lease-id", required=True)
+    p_lease_acquire.add_argument("--holder", required=True)
+    p_lease_acquire.add_argument("--purpose", required=True)
+    p_lease_acquire.add_argument(
+        "--receipt-path",
+        help="Caller-owned receipt path (default: queue-dir/leases/<id>/receipt.json)",
+    )
+    p_lease_acquire.add_argument(
+        "--poll-seconds",
+        type=_positive_float,
+        default=0.05,
+        help="Signal/stdin poll interval; does not limit lease acquisition",
+    )
+    p_lease_acquire.set_defaults(func=cmd_lease_acquire)
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
         sys.exit(1)
-    args.func(args)
+    result = args.func(args)
+    if isinstance(result, int):
+        sys.exit(result)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,9 @@
 """Tests for the GPU Greenroom CLI."""
 
 import json
+import os
+import select
+import signal
 import subprocess
 import sys
 import tempfile
@@ -156,3 +159,136 @@ class TestCLIRecover:
         rc, out, _ = run_cli("recover", queue_dir=queue_dir)
         assert rc == 0
         assert "No stale" in out
+
+
+def _read_json_line(proc: subprocess.Popen, timeout: float = 3.0) -> dict:
+    assert proc.stdout is not None
+    readable, _, _ = select.select([proc.stdout], [], [], timeout)
+    assert readable, "timed out waiting for lease event"
+    line = proc.stdout.readline()
+    assert line, f"lease process exited before event: {proc.poll()}"
+    return json.loads(line)
+
+
+def _lease_process(queue_dir: Path, lease_id: str) -> subprocess.Popen:
+    return subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "gpu_queue.cli",
+            "--queue-dir",
+            str(queue_dir),
+            "lease",
+            "acquire",
+            "--lease-id",
+            lease_id,
+            "--holder",
+            "spoke",
+            "--purpose",
+            "final-asr",
+        ],
+        cwd=str(Path(__file__).resolve().parent.parent),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+
+
+class TestCLIInteractiveLease:
+    def test_poll_interval_must_be_positive(self, queue_dir):
+        rc, _, err = run_cli(
+            "lease",
+            "acquire",
+            "--lease-id",
+            "bad-poll",
+            "--holder",
+            "spoke",
+            "--purpose",
+            "final-asr",
+            "--poll-seconds",
+            "0",
+            queue_dir=queue_dir,
+        )
+
+        assert rc == 2
+        assert "positive" in err
+
+    def test_holder_emits_requested_then_effective_and_releases_on_stdin_eof(
+        self, queue_dir
+    ):
+        proc = _lease_process(queue_dir, "spoke-cli-1")
+        try:
+            requested = _read_json_line(proc)
+            effective = _read_json_line(proc)
+            assert requested["state"] == "requested"
+            assert requested["effective_at"] is None
+            assert effective["state"] == "effective"
+            assert effective["effective_at"] is not None
+
+            assert proc.stdin is not None
+            proc.stdin.close()
+            assert proc.wait(timeout=3) == 0
+
+            receipt_path = queue_dir / "leases" / "spoke-cli-1" / "receipt.json"
+            receipt = json.loads(receipt_path.read_text())
+            assert receipt["state"] == "released"
+            assert receipt["released_at"] is not None
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=3)
+
+    def test_blocked_holder_does_not_emit_effective(self, queue_dir):
+        from gpu_queue.queue import GPUQueue
+        import fcntl
+
+        queue = GPUQueue(queue_dir)
+        blocker = open(queue.lock_path, "w")
+        fcntl.flock(blocker, fcntl.LOCK_EX)
+        proc = _lease_process(queue_dir, "spoke-cli-blocked")
+        try:
+            requested = _read_json_line(proc)
+            assert requested["state"] == "requested"
+            assert proc.stdout is not None
+            readable, _, _ = select.select([proc.stdout], [], [], 0.2)
+            assert not readable
+
+            receipt_path = queue_dir / "leases" / "spoke-cli-blocked" / "receipt.json"
+            receipt = json.loads(receipt_path.read_text())
+            assert receipt["state"] == "requested"
+            assert receipt["effective_at"] is None
+        finally:
+            proc.kill()
+            proc.wait(timeout=3)
+            fcntl.flock(blocker, fcntl.LOCK_UN)
+            blocker.close()
+
+    def test_sigkill_releases_kernel_lock_without_rewriting_stale_receipt(
+        self, queue_dir
+    ):
+        proc = _lease_process(queue_dir, "spoke-cli-killed")
+        _read_json_line(proc)
+        effective = _read_json_line(proc)
+        assert effective["state"] == "effective"
+
+        os.kill(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=3)
+
+        stale_path = queue_dir / "leases" / "spoke-cli-killed" / "receipt.json"
+        stale = json.loads(stale_path.read_text())
+        assert stale["state"] == "effective"
+        assert stale["current_authority"] == "requires-live-holder-process-and-flock"
+
+        successor = _lease_process(queue_dir, "spoke-cli-successor")
+        try:
+            assert _read_json_line(successor)["state"] == "requested"
+            assert _read_json_line(successor)["state"] == "effective"
+            assert successor.stdin is not None
+            successor.stdin.close()
+            assert successor.wait(timeout=3) == 0
+        finally:
+            if successor.poll() is None:
+                successor.kill()
+                successor.wait(timeout=3)

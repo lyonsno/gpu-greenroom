@@ -46,7 +46,21 @@ gpu-greenroom resume
 
 # Recover stale jobs after crash
 gpu-greenroom recover
+
+# Hold the GPU lock for latency-sensitive interactive work. This emits one
+# JSON line when requested, another only after the lock becomes effective,
+# and holds the lease until stdin closes or the process receives INT/TERM.
+gpu-greenroom lease acquire \
+  --lease-id spoke-utterance-123 \
+  --holder spoke \
+  --purpose final-asr
 ```
+
+Interactive lease acquisition has no timeout. Callers that cannot wait should
+launch the holder asynchronously and use its JSONL events to distinguish
+`requested` from `effective`; terminating a still-requested holder records
+`released-unacquired` rather than claiming GPU breathing room. Use
+`--receipt-path` when the caller owns a different durable report location.
 
 ## Queue directory layout
 
@@ -54,6 +68,9 @@ gpu-greenroom recover
 ~/.local/state/gpu-greenroom/
   gpu.lock              # flock file for mutual exclusion
   paused                # present when queue is paused (touch to pause, rm to resume)
+  leases/
+    <lease-id>/
+      receipt.json      # requested/effective/released identity and timestamps
   job_types.json        # optional: custom job type configs (overrides defaults)
   outputs/              # durable output directory for jobs submitted without explicit output_dir
   pending/
@@ -167,10 +184,23 @@ Every completed or failed job gets a `receipt.json`:
 
 Uses `flock(LOCK_EX | LOCK_NB)` on `gpu.lock`. Only one worker can run a job at a time. If the lock is held, `run_one()` returns immediately without queuing or blocking. Cancel also acquires the lock to prevent races.
 
+Interactive leases use that same lock. A lease writes `requested` before it
+attempts acquisition and writes `effective` only after `flock` succeeds. While
+the holder process remains alive and owns the file descriptor, workers cannot
+start another job. Orderly stdin EOF or `SIGINT`/`SIGTERM` writes `released`;
+process death still releases the kernel lock automatically. A receipt left at
+`effective` by `SIGKILL` is historical evidence that acquisition happened, not
+proof that exclusion remains live: its `current_authority` explicitly requires
+both the live holder process and flock ownership.
+
+This mechanism does not preempt a running job. A lease requested while a job
+owns `gpu.lock` remains requested until that job exits. Cooperative yielding at
+model, render, or command-buffer boundaries is a separate consumer contract.
+
 ## Tests
 
 ```bash
 uv run --extra test python -m pytest tests/ -v
 ```
 
-72 tests covering serialization, failure receipts, stale recovery, cancel safety, FIFO order, param injection prevention, rich config (cwd/env/defaults), receipt route identity, configurable timeout, pause/resume, durable output dirs, volatile path warnings, and CLI.
+98 tests covering serialization, failure receipts, stale recovery, cancel safety, FIFO order, param injection prevention, rich config (cwd/env/defaults), receipt route identity, configurable timeout, pause/resume, interactive lease truthfulness and process-death release, durable output dirs, volatile path warnings, and CLI.
