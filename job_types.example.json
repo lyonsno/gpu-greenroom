@@ -53,46 +53,5 @@
       "seed": "42",
       "cascade": "512"
     }
-  },
-  "moge-bench-mlx": {
-    "cmd": [
-      "/Users/noahlyons/dev/pixal3d-mlx/.venv/bin/python", "-u",
-      "/Users/noahlyons/dev/gpu-greenroom/benchmarks/bench_mlx.py",
-      "--image", "{input_path}",
-      "--runs", "{runs}",
-      "--output-dir", "{output_dir}"
-    ],
-    "env": {"PYTHONPATH": "/Users/noahlyons/dev/moge-mlx"},
-    "defaults": {
-      "runs": "10"
-    },
-    "timeout": 300
-  },
-  "moge-bench-pytorch": {
-    "cmd": [
-      "/Users/noahlyons/dev/moge-standalone/.venv/bin/python", "-u",
-      "/Users/noahlyons/dev/gpu-greenroom/benchmarks/bench_pytorch.py",
-      "--image", "{input_path}",
-      "--runs", "{runs}",
-      "--device", "mps",
-      "--output-dir", "{output_dir}"
-    ],
-    "env": {"PYTHONPATH": "/Users/noahlyons/dev/moge-standalone"},
-    "defaults": {
-      "runs": "10"
-    },
-    "timeout": 300
-  },
-  "moge-bench-webgpu": {
-    "cmd": [
-      "/bin/bash",
-      "/Users/noahlyons/dev/gpu-greenroom/benchmarks/moge_webgpu.sh",
-      "--runs", "{runs}",
-      "--output-dir", "{output_dir}"
-    ],
-    "defaults": {
-      "runs": "10"
-    },
-    "timeout": 600
   }
 }

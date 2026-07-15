@@ -34,6 +34,7 @@ DEFAULT_QUEUE_DIR = os.environ.get(
     "GPU_GREENROOM_DIR",
     os.path.expanduser("~/.local/state/gpu-greenroom"),
 )
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # Benchmark job definitions
 BENCHMARK_JOBS = {
@@ -50,6 +51,79 @@ BENCHMARK_JOBS = {
         "description": "WebGPU (browser compute shaders, fp16 weights)",
     },
 }
+
+
+def _expanded_env_path(name: str, default: str) -> str:
+    return os.path.expanduser(os.environ.get(name, default))
+
+
+def build_benchmark_job_types(repo_root: str | Path = REPO_ROOT) -> dict:
+    """Build MoGE benchmark routes from the active gpu-greenroom checkout."""
+    root = Path(repo_root).resolve()
+    benchmarks_dir = root / "benchmarks"
+    return {
+        "moge-bench-mlx": {
+            "cmd": [
+                _expanded_env_path("MOGE_BENCH_MLX_PYTHON", "~/dev/pixal3d-mlx/.venv/bin/python"),
+                "-u",
+                str(benchmarks_dir / "bench_mlx.py"),
+                "--image",
+                "{input_path}",
+                "--runs",
+                "{runs}",
+                "--output-dir",
+                "{output_dir}",
+            ],
+            "env": {"PYTHONPATH": _expanded_env_path("MOGE_MLX_DIR", "~/dev/moge-mlx")},
+            "defaults": {"runs": "10"},
+            "timeout": 300,
+        },
+        "moge-bench-pytorch": {
+            "cmd": [
+                _expanded_env_path("MOGE_BENCH_PYTORCH_PYTHON", "~/dev/moge-standalone/.venv/bin/python"),
+                "-u",
+                str(benchmarks_dir / "bench_pytorch.py"),
+                "--image",
+                "{input_path}",
+                "--runs",
+                "{runs}",
+                "--device",
+                "{device}",
+                "--output-dir",
+                "{output_dir}",
+            ],
+            "env": {"PYTHONPATH": _expanded_env_path("MOGE_STANDALONE_DIR", "~/dev/moge-standalone")},
+            "defaults": {"runs": "10", "device": "mps"},
+            "timeout": 300,
+        },
+        "moge-bench-webgpu": {
+            "cmd": [
+                "/bin/bash",
+                str(benchmarks_dir / "moge_webgpu.sh"),
+                "--image",
+                "{input_path}",
+                "--runs",
+                "{runs}",
+                "--output-dir",
+                "{output_dir}",
+            ],
+            "defaults": {"runs": "10"},
+            "timeout": 600,
+        },
+    }
+
+
+def load_matrix_job_types(queue_dir: str | Path, repo_root: str | Path = REPO_ROOT) -> dict:
+    """Load Greenroom routes and add checkout-local MoGE benchmark routes.
+
+    Queue-local config remains able to override these routes for controlled
+    experiments, but a fresh queue now has runnable matrix routes without any
+    copy/paste setup.
+    """
+    return {
+        **build_benchmark_job_types(repo_root),
+        **_load_job_types(str(queue_dir)),
+    }
 
 
 def get_hardware_info() -> dict:
@@ -147,6 +221,19 @@ def poll_job(queue: GPUQueue, job_id: str, timeout: float = 600) -> dict | None:
 
     print(f"  TIMEOUT: Job {job_id} did not complete in {timeout}s", file=sys.stderr)
     return None
+
+
+def unresolved_failure(queue: GPUQueue, job_id: str, phase: str, message: str) -> dict:
+    state = queue.get_job(job_id)
+    return {
+        "phase": phase,
+        "message": message,
+        "job_id": job_id,
+        "status": state.status.value if state else "missing",
+        "job_type": state.job_type if state else None,
+        "queue_dir": str(queue.queue_dir),
+        "output_dir": state.output_dir if state else None,
+    }
 
 
 def run_submitted_job_if_next(queue: GPUQueue, job_id: str, job_types: dict) -> None:
@@ -316,7 +403,7 @@ def main():
         return
 
     queue = GPUQueue(args.queue_dir)
-    job_types = _load_job_types(args.queue_dir)
+    job_types = load_matrix_job_types(args.queue_dir, REPO_ROOT)
 
     # Collect hardware info and git commits
     hardware = get_hardware_info()
@@ -335,6 +422,7 @@ def main():
     results = {}
     receipts = {}
     statuses = {}
+    failures = {}
 
     for rt in runtimes:
         job_def = BENCHMARK_JOBS[rt]
@@ -380,17 +468,29 @@ def main():
             else:
                 print(f"  WARNING: Job completed but no result JSON found", file=sys.stderr)
                 results[rt] = None
+                failures[rt] = unresolved_failure(
+                    queue,
+                    job_id,
+                    "result",
+                    "Job completed but no benchmark result JSON was found",
+                )
         else:
             fail_reason = "timeout"
             if status:
                 fail_reason = status.get("error_message", status.get("failure_phase", "unknown"))
             print(f"  FAILED: {fail_reason}", file=sys.stderr)
             results[rt] = None
+            failures[rt] = unresolved_failure(queue, job_id, "timeout" if status is None else "job", str(fail_reason))
 
         # Collect receipt
         receipt = collect_receipt(queue, job_id)
         if receipt:
             receipts[rt] = receipt
+        else:
+            failures.setdefault(
+                rt,
+                unresolved_failure(queue, job_id, "receipt", "No Greenroom receipt was found for this benchmark job"),
+            )
 
         print(f"", file=sys.stderr)
 
@@ -402,6 +502,8 @@ def main():
         "input_image": input_image,
         "hardware": hardware,
         "git_commits": git_commits,
+        "success": not failures,
+        "failures": failures,
         "results": results,
         "receipts": receipts,
         "statuses": statuses,
@@ -422,6 +524,9 @@ def main():
     # Print table to stderr and JSON to stdout
     print(f"\n{table}", file=sys.stderr)
     print(json.dumps(report, indent=2, default=str))
+    if failures:
+        print("Benchmark matrix incomplete; see report.failures for job ids and queue state.", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

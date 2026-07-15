@@ -5,7 +5,7 @@
 # kills the server, and outputs JSON to stdout.
 #
 # Usage:
-#   benchmarks/moge_webgpu.sh [--runs N] [--output-dir /path]
+#   benchmarks/moge_webgpu.sh [--image /path/input.png] [--runs N] [--output-dir /path]
 #
 # Designed to run standalone or through the GPU Greenroom queue.
 
@@ -15,9 +15,11 @@ MOGE_WEBGPU_DIR="${MOGE_WEBGPU_DIR:-$HOME/dev/moge-webgpu}"
 PORT="${BENCHMARK_PORT:-5181}"
 RUNS=10
 OUTPUT_DIR=""
+IMAGE=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --image) IMAGE="$2"; shift 2 ;;
         --runs) RUNS="$2"; shift 2 ;;
         --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
         --port) PORT="$2"; shift 2 ;;
@@ -27,6 +29,9 @@ done
 
 echo "WebGPU MoGe-2 benchmark -- port=$PORT, runs=$RUNS" >&2
 echo "moge-webgpu dir: $MOGE_WEBGPU_DIR" >&2
+if [[ -n "$IMAGE" ]]; then
+    echo "input image: $IMAGE" >&2
+fi
 
 # Do not kill an unrelated process. Greenroom serializes GPU work, not TCP
 # ownership; an occupied benchmark port is a route/setup failure.
@@ -68,9 +73,20 @@ if ! curl -s -o /dev/null "http://localhost:$PORT/"; then
     exit 1
 fi
 
-# Run the Puppeteer benchmark
+# Run the Puppeteer benchmark. The current upstream benchmark script only
+# supports its default fixture; if a caller asks for another matrix image, fail
+# loudly instead of producing a false shared-input comparison.
 echo "Running Puppeteer benchmark ($RUNS runs)..." >&2
-RESULT=$(node "$MOGE_WEBGPU_DIR/tools/benchmark.mjs" --port "$PORT" --runs "$RUNS" --json)
+DEFAULT_IMAGE="$MOGE_WEBGPU_DIR/public/test_fixtures/input.png"
+BENCHMARK_ARGS=(--port "$PORT" --runs "$RUNS" --json)
+if [[ -n "$IMAGE" && "$IMAGE" != "$DEFAULT_IMAGE" ]]; then
+    if ! grep -q -- "--image" "$MOGE_WEBGPU_DIR/tools/benchmark.mjs"; then
+        echo "ERROR: $MOGE_WEBGPU_DIR/tools/benchmark.mjs does not support --image; cannot benchmark custom matrix image $IMAGE" >&2
+        exit 1
+    fi
+    BENCHMARK_ARGS+=(--image "$IMAGE")
+fi
+RESULT=$(node "$MOGE_WEBGPU_DIR/tools/benchmark.mjs" "${BENCHMARK_ARGS[@]}")
 
 # Output JSON to stdout
 echo "$RESULT"
