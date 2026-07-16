@@ -5,12 +5,15 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import select
 import shutil
 import subprocess
 import time
+import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
-from .models import JobRequest, JobState, JobStatus
+from .models import BumpRequest, BumpStatus, ExternalLease, JobRequest, JobState, JobStatus, LeaseStatus
 
 
 class GPUQueue:
@@ -31,14 +34,145 @@ class GPUQueue:
         self.queue_dir = Path(queue_dir)
         for sub in ("pending", "running", "done", "failed", "cancelled", "outputs"):
             (self.queue_dir / sub).mkdir(parents=True, exist_ok=True)
+        for sub in ("leases", "leases/receipts", "bumps", "bumps/receipts", "events"):
+            (self.queue_dir / sub).mkdir(parents=True, exist_ok=True)
 
     @property
     def lock_path(self) -> Path:
         return self.queue_dir / "gpu.lock"
 
     @property
+    def coordination_lock_path(self) -> Path:
+        return self.queue_dir / "coordination.lock"
+
+    @property
     def pause_path(self) -> Path:
         return self.queue_dir / "paused"
+
+    @property
+    def current_lease_path(self) -> Path:
+        return self.queue_dir / "leases" / "current.json"
+
+    @property
+    def lease_receipts_dir(self) -> Path:
+        return self.queue_dir / "leases" / "receipts"
+
+    @property
+    def bumps_dir(self) -> Path:
+        return self.queue_dir / "bumps"
+
+    @property
+    def bump_receipts_dir(self) -> Path:
+        return self.queue_dir / "bumps" / "receipts"
+
+    @property
+    def events_dir(self) -> Path:
+        return self.queue_dir / "events"
+
+    @contextmanager
+    def _coordination_lock(self):
+        lock_fd = open(self.coordination_lock_path, "w")
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
+
+    def _write_text_atomic(self, path: Path, text: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        tmp.write_text(text)
+        os.replace(tmp, path)
+
+    def _write_json_atomic(self, path: Path, payload: dict) -> None:
+        self._write_text_atomic(path, json.dumps(payload, indent=2))
+
+    def _write_lease_locked(self, lease: ExternalLease) -> None:
+        self._write_text_atomic(self.current_lease_path, lease.to_json())
+
+    def _read_lease_locked(self) -> ExternalLease | None:
+        if not self.current_lease_path.exists():
+            return None
+        return ExternalLease.from_json(self.current_lease_path.read_text())
+
+    def _bump_path(self, bump_id: str) -> Path:
+        return self.bumps_dir / f"{bump_id}.json"
+
+    def _write_bump_locked(self, bump: BumpRequest) -> None:
+        self._write_text_atomic(self._bump_path(bump.bump_id), bump.to_json())
+
+    def _read_bump_locked(self, bump_id: str) -> BumpRequest | None:
+        path = self._bump_path(bump_id)
+        if not path.exists():
+            return None
+        return BumpRequest.from_json(path.read_text())
+
+    def _emit_event_locked(self, kind: str, object_id: str, payload: dict) -> None:
+        event = {
+            "kind": kind,
+            "object_id": object_id,
+            "emitted_at": time.time(),
+            "payload": payload,
+        }
+        name = f"{time.time_ns()}-{kind}-{object_id}.json"
+        self._write_json_atomic(self.events_dir / name, event)
+
+    def _write_receipt_locked(self, directory: Path, name: str, payload: dict) -> None:
+        payload = {
+            **payload,
+            "receipt_written_at": time.time(),
+        }
+        self._write_json_atomic(directory / name, payload)
+
+    def _pid_alive(self, pid: int | None) -> bool | None:
+        if pid is None:
+            return None
+        try:
+            os.kill(pid, 0)
+            return True
+        except PermissionError:
+            return True
+        except ProcessLookupError:
+            return False
+
+    def _mark_lease_unknown_locked(self, lease: ExternalLease, reason: str) -> ExternalLease:
+        if lease.lifecycle_state == LeaseStatus.OWNERSHIP_UNKNOWN:
+            return lease
+        lease.lifecycle_state = LeaseStatus.OWNERSHIP_UNKNOWN
+        lease.unknown_at = time.time()
+        lease.unknown_reason = reason
+        self._write_lease_locked(lease)
+        self._write_receipt_locked(
+            self.lease_receipts_dir,
+            f"{lease.lease_id}-ownership-unknown.json",
+            {
+                "transition": "ownership_unknown",
+                "lease_id": lease.lease_id,
+                "reason": reason,
+                "owner": lease.owner,
+                "effective_route": lease.effective_route,
+            },
+        )
+        self._emit_event_locked("lease_ownership_unknown", lease.lease_id, {"reason": reason})
+        return lease
+
+    def _refresh_lease_observation_locked(self) -> ExternalLease | None:
+        lease = self._read_lease_locked()
+        if lease is None:
+            return None
+        if lease.lifecycle_state in (LeaseStatus.RELEASED, LeaseStatus.OWNERSHIP_UNKNOWN):
+            return lease
+        if lease.ttl_seconds is not None and time.time() - lease.renewed_at > lease.ttl_seconds:
+            return self._mark_lease_unknown_locked(lease, "ttl_expired")
+        if lease.lifecycle_state == LeaseStatus.ACTIVE and self._pid_alive(lease.pid) is False:
+            return self._mark_lease_unknown_locked(lease, "holder_pid_dead_without_release")
+        return lease
+
+    def _external_execution_blocked(self) -> bool:
+        with self._coordination_lock():
+            lease = self._refresh_lease_observation_locked()
+            return lease is not None and lease.lifecycle_state != LeaseStatus.RELEASED
 
     def pause(self) -> None:
         """Pause the queue. The worker finishes its current job then waits."""
@@ -50,6 +184,424 @@ class GPUQueue:
 
     def is_paused(self) -> bool:
         return self.pause_path.exists()
+
+    def _try_execution_lock(self):
+        lock_fd = open(self.lock_path, "w")
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return lock_fd
+        except BlockingIOError:
+            lock_fd.close()
+            return None
+
+    def lease_status(self) -> ExternalLease | None:
+        """Return the current external lease, refreshing stale observations first."""
+        with self._coordination_lock():
+            return self._refresh_lease_observation_locked()
+
+    def claim_lease(
+        self,
+        *,
+        owner: str,
+        agent_id: str,
+        repo_root: str,
+        effective_route: str,
+        backend: str,
+        device: str,
+        profile: str,
+        supports_checkpoints: bool,
+        interruptible: bool,
+        lease_id: str | None = None,
+        pid: int | None = None,
+        process_group: int | None = None,
+        ttl_seconds: float = 300.0,
+        handoff_bump_id: str | None = None,
+        raise_on_blocked: bool = True,
+    ) -> ExternalLease | None:
+        """Claim a cooperative external GPU lease.
+
+        The claim briefly acquires gpu.lock to prove no Greenroom worker owns
+        the execution mutex at the claim boundary. The lease then blocks worker
+        dispatch until it is released or deliberately handed off.
+        """
+        lock_fd = self._try_execution_lock()
+        if lock_fd is None:
+            if raise_on_blocked:
+                raise RuntimeError("gpu.lock is held; cannot claim external lease")
+            return None
+        try:
+            with self._coordination_lock():
+                current = self._refresh_lease_observation_locked()
+                replacing_handoff = False
+                if current is not None and current.lifecycle_state != LeaseStatus.RELEASED:
+                    replacing_handoff = (
+                        current.lifecycle_state == LeaseStatus.HANDOFF
+                        and handoff_bump_id is not None
+                        and current.handoff_bump_id == handoff_bump_id
+                    )
+                    bump = self._read_bump_locked(handoff_bump_id) if replacing_handoff else None
+                    if not replacing_handoff or bump is None or bump.status != BumpStatus.GRANTED:
+                        if raise_on_blocked:
+                            raise RuntimeError("external lease already blocks Greenroom execution")
+                        return None
+
+                now = time.time()
+                lease = ExternalLease(
+                    lease_id=lease_id or uuid.uuid4().hex[:12],
+                    owner=owner,
+                    agent_id=agent_id,
+                    repo_root=repo_root,
+                    pid=pid,
+                    process_group=process_group,
+                    effective_route=effective_route,
+                    backend=backend,
+                    device=device,
+                    profile=profile,
+                    supports_checkpoints=supports_checkpoints,
+                    interruptible=interruptible,
+                    claimed_at=now,
+                    renewed_at=now,
+                    ttl_seconds=ttl_seconds,
+                    handoff_bump_id=handoff_bump_id,
+                )
+                self._write_lease_locked(lease)
+                self._write_receipt_locked(
+                    self.lease_receipts_dir,
+                    f"{lease.lease_id}-claim.json",
+                    {
+                        "transition": "claim",
+                        "lease_id": lease.lease_id,
+                        "owner": owner,
+                        "agent_id": agent_id,
+                        "repo_root": repo_root,
+                        "pid": pid,
+                        "process_group": process_group,
+                        "effective_route": effective_route,
+                        "backend": backend,
+                        "device": device,
+                        "profile": profile,
+                        "supports_checkpoints": supports_checkpoints,
+                        "interruptible": interruptible,
+                        "handoff_bump_id": handoff_bump_id,
+                    },
+                )
+                if replacing_handoff and current is not None:
+                    self._write_receipt_locked(
+                        self.lease_receipts_dir,
+                        f"{current.lease_id}-handoff-claim.json",
+                        {
+                            "transition": "handoff_claimed",
+                            "lease_id": current.lease_id,
+                            "handoff_bump_id": handoff_bump_id,
+                            "claimed_by_lease_id": lease.lease_id,
+                            "claimed_by_owner": lease.owner,
+                        },
+                    )
+                self._emit_event_locked("lease_claim", lease.lease_id, {"owner": owner, "handoff_bump_id": handoff_bump_id})
+                return lease
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
+
+    def renew_lease(
+        self,
+        lease_id: str,
+        *,
+        interruptible: bool | None = None,
+        ttl_seconds: float | None = None,
+        lifecycle_state: LeaseStatus | str | None = None,
+    ) -> ExternalLease:
+        """Renew an existing lease without changing its route identity."""
+        with self._coordination_lock():
+            lease = self._refresh_lease_observation_locked()
+            if lease is None or lease.lease_id != lease_id:
+                raise KeyError(f"lease {lease_id} not found")
+            if lease.lifecycle_state == LeaseStatus.RELEASED:
+                raise RuntimeError(f"lease {lease_id} is released")
+            lease.renewed_at = time.time()
+            if interruptible is not None:
+                lease.interruptible = interruptible
+            if ttl_seconds is not None:
+                lease.ttl_seconds = ttl_seconds
+            if lifecycle_state is not None:
+                lease.lifecycle_state = LeaseStatus(lifecycle_state)
+            self._write_lease_locked(lease)
+            self._write_receipt_locked(
+                self.lease_receipts_dir,
+                f"{lease.lease_id}-renew.json",
+                {
+                    "transition": "renew",
+                    "lease_id": lease.lease_id,
+                    "interruptible": lease.interruptible,
+                    "ttl_seconds": lease.ttl_seconds,
+                    "lifecycle_state": lease.lifecycle_state.value,
+                },
+            )
+            self._emit_event_locked("lease_renew", lease.lease_id, {"lifecycle_state": lease.lifecycle_state.value})
+            return lease
+
+    def release_lease(self, lease_id: str, *, released_by: str, reason: str) -> ExternalLease:
+        """Release a lease or move it into handoff when a checkpoint grant is waiting."""
+        with self._coordination_lock():
+            lease = self._refresh_lease_observation_locked()
+            if lease is None or lease.lease_id != lease_id:
+                raise KeyError(f"lease {lease_id} not found")
+
+            waiting_bump = None
+            sticky_handoff_bump = None
+            if lease.lifecycle_state == LeaseStatus.HANDOFF and lease.handoff_bump_id:
+                bump = self._read_bump_locked(lease.handoff_bump_id)
+                if bump is not None and bump.status == BumpStatus.GRANTED:
+                    sticky_handoff_bump = bump
+            for bump in self.list_bumps_locked():
+                if bump.holder_lease_id == lease_id and bump.status == BumpStatus.GRANT_PENDING_CHECKPOINT:
+                    waiting_bump = bump
+                    break
+
+            lease.released_at = time.time()
+            lease.released_by = released_by
+            lease.release_reason = reason
+            if waiting_bump is not None:
+                lease.lifecycle_state = LeaseStatus.HANDOFF
+                lease.handoff_bump_id = waiting_bump.bump_id
+                waiting_bump.status = BumpStatus.GRANTED
+                waiting_bump.updated_at = time.time()
+                waiting_bump.granted_at = waiting_bump.granted_at or time.time()
+                waiting_bump.quiescence_confirmed = True
+                self._write_bump_locked(waiting_bump)
+                self._write_receipt_locked(
+                    self.bump_receipts_dir,
+                    f"{waiting_bump.bump_id}-grant.json",
+                    {
+                        "transition": "grant",
+                        "bump_id": waiting_bump.bump_id,
+                        "holder_lease_id": lease_id,
+                        "granted_by": waiting_bump.granted_by,
+                        "checkpoint": waiting_bump.checkpoint,
+                        "quiescence_confirmed": True,
+                    },
+                )
+                self._emit_event_locked("bump_granted", waiting_bump.bump_id, {"holder_lease_id": lease_id})
+            elif sticky_handoff_bump is not None:
+                lease.lifecycle_state = LeaseStatus.HANDOFF
+                lease.handoff_bump_id = sticky_handoff_bump.bump_id
+            else:
+                lease.lifecycle_state = LeaseStatus.RELEASED
+            self._write_lease_locked(lease)
+            self._write_receipt_locked(
+                self.lease_receipts_dir,
+                f"{lease.lease_id}-release.json",
+                {
+                    "transition": "release",
+                    "lease_id": lease.lease_id,
+                    "released_by": released_by,
+                    "reason": reason,
+                    "lifecycle_state": lease.lifecycle_state.value,
+                    "handoff_bump_id": lease.handoff_bump_id,
+                },
+            )
+            self._emit_event_locked("lease_release", lease.lease_id, {"lifecycle_state": lease.lifecycle_state.value})
+            return lease
+
+    def request_bump(
+        self,
+        *,
+        requester: str,
+        agent_id: str,
+        repo_root: str,
+        intended_route: str,
+        workload_class: str,
+        memory_pressure: str,
+        estimated_occupancy: str,
+        full_quiescence_required: bool,
+        reason: str,
+        callback_address: str,
+        bump_id: str | None = None,
+    ) -> BumpRequest:
+        """Create an idempotent inbound bump request."""
+        with self._coordination_lock():
+            bump_id = bump_id or uuid.uuid4().hex[:12]
+            existing = self._read_bump_locked(bump_id)
+            if existing is not None:
+                return existing
+            bump = BumpRequest(
+                bump_id=bump_id,
+                requester=requester,
+                agent_id=agent_id,
+                repo_root=repo_root,
+                intended_route=intended_route,
+                workload_class=workload_class,
+                memory_pressure=memory_pressure,
+                estimated_occupancy=estimated_occupancy,
+                full_quiescence_required=full_quiescence_required,
+                reason=reason,
+                callback_address=callback_address,
+            )
+            self._write_bump_locked(bump)
+            self._write_receipt_locked(
+                self.bump_receipts_dir,
+                f"{bump.bump_id}-request.json",
+                {
+                    "transition": "request",
+                    "bump_id": bump.bump_id,
+                    "requester": requester,
+                    "agent_id": agent_id,
+                    "repo_root": repo_root,
+                    "intended_route": intended_route,
+                    "workload_class": workload_class,
+                    "memory_pressure": memory_pressure,
+                    "estimated_occupancy": estimated_occupancy,
+                    "estimated_occupancy_authority": bump.estimated_occupancy_authority,
+                    "full_quiescence_required": full_quiescence_required,
+                    "reason": reason,
+                    "callback_address": callback_address,
+                },
+            )
+            self._emit_event_locked("bump_request", bump.bump_id, {"requester": requester})
+            return bump
+
+    def list_bumps_locked(self, status: BumpStatus | str | None = None) -> list[BumpRequest]:
+        target = BumpStatus(status) if status else None
+        bumps = []
+        for path in sorted(self.bumps_dir.glob("*.json")):
+            bump = BumpRequest.from_json(path.read_text())
+            if target is None or bump.status == target:
+                bumps.append(bump)
+        return bumps
+
+    def list_bumps(self, status: BumpStatus | str | None = None) -> list[BumpRequest]:
+        with self._coordination_lock():
+            return self.list_bumps_locked(status)
+
+    def get_bump(self, bump_id: str) -> BumpRequest | None:
+        with self._coordination_lock():
+            return self._read_bump_locked(bump_id)
+
+    def grant_bump(
+        self,
+        bump_id: str,
+        *,
+        granted_by: str,
+        checkpoint: str,
+        quiescence_confirmed: bool,
+    ) -> BumpRequest:
+        """Grant a bump now or after a named checkpoint.
+
+        A quiesced grant moves the current lease into handoff. A non-quiesced
+        grant records a pending checkpoint; release_lease completes the handoff.
+        """
+        with self._coordination_lock():
+            lease = self._refresh_lease_observation_locked()
+            bump = self._read_bump_locked(bump_id)
+            if bump is None:
+                raise KeyError(f"bump {bump_id} not found")
+            if bump.status != BumpStatus.PENDING:
+                return bump
+            if lease is None or lease.lifecycle_state != LeaseStatus.ACTIVE:
+                return bump
+            bump.holder_lease_id = lease.lease_id
+            bump.granted_by = granted_by
+            bump.granted_at = time.time()
+            bump.updated_at = bump.granted_at
+            bump.checkpoint = checkpoint
+            bump.quiescence_confirmed = quiescence_confirmed
+            if quiescence_confirmed:
+                bump.status = BumpStatus.GRANTED
+                lease.lifecycle_state = LeaseStatus.HANDOFF
+                lease.handoff_bump_id = bump.bump_id
+                self._write_lease_locked(lease)
+                self._emit_event_locked("bump_granted", bump.bump_id, {"holder_lease_id": lease.lease_id})
+            else:
+                bump.status = BumpStatus.GRANT_PENDING_CHECKPOINT
+                self._emit_event_locked("bump_grant_pending_checkpoint", bump.bump_id, {"checkpoint": checkpoint})
+            self._write_bump_locked(bump)
+            self._write_receipt_locked(
+                self.bump_receipts_dir,
+                f"{bump.bump_id}-grant.json",
+                {
+                    "transition": "grant",
+                    "bump_id": bump.bump_id,
+                    "holder_lease_id": bump.holder_lease_id,
+                    "granted_by": granted_by,
+                    "checkpoint": checkpoint,
+                    "quiescence_confirmed": quiescence_confirmed,
+                    "status": bump.status.value,
+                },
+            )
+            return bump
+
+    def decline_bump(self, bump_id: str, *, declined_by: str, reason: str) -> BumpRequest:
+        with self._coordination_lock():
+            bump = self._read_bump_locked(bump_id)
+            if bump is None:
+                raise KeyError(f"bump {bump_id} not found")
+            if bump.status in (BumpStatus.GRANTED, BumpStatus.DECLINED, BumpStatus.CLOSED):
+                return bump
+            bump.status = BumpStatus.DECLINED
+            bump.declined_by = declined_by
+            bump.declined_at = time.time()
+            bump.updated_at = bump.declined_at
+            bump.decline_reason = reason
+            self._write_bump_locked(bump)
+            self._write_receipt_locked(
+                self.bump_receipts_dir,
+                f"{bump.bump_id}-decline.json",
+                {
+                    "transition": "decline",
+                    "bump_id": bump.bump_id,
+                    "declined_by": declined_by,
+                    "reason": reason,
+                },
+            )
+            self._emit_event_locked("bump_declined", bump.bump_id, {"declined_by": declined_by})
+            return bump
+
+    def wait_for_bump(self, bump_id: str, *, timeout: float | None = None) -> BumpRequest:
+        """Wait for a bump to reach a terminal/wake state using filesystem events."""
+        deadline = time.time() + timeout if timeout is not None else None
+
+        def current_if_wakeable():
+            bump = self.get_bump(bump_id)
+            if bump is None:
+                raise KeyError(f"bump {bump_id} not found")
+            if bump.status in (BumpStatus.GRANTED, BumpStatus.DECLINED, BumpStatus.CLOSED):
+                return bump
+            return None
+
+        ready = current_if_wakeable()
+        if ready is not None:
+            return ready
+
+        if hasattr(select, "kqueue"):
+            fd = os.open(self.events_dir, os.O_RDONLY)
+            kq = select.kqueue()
+            try:
+                event = select.kevent(
+                    fd,
+                    filter=select.KQ_FILTER_VNODE,
+                    flags=select.KQ_EV_ADD | select.KQ_EV_ENABLE | select.KQ_EV_CLEAR,
+                    fflags=select.KQ_NOTE_WRITE | select.KQ_NOTE_EXTEND | select.KQ_NOTE_RENAME,
+                )
+                kq.control([event], 0, 0)
+                while True:
+                    wait = None if deadline is None else max(0.0, deadline - time.time())
+                    if wait == 0.0:
+                        raise TimeoutError(f"timed out waiting for bump {bump_id}")
+                    kq.control(None, 1, wait)
+                    ready = current_if_wakeable()
+                    if ready is not None:
+                        return ready
+            finally:
+                kq.close()
+                os.close(fd)
+
+        while True:
+            if deadline is not None and time.time() >= deadline:
+                raise TimeoutError(f"timed out waiting for bump {bump_id}")
+            time.sleep(0.1)
+            ready = current_if_wakeable()
+            if ready is not None:
+                return ready
 
     def _is_volatile(self, path: str) -> bool:
         resolved = str(Path(path).resolve())
@@ -205,17 +757,17 @@ class GPUQueue:
         """
         if self.is_paused():
             return False
+        if self._external_execution_blocked():
+            return False
 
-        lock_fd = open(self.lock_path, "w")
-        try:
-            # Non-blocking lock attempt
-            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            lock_fd.close()
+        lock_fd = self._try_execution_lock()
+        if lock_fd is None:
             return False
 
         try:
             if self.is_paused():
+                return False
+            if self._external_execution_blocked():
                 return False
 
             job_dir = self._next_pending()

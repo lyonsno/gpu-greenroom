@@ -19,6 +19,21 @@ class JobStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+class LeaseStatus(str, Enum):
+    ACTIVE = "active"
+    HANDOFF = "handoff"
+    RELEASED = "released"
+    OWNERSHIP_UNKNOWN = "ownership_unknown"
+
+
+class BumpStatus(str, Enum):
+    PENDING = "pending"
+    GRANT_PENDING_CHECKPOINT = "grant_pending_checkpoint"
+    GRANTED = "granted"
+    DECLINED = "declined"
+    CLOSED = "closed"
+
+
 @dataclass
 class JobRequest:
     job_type: str
@@ -66,6 +81,81 @@ class JobState:
         d["status"] = JobStatus(d["status"])
         if d.get("warnings") is None:
             d["warnings"] = []
+        return cls(**_known_fields(cls, d))
+
+
+@dataclass
+class ExternalLease:
+    owner: str
+    agent_id: str
+    repo_root: str
+    effective_route: str
+    backend: str
+    device: str
+    profile: str
+    supports_checkpoints: bool
+    interruptible: bool
+    lease_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    lifecycle_state: LeaseStatus = LeaseStatus.ACTIVE
+    pid: int | None = None
+    process_group: int | None = None
+    claimed_at: float = field(default_factory=time.time)
+    renewed_at: float = field(default_factory=time.time)
+    ttl_seconds: float = 300.0
+    handoff_bump_id: str | None = None
+    released_at: float | None = None
+    released_by: str | None = None
+    release_reason: str | None = None
+    unknown_at: float | None = None
+    unknown_reason: str | None = None
+
+    def to_json(self) -> str:
+        d = asdict(self)
+        d["lifecycle_state"] = self.lifecycle_state.value
+        return json.dumps(d, indent=2)
+
+    @classmethod
+    def from_json(cls, text: str) -> ExternalLease:
+        d = json.loads(text)
+        d["lifecycle_state"] = LeaseStatus(d["lifecycle_state"])
+        return cls(**_known_fields(cls, d))
+
+
+@dataclass
+class BumpRequest:
+    requester: str
+    agent_id: str
+    repo_root: str
+    intended_route: str
+    workload_class: str
+    memory_pressure: str
+    estimated_occupancy: str
+    full_quiescence_required: bool
+    reason: str
+    callback_address: str
+    bump_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    status: BumpStatus = BumpStatus.PENDING
+    requested_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+    estimated_occupancy_authority: str = "diagnostic_only"
+    holder_lease_id: str | None = None
+    granted_by: str | None = None
+    granted_at: float | None = None
+    checkpoint: str | None = None
+    quiescence_confirmed: bool = False
+    declined_by: str | None = None
+    declined_at: float | None = None
+    decline_reason: str | None = None
+
+    def to_json(self) -> str:
+        d = asdict(self)
+        d["status"] = self.status.value
+        return json.dumps(d, indent=2)
+
+    @classmethod
+    def from_json(cls, text: str) -> BumpRequest:
+        d = json.loads(text)
+        d["status"] = BumpStatus(d["status"])
         return cls(**_known_fields(cls, d))
 
 

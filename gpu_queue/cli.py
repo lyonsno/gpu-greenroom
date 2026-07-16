@@ -10,7 +10,7 @@ import sys
 import time
 from pathlib import Path
 
-from .models import JobRequest, JobStatus
+from .models import BumpStatus, JobRequest, JobStatus, LeaseStatus
 from .queue import GPUQueue
 
 DEFAULT_QUEUE_DIR = os.environ.get("GPU_GREENROOM_DIR", os.path.expanduser("~/.local/state/gpu-greenroom"))
@@ -197,6 +197,111 @@ def cmd_recover(args):
         print("No stale jobs found.")
 
 
+def _print_model(model):
+    print(json.dumps(json.loads(model.to_json()), indent=2))
+
+
+def cmd_lease_claim(args):
+    queue = get_queue(args)
+    lease = queue.claim_lease(
+        lease_id=args.lease_id,
+        owner=args.owner,
+        agent_id=args.agent_id,
+        repo_root=args.repo_root,
+        pid=args.pid,
+        process_group=args.process_group,
+        effective_route=args.effective_route,
+        backend=args.backend,
+        device=args.device,
+        profile=args.profile,
+        supports_checkpoints=args.supports_checkpoints,
+        interruptible=args.interruptible,
+        ttl_seconds=args.ttl_seconds,
+        handoff_bump_id=args.handoff_bump_id,
+        raise_on_blocked=False,
+    )
+    if lease is None:
+        print("Could not claim lease; gpu.lock or existing external lease blocks acquisition.", file=sys.stderr)
+        sys.exit(1)
+    _print_model(lease)
+
+
+def cmd_lease_renew(args):
+    queue = get_queue(args)
+    interruptible = args.interruptible
+    if args.not_interruptible:
+        interruptible = False
+    lease = queue.renew_lease(
+        args.lease_id,
+        interruptible=interruptible,
+        ttl_seconds=args.ttl_seconds,
+        lifecycle_state=args.lifecycle_state,
+    )
+    _print_model(lease)
+
+
+def cmd_lease_status(args):
+    queue = get_queue(args)
+    lease = queue.lease_status()
+    if lease is None:
+        print(json.dumps({"lease": None, "execution_blocked": False}, indent=2))
+        return
+    _print_model(lease)
+
+
+def cmd_lease_release(args):
+    queue = get_queue(args)
+    lease = queue.release_lease(args.lease_id, released_by=args.released_by, reason=args.reason)
+    _print_model(lease)
+
+
+def cmd_bump_request(args):
+    queue = get_queue(args)
+    bump = queue.request_bump(
+        bump_id=args.bump_id,
+        requester=args.requester,
+        agent_id=args.agent_id,
+        repo_root=args.repo_root,
+        intended_route=args.intended_route,
+        workload_class=args.workload_class,
+        memory_pressure=args.memory_pressure,
+        estimated_occupancy=args.estimated_occupancy,
+        full_quiescence_required=args.full_quiescence_required,
+        reason=args.reason,
+        callback_address=args.callback_address,
+    )
+    _print_model(bump)
+
+
+def cmd_bump_list(args):
+    queue = get_queue(args)
+    bumps = queue.list_bumps(args.status)
+    print(json.dumps([json.loads(bump.to_json()) for bump in bumps], indent=2))
+
+
+def cmd_bump_grant(args):
+    queue = get_queue(args)
+    bump = queue.grant_bump(
+        args.bump_id,
+        granted_by=args.granted_by,
+        checkpoint=args.checkpoint,
+        quiescence_confirmed=args.quiescence_confirmed,
+    )
+    _print_model(bump)
+
+
+def cmd_bump_decline(args):
+    queue = get_queue(args)
+    bump = queue.decline_bump(args.bump_id, declined_by=args.declined_by, reason=args.reason)
+    _print_model(bump)
+
+
+def cmd_bump_wait(args):
+    queue = get_queue(args)
+    bump = queue.wait_for_bump(args.bump_id, timeout=args.timeout)
+    _print_model(bump)
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="gpu-greenroom",
@@ -250,9 +355,93 @@ def main():
     p_recover = sub.add_parser("recover", help="Recover stale running jobs")
     p_recover.set_defaults(func=cmd_recover)
 
+    # lease
+    p_lease = sub.add_parser("lease", help="Manage cooperative external GPU leases")
+    lease_sub = p_lease.add_subparsers(dest="lease_command")
+
+    p_lease_claim = lease_sub.add_parser("claim", help="Claim a cooperative external GPU lease")
+    p_lease_claim.add_argument("--lease-id")
+    p_lease_claim.add_argument("--owner", required=True)
+    p_lease_claim.add_argument("--agent-id", required=True)
+    p_lease_claim.add_argument("--repo-root", required=True)
+    p_lease_claim.add_argument("--pid", type=int)
+    p_lease_claim.add_argument("--process-group", type=int)
+    p_lease_claim.add_argument("--effective-route", required=True)
+    p_lease_claim.add_argument("--backend", required=True)
+    p_lease_claim.add_argument("--device", required=True)
+    p_lease_claim.add_argument("--profile", required=True)
+    p_lease_claim.add_argument("--supports-checkpoints", action="store_true")
+    p_lease_claim.add_argument("--interruptible", action="store_true")
+    p_lease_claim.add_argument("--ttl-seconds", type=float, default=300.0)
+    p_lease_claim.add_argument("--handoff-bump-id")
+    p_lease_claim.set_defaults(func=cmd_lease_claim)
+
+    p_lease_renew = lease_sub.add_parser("renew", help="Renew the current external GPU lease")
+    p_lease_renew.add_argument("lease_id")
+    p_lease_renew.add_argument("--interruptible", action="store_true", default=None)
+    p_lease_renew.add_argument("--not-interruptible", action="store_true")
+    p_lease_renew.add_argument("--ttl-seconds", type=float)
+    p_lease_renew.add_argument("--lifecycle-state", choices=[status.value for status in LeaseStatus])
+    p_lease_renew.set_defaults(func=cmd_lease_renew)
+
+    p_lease_status = lease_sub.add_parser("status", help="Show current external GPU lease")
+    p_lease_status.set_defaults(func=cmd_lease_status)
+
+    p_lease_release = lease_sub.add_parser("release", help="Release the current external GPU lease")
+    p_lease_release.add_argument("lease_id")
+    p_lease_release.add_argument("--released-by", required=True)
+    p_lease_release.add_argument("--reason", required=True)
+    p_lease_release.set_defaults(func=cmd_lease_release)
+
+    # bump
+    p_bump = sub.add_parser("bump", help="Manage inbound cooperative GPU bump requests")
+    bump_sub = p_bump.add_subparsers(dest="bump_command")
+
+    p_bump_request = bump_sub.add_parser("request", help="Request a cooperative GPU handoff window")
+    p_bump_request.add_argument("--bump-id")
+    p_bump_request.add_argument("--requester", required=True)
+    p_bump_request.add_argument("--agent-id", required=True)
+    p_bump_request.add_argument("--repo-root", required=True)
+    p_bump_request.add_argument("--intended-route", required=True)
+    p_bump_request.add_argument("--workload-class", required=True)
+    p_bump_request.add_argument("--memory-pressure", required=True)
+    p_bump_request.add_argument("--estimated-occupancy", required=True)
+    p_bump_request.add_argument("--full-quiescence-required", action="store_true")
+    p_bump_request.add_argument("--reason", required=True)
+    p_bump_request.add_argument("--callback-address", required=True)
+    p_bump_request.set_defaults(func=cmd_bump_request)
+
+    p_bump_list = bump_sub.add_parser("list", help="List bump requests")
+    p_bump_list.add_argument("--status", choices=[status.value for status in BumpStatus])
+    p_bump_list.set_defaults(func=cmd_bump_list)
+
+    p_bump_grant = bump_sub.add_parser("grant", help="Grant a bump now or after a checkpoint")
+    p_bump_grant.add_argument("bump_id")
+    p_bump_grant.add_argument("--granted-by", required=True)
+    p_bump_grant.add_argument("--checkpoint", required=True)
+    p_bump_grant.add_argument("--quiescence-confirmed", action="store_true")
+    p_bump_grant.set_defaults(func=cmd_bump_grant)
+
+    p_bump_decline = bump_sub.add_parser("decline", help="Decline a bump request")
+    p_bump_decline.add_argument("bump_id")
+    p_bump_decline.add_argument("--declined-by", required=True)
+    p_bump_decline.add_argument("--reason", required=True)
+    p_bump_decline.set_defaults(func=cmd_bump_decline)
+
+    p_bump_wait = bump_sub.add_parser("wait", help="Wait for a bump grant/decline event")
+    p_bump_wait.add_argument("bump_id")
+    p_bump_wait.add_argument("--timeout", type=float)
+    p_bump_wait.set_defaults(func=cmd_bump_wait)
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
+        sys.exit(1)
+    if args.command == "lease" and not getattr(args, "lease_command", None):
+        p_lease.print_help()
+        sys.exit(1)
+    if args.command == "bump" and not getattr(args, "bump_command", None):
+        p_bump.print_help()
         sys.exit(1)
     args.func(args)
 
