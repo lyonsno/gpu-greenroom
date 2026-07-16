@@ -240,7 +240,15 @@ class GPUQueue:
                         and current.handoff_bump_id == handoff_bump_id
                     )
                     bump = self._read_bump_locked(handoff_bump_id) if replacing_handoff else None
-                    if not replacing_handoff or bump is None or bump.status != BumpStatus.GRANTED:
+                    claimant_matches_bump = (
+                        bump is not None
+                        and bump.status == BumpStatus.GRANTED
+                        and owner == bump.requester
+                        and agent_id == bump.agent_id
+                        and repo_root == bump.repo_root
+                        and effective_route == bump.intended_route
+                    )
+                    if not replacing_handoff or not claimant_matches_bump:
                         if raise_on_blocked:
                             raise RuntimeError("external lease already blocks Greenroom execution")
                         return None
@@ -583,6 +591,9 @@ class GPUQueue:
                     fflags=select.KQ_NOTE_WRITE | select.KQ_NOTE_EXTEND | select.KQ_NOTE_RENAME,
                 )
                 kq.control([event], 0, 0)
+                ready = current_if_wakeable()
+                if ready is not None:
+                    return ready
                 while True:
                     wait = None if deadline is None else max(0.0, deadline - time.time())
                     if wait == 0.0:

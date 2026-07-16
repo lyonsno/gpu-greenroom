@@ -274,4 +274,4 @@ Uses `flock(LOCK_EX | LOCK_NB)` on `gpu.lock`. Only one worker can run a job at 
 uv run --extra test python -m pytest tests/ -v
 ```
 
-103 tests covering serialization, failure receipts, stale recovery, cancel safety, FIFO order, param injection prevention, rich config (cwd/env/defaults), receipt route identity, configurable timeout, pause/resume, durable output dirs, volatile path warnings, CLI, cooperative external leases, bump handoffs, ownership-unknown lease expiry, dead/live PID handling, duplicate bump requests, concurrent grants, release/grant races, and worker race prevention.
+105 tests covering serialization, failure receipts, stale recovery, cancel safety, FIFO order, param injection prevention, rich config (cwd/env/defaults), receipt route identity, configurable timeout, pause/resume, durable output dirs, volatile path warnings, CLI, cooperative external leases, bump handoffs, ownership-unknown lease expiry, dead/live PID handling, duplicate bump requests, concurrent grants, release/grant races, handoff identity binding, wait wakeup races, and worker race prevention.

@@ -11,6 +11,7 @@ import threading
 import time
 from pathlib import Path
 
+import gpu_queue.queue as queue_module
 from gpu_queue.models import BumpStatus, LeaseStatus
 from gpu_queue.queue import GPUQueue
 
@@ -277,6 +278,37 @@ def test_requester_claims_handoff_only_for_matching_granted_bump(tmp_path):
     assert old_receipt["claimed_by_lease_id"] == claimed.lease_id
 
 
+def test_handoff_claim_requires_matching_requester_identity(tmp_path):
+    queue = GPUQueue(tmp_path / "queue")
+    lease = queue.claim_lease(**_lease_kwargs())
+    bump = queue.request_bump(bump_id="resident-cold-load", **_bump_kwargs())
+    queue.grant_bump(
+        bump.bump_id,
+        granted_by="neural-fire",
+        checkpoint="capture-42",
+        quiescence_confirmed=True,
+    )
+
+    wrong = queue.claim_lease(
+        **_lease_kwargs(
+            owner="wrong-lane",
+            agent_id="wrong-lane",
+            repo_root="/repo/other",
+            pid=None,
+            effective_route="wrong route --mps",
+            profile="other-work",
+        ),
+        handoff_bump_id=bump.bump_id,
+        raise_on_blocked=False,
+    )
+
+    assert wrong is None
+    observed = queue.lease_status()
+    assert observed.lease_id == lease.lease_id
+    assert observed.lifecycle_state == LeaseStatus.HANDOFF
+    assert observed.handoff_bump_id == bump.bump_id
+
+
 def test_concurrent_grants_allow_only_one_winner(tmp_path):
     queue = GPUQueue(tmp_path / "queue")
     queue.claim_lease(**_lease_kwargs())
@@ -317,6 +349,36 @@ def test_bump_wait_uses_event_file_and_returns_after_grant(tmp_path):
     thread.start()
     observed = queue.wait_for_bump(bump.bump_id, timeout=2)
     thread.join()
+
+    assert observed.status == BumpStatus.GRANTED
+
+
+def test_bump_wait_rereads_after_watcher_registration_race(tmp_path, monkeypatch):
+    queue = GPUQueue(tmp_path / "queue")
+    queue.claim_lease(**_lease_kwargs())
+    bump = queue.request_bump(bump_id="resident-cold-load", **_bump_kwargs())
+
+    class FakeKqueue:
+        def __init__(self):
+            queue.grant_bump(
+                bump.bump_id,
+                granted_by="neural-fire",
+                checkpoint="capture-42",
+                quiescence_confirmed=True,
+            )
+
+        def control(self, changelist, max_events, timeout):
+            if changelist is not None:
+                return []
+            raise AssertionError("wait_for_bump blocked after state became granted")
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(queue_module.select, "kqueue", FakeKqueue)
+    monkeypatch.setattr(queue_module.select, "kevent", lambda *args, **kwargs: object())
+
+    observed = queue.wait_for_bump(bump.bump_id, timeout=60)
 
     assert observed.status == BumpStatus.GRANTED
 
