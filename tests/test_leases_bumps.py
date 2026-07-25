@@ -383,6 +383,45 @@ def test_bump_wait_rereads_after_watcher_registration_race(tmp_path, monkeypatch
     assert observed.status == BumpStatus.GRANTED
 
 
+def test_cli_bump_wait_timeout_is_structured_and_preserves_pending_bump(tmp_path):
+    queue_dir = tmp_path / "cli-timeout"
+    queue = GPUQueue(queue_dir)
+    bump = queue.request_bump(bump_id="resident-cold-load", **_bump_kwargs())
+    bump_path = queue.bumps_dir / f"{bump.bump_id}.json"
+    state_before = bump_path.read_bytes()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "gpu_queue.cli",
+            "--queue-dir",
+            str(queue_dir),
+            "bump",
+            "wait",
+            bump.bump_id,
+            "--timeout",
+            "0.01",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(REPO_ROOT),
+    )
+
+    assert result.returncode != 0
+    assert "Traceback" not in result.stderr
+    payload = json.loads(result.stdout)
+    assert payload == {
+        "bump_id": bump.bump_id,
+        "status": "timed_out",
+        "failure_phase": "wait",
+        "requested_timeout_seconds": 0.01,
+        "effective_queue_dir": str(queue_dir.resolve()),
+        "last_trustworthy_bump": json.loads(bump.to_json()),
+    }
+    assert bump_path.read_bytes() == state_before
+
+
 def test_cli_exposes_required_lease_and_bump_commands(tmp_path):
     queue_dir = tmp_path / "cli"
     cmd = [

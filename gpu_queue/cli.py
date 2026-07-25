@@ -298,7 +298,21 @@ def cmd_bump_decline(args):
 
 def cmd_bump_wait(args):
     queue = get_queue(args)
-    bump = queue.wait_for_bump(args.bump_id, timeout=args.timeout)
+    try:
+        bump = queue.wait_for_bump(args.bump_id, timeout=args.timeout)
+    except TimeoutError:
+        last_bump = queue.get_bump(args.bump_id)
+        print(json.dumps({
+            "bump_id": args.bump_id,
+            "status": "timed_out",
+            "failure_phase": "wait",
+            "requested_timeout_seconds": args.timeout,
+            "effective_queue_dir": str(queue.queue_dir.resolve()),
+            "last_trustworthy_bump": (
+                json.loads(last_bump.to_json()) if last_bump is not None else None
+            ),
+        }, indent=2))
+        sys.exit(1)
     _print_model(bump)
 
 
