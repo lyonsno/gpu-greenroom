@@ -188,6 +188,54 @@ def test_partial_marker_failure_writes_durable_per_queue_failure_receipt(
     assert queue_b.is_paused() is False
 
 
+def test_second_queue_construction_failure_after_first_mutation_is_receipted(
+    tmp_path, monkeypatch
+):
+    registry = QueueRegistry(tmp_path / "queues.json")
+    queue_a = GPUQueue(tmp_path / "queue-a")
+    queue_b = GPUQueue(tmp_path / "queue-b")
+    registry.register(
+        name="a-first",
+        queue_dir=queue_a.queue_dir,
+        contention_class="apple-unified-accelerator",
+    )
+    registry.register(
+        name="b-second",
+        queue_dir=queue_b.queue_dir,
+        contention_class="apple-unified-accelerator",
+    )
+    native_queue = GPUQueue
+
+    def fail_second_construction(queue_dir):
+        if Path(queue_dir).resolve() == queue_b.queue_dir.resolve():
+            raise PermissionError("fixture denies second queue construction")
+        return native_queue(queue_dir)
+
+    monkeypatch.setattr(
+        "gpu_queue.control.GPUQueue",
+        fail_second_construction,
+    )
+
+    with pytest.raises(Exception) as raised:
+        registry.pause("apple-unified-accelerator")
+
+    report = raised.value.report
+    assert report["status"] == "failed"
+    assert report["failure_phase"] == "native-marker-mutation"
+    assert report["rollback_attempted"] is False
+    assert report["receipt_persisted"] is True
+    assert Path(report["receipt_path"]).exists()
+    assert [
+        (row["name"], row["mutation"], row["observed_paused"])
+        for row in report["mutations"]
+    ] == [
+        ("a-first", "succeeded", True),
+        ("b-second", "failed", False),
+    ]
+    assert queue_a.is_paused() is True
+    assert queue_b.is_paused() is False
+
+
 def test_receipt_write_failure_returns_in_memory_mutation_accounting(
     tmp_path, monkeypatch
 ):

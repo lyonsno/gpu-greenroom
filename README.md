@@ -56,7 +56,7 @@ gpu-greenroom pause
 # Resume a paused queue
 gpu-greenroom resume
 
-# Check that this agent runtime can import the CLI, write queue state, and dispatch
+# Check executable discovery, CLI import, queue writes, and dispatch availability
 gpu-greenroom doctor --json
 
 # Register participating queues once, then inspect or gate one collision domain

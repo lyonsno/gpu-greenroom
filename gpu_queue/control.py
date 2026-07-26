@@ -116,7 +116,20 @@ class QueueRegistry:
                     "running_jobs": [],
                 })
                 continue
-            queue = GPUQueue(queue_path)
+            try:
+                queue = GPUQueue(queue_path)
+            except OSError as error:
+                rows.append({
+                    **entry,
+                    "source": str(queue_path),
+                    "available": False,
+                    "error": f"queue_initialization_failed: {error}",
+                    "paused": (queue_path / "paused").exists(),
+                    "pending": None,
+                    "running": None,
+                    "running_jobs": [],
+                })
+                continue
             pending = queue.list_jobs(JobStatus.PENDING)
             running = queue.list_jobs(JobStatus.RUNNING)
             rows.append({
@@ -181,9 +194,9 @@ class QueueRegistry:
             ]
             mutation_error = None
             for entry, row in zip(selected, mutation_rows):
-                queue = GPUQueue(entry["queue_dir"])
                 row["attempted"] = True
                 try:
+                    queue = GPUQueue(entry["queue_dir"])
                     queue.pause() if paused else queue.resume()
                     row["mutation"] = "succeeded"
                 except OSError as error:
@@ -191,7 +204,9 @@ class QueueRegistry:
                     row["error"] = str(error)
                     mutation_error = error
                 finally:
-                    row["observed_paused"] = queue.is_paused()
+                    row["observed_paused"] = (
+                        Path(entry["queue_dir"]) / "paused"
+                    ).exists()
                 if mutation_error is not None:
                     break
 
