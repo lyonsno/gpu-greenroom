@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from gpu_queue import queue as queue_module
 from gpu_queue.cli import _load_job_types, cmd_doctor
 from gpu_queue.models import JobRequest, JobStatus
 from gpu_queue.queue import GPUQueue
@@ -246,6 +247,101 @@ def test_worker_without_required_capability_leaves_fifo_head_pending(
     }) is True
     assert queue.get_job(legacy.job_id).status == JobStatus.DONE
     assert (legacy_output / "result.txt").read_text().strip() == "legacy"
+
+
+def test_legacy_command_without_capability_field_is_still_gated(
+    tmp_path, monkeypatch
+):
+    queue = GPUQueue(tmp_path / "queue")
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    request = JobRequest(
+        job_type="command",
+        input_path="",
+        repo_root=str(repo_root),
+        command_argv=[sys.executable, "-c", "print('must not run')"],
+        command_cwd=str(repo_root),
+        route_identity="fixture/legacy-command-request",
+    )
+    pending_dir = queue.submit(request)
+    request_payload = json.loads((pending_dir / "request.json").read_text())
+    request_payload.pop("required_worker_capabilities")
+    (pending_dir / "request.json").write_text(json.dumps(request_payload, indent=2))
+
+    monkeypatch.setenv("GPU_GREENROOM_WORKER_CAPABILITIES", "")
+    assert queue.run_one({}) is False
+    assert queue.get_job(request.job_id).status == JobStatus.PENDING
+
+    monkeypatch.setenv(
+        "GPU_GREENROOM_WORKER_CAPABILITIES", "structured-command.v1"
+    )
+    assert queue.run_one({}) is True
+    assert queue.get_job(request.job_id).status == JobStatus.DONE
+
+
+def test_explicit_claimant_capabilities_govern_admission_and_receipt(
+    tmp_path, monkeypatch
+):
+    queue = GPUQueue(tmp_path / "queue")
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    request = JobRequest(
+        job_type="command",
+        input_path="",
+        repo_root=str(repo_root),
+        command_argv=[sys.executable, "-c", "print('must not run')"],
+        command_cwd=str(repo_root),
+        route_identity="fixture/claimant-capability-consistency",
+    )
+    queue.submit(request)
+    claimant = {
+        "pid": os.getpid(),
+        "source_root": str(repo_root),
+        "commit": "fixture",
+        "git_dirty": False,
+        "capabilities": [],
+    }
+
+    monkeypatch.setenv(
+        "GPU_GREENROOM_WORKER_CAPABILITIES", "structured-command.v1"
+    )
+    assert queue.run_one({}, claimant=claimant) is False
+    assert queue.get_job(request.job_id).status == JobStatus.PENDING
+
+
+def test_worker_source_identity_reports_untracked_files(tmp_path, monkeypatch):
+    source_root = tmp_path / "worker-source"
+    package_dir = source_root / "gpu_queue"
+    package_dir.mkdir(parents=True)
+    queue_source = package_dir / "queue.py"
+    queue_source.write_text("# tracked worker source\n")
+    subprocess.run(["git", "init", "-q"], cwd=source_root, check=True)
+    subprocess.run(
+        ["git", "config", "user.name", "Greenroom Test"],
+        cwd=source_root,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "greenroom-test@example.invalid"],
+        cwd=source_root,
+        check=True,
+    )
+    subprocess.run(["git", "add", "gpu_queue/queue.py"], cwd=source_root, check=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "tracked worker source"],
+        cwd=source_root,
+        check=True,
+    )
+    (package_dir / "untracked_helper.py").write_text("# importable local helper\n")
+
+    queue_module._worker_source_identity.cache_clear()
+    monkeypatch.setattr(queue_module, "__file__", str(queue_source))
+    try:
+        identity = queue_module._worker_source_identity()
+    finally:
+        queue_module._worker_source_identity.cache_clear()
+
+    assert identity["git_dirty"] is True
 
 
 def test_doctor_reports_cli_queue_and_worker_dispatch(tmp_path):

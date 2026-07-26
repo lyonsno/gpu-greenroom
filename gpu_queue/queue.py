@@ -49,7 +49,7 @@ def _worker_source_identity() -> dict:
             text=True,
         ).strip()
         identity["git_dirty"] = bool(subprocess.check_output(
-            ["git", "status", "--porcelain", "--untracked-files=no"],
+            ["git", "status", "--porcelain"],
             cwd=source_root,
             stderr=subprocess.DEVNULL,
             text=True,
@@ -65,6 +65,13 @@ def worker_identity() -> dict:
         "pid": os.getpid(),
         "capabilities": sorted(effective_worker_capabilities()),
     }
+
+
+def required_worker_capabilities(request: JobRequest) -> frozenset[str]:
+    required = set(request.required_worker_capabilities)
+    if request.command_argv is not None:
+        required.add(STRUCTURED_COMMAND_CAPABILITY)
+    return frozenset(required)
 
 
 class GPUQueue:
@@ -845,8 +852,13 @@ class GPUQueue:
                 return False
 
             request = JobRequest.from_json((job_dir / "request.json").read_text())
-            required_capabilities = frozenset(request.required_worker_capabilities)
-            if not required_capabilities.issubset(effective_worker_capabilities()):
+            effective_claimant = claimant or worker_identity()
+            claimant_capabilities = frozenset(
+                effective_claimant.get("capabilities", [])
+            )
+            if not required_worker_capabilities(request).issubset(
+                claimant_capabilities
+            ):
                 return False
 
             # Move to running
@@ -1024,7 +1036,7 @@ class GPUQueue:
                 "request_path": str(final_job_dir / "request.json"),
                 "stdout_path": str(final_job_dir / "stdout.log"),
                 "stderr_path": str(final_job_dir / "stderr.log"),
-                "worker": claimant or worker_identity(),
+                "worker": effective_claimant,
             }
             (job_dir / "receipt.json").write_text(json.dumps(receipt, indent=2))
 
