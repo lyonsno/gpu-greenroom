@@ -6,6 +6,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
+from gpu_queue.cli import cmd_queues_pause
+from gpu_queue.control import QueueControlError, QueueRegistry
 from gpu_queue.models import JobRequest, JobStatus
 from gpu_queue.queue import GPUQueue
 
@@ -136,3 +140,115 @@ def test_queue_registry_cli_returns_aggregate_json(tmp_path):
     assert report["schema"] == "gpu-greenroom.aggregate-status.v1"
     assert report["registry_path"] == str(registry_path.resolve())
     assert report["queues"][0]["source"] == str(queue_dir.resolve())
+
+
+def test_partial_marker_failure_writes_durable_per_queue_failure_receipt(
+    tmp_path, monkeypatch
+):
+    registry = QueueRegistry(tmp_path / "queues.json")
+    queue_a = GPUQueue(tmp_path / "queue-a")
+    queue_b = GPUQueue(tmp_path / "queue-b")
+    registry.register(
+        name="a-first",
+        queue_dir=queue_a.queue_dir,
+        contention_class="apple-unified-accelerator",
+    )
+    registry.register(
+        name="b-second",
+        queue_dir=queue_b.queue_dir,
+        contention_class="apple-unified-accelerator",
+    )
+    original_pause = GPUQueue.pause
+
+    def fail_second(queue):
+        if queue.queue_dir.resolve() == queue_b.queue_dir.resolve():
+            raise PermissionError("fixture denies second pause marker")
+        return original_pause(queue)
+
+    monkeypatch.setattr(GPUQueue, "pause", fail_second)
+
+    with pytest.raises(Exception) as raised:
+        registry.pause("apple-unified-accelerator")
+
+    report = raised.value.report
+    assert report["status"] == "failed"
+    assert report["failure_phase"] == "native-marker-mutation"
+    assert report["rollback_attempted"] is False
+    assert report["receipt_persisted"] is True
+    assert Path(report["receipt_path"]).exists()
+    assert json.loads(Path(report["receipt_path"]).read_text()) == report
+    assert [
+        (row["name"], row["mutation"], row["observed_paused"])
+        for row in report["mutations"]
+    ] == [
+        ("a-first", "succeeded", True),
+        ("b-second", "failed", False),
+    ]
+    assert queue_a.is_paused() is True
+    assert queue_b.is_paused() is False
+
+
+def test_receipt_write_failure_returns_in_memory_mutation_accounting(
+    tmp_path, monkeypatch
+):
+    registry = QueueRegistry(tmp_path / "queues.json")
+    queue = GPUQueue(tmp_path / "queue")
+    registry.register(
+        name="science",
+        queue_dir=queue.queue_dir,
+        contention_class="apple-unified-accelerator",
+    )
+    original_write = registry._write_atomic
+
+    def fail_primary_receipt(path, payload):
+        if path.parent == registry.receipts_dir:
+            raise PermissionError("fixture denies primary receipt directory")
+        return original_write(path, payload)
+
+    monkeypatch.setattr(registry, "_write_atomic", fail_primary_receipt)
+
+    with pytest.raises(Exception) as raised:
+        registry.pause("apple-unified-accelerator")
+
+    report = raised.value.report
+    assert report["status"] == "failed"
+    assert report["failure_phase"] == "receipt-write"
+    assert report["rollback_attempted"] is False
+    assert report["receipt_persisted"] is False
+    assert report["failed_receipt_path"].startswith(str(registry.receipts_dir))
+    assert report["mutations"][0]["mutation"] == "succeeded"
+    assert report["mutations"][0]["observed_paused"] is True
+    assert queue.is_paused() is True
+
+
+def test_queue_control_error_is_structured_stderr_and_nonzero(monkeypatch, capsys):
+    report = {
+        "schema": "gpu-greenroom.queue-control-receipt.v1",
+        "status": "failed",
+        "failure_phase": "receipt-write",
+        "receipt_persisted": False,
+        "failed_receipt_path": "/durable/queue-control-receipts/failed.json",
+        "mutations": [{"name": "science", "mutation": "succeeded"}],
+    }
+
+    class FailingRegistry:
+        def pause(self, _contention_class):
+            raise QueueControlError(report)
+
+    monkeypatch.setattr("gpu_queue.cli.get_registry", lambda _args: FailingRegistry())
+    args = type(
+        "Args",
+        (),
+        {
+            "contention_class": "apple-unified-accelerator",
+            "registry": "/unused/registry.json",
+        },
+    )()
+
+    with pytest.raises(SystemExit) as raised:
+        cmd_queues_pause(args)
+
+    captured = capsys.readouterr()
+    assert raised.value.code == 2
+    assert captured.out == ""
+    assert json.loads(captured.err) == report

@@ -11,7 +11,7 @@ import sys
 import time
 from pathlib import Path
 
-from .control import QueueRegistry
+from .control import QueueControlError, QueueRegistry
 from .models import BumpStatus, JobRequest, JobStatus, LeaseStatus
 from .queue import GPUQueue
 
@@ -331,11 +331,20 @@ def cmd_recover(args):
 
 def cmd_doctor(args):
     queue = get_queue(args)
+    cli_executable = shutil.which("gpu-greenroom")
     probe_path = queue.queue_dir / f".doctor-write-{os.getpid()}"
     checks = {
         "cli_import": {"ok": callable(main)},
+        "cli_executable": {
+            "ok": cli_executable is not None,
+            "requested": "gpu-greenroom",
+            "effective": cli_executable,
+        },
         "queue_writable": {"ok": False},
-        "worker_dispatch": {"ok": callable(queue.run_one)},
+        "worker_dispatch_available": {
+            "ok": callable(queue.run_one),
+            "claim": "python-callable-present; no workload dispatched",
+        },
     }
     try:
         probe_path.write_text("ok")
@@ -351,7 +360,7 @@ def cmd_doctor(args):
         "schema": "gpu-greenroom.doctor.v1",
         "healthy": all(check["ok"] for check in checks.values()),
         "effective_queue_dir": str(queue.queue_dir.resolve()),
-        "cli_executable": shutil.which("gpu-greenroom"),
+        "cli_executable": cli_executable,
         "checks": checks,
         "queue": {
             "paused": queue.is_paused(),
@@ -388,11 +397,21 @@ def cmd_queues_status(args):
 
 
 def cmd_queues_pause(args):
-    print(json.dumps(get_registry(args).pause(args.contention_class), indent=2))
+    try:
+        report = get_registry(args).pause(args.contention_class)
+    except QueueControlError as error:
+        print(json.dumps(error.report, indent=2), file=sys.stderr)
+        sys.exit(2)
+    print(json.dumps(report, indent=2))
 
 
 def cmd_queues_resume(args):
-    print(json.dumps(get_registry(args).resume(args.contention_class), indent=2))
+    try:
+        report = get_registry(args).resume(args.contention_class)
+    except QueueControlError as error:
+        print(json.dumps(error.report, indent=2), file=sys.stderr)
+        sys.exit(2)
+    print(json.dumps(report, indent=2))
 
 
 def _print_model(model):

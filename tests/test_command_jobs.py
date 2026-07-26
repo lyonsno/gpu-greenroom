@@ -1,21 +1,25 @@
 """Structured arbitrary-command admission and receipt contracts."""
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
-from gpu_queue.cli import _load_job_types
+import pytest
+
+from gpu_queue.cli import _load_job_types, cmd_doctor
 from gpu_queue.models import JobRequest, JobStatus
 from gpu_queue.queue import GPUQueue
 
 
-def run_cli(*args, queue_dir):
+def run_cli(*args, queue_dir, env=None):
     result = subprocess.run(
         [sys.executable, "-m", "gpu_queue.cli", "--queue-dir", str(queue_dir), *args],
         capture_output=True,
         text=True,
         cwd=str(Path(__file__).resolve().parent.parent),
+        env=env,
     )
     return result.returncode, result.stdout, result.stderr
 
@@ -174,8 +178,16 @@ def test_paused_queue_accepts_command_but_does_not_start_it(tmp_path):
 
 def test_doctor_reports_cli_queue_and_worker_dispatch(tmp_path):
     queue_dir = tmp_path / "queue"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    executable = bin_dir / "gpu-greenroom"
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o755)
+    env = {**os.environ, "PATH": str(bin_dir)}
 
-    rc, stdout, stderr = run_cli("doctor", "--json", queue_dir=queue_dir)
+    rc, stdout, stderr = run_cli(
+        "doctor", "--json", queue_dir=queue_dir, env=env
+    )
 
     assert rc == 0, stderr
     report = json.loads(stdout)
@@ -183,8 +195,34 @@ def test_doctor_reports_cli_queue_and_worker_dispatch(tmp_path):
     assert report["healthy"] is True
     assert report["effective_queue_dir"] == str(queue_dir.resolve())
     assert report["checks"]["cli_import"]["ok"] is True
+    assert report["checks"]["cli_executable"]["effective"] == str(executable)
     assert report["checks"]["queue_writable"]["ok"] is True
-    assert report["checks"]["worker_dispatch"]["ok"] is True
+    assert report["checks"]["worker_dispatch_available"]["ok"] is True
     assert report["queue"]["paused"] is False
     assert report["queue"]["pending"] == 0
     assert report["queue"]["running"] == 0
+
+
+def test_doctor_is_unhealthy_when_installed_cli_route_is_missing(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setattr("gpu_queue.cli.shutil.which", lambda _name: None)
+    args = type("Args", (), {"queue_dir": str(tmp_path / "queue")})()
+
+    with pytest.raises(SystemExit) as raised:
+        cmd_doctor(args)
+
+    assert raised.value.code == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report["healthy"] is False
+    assert report["effective_queue_dir"] == str((tmp_path / "queue").resolve())
+    assert report["cli_executable"] is None
+    assert report["checks"]["cli_executable"] == {
+        "ok": False,
+        "requested": "gpu-greenroom",
+        "effective": None,
+    }
+    assert report["checks"]["worker_dispatch_available"]["ok"] is True
+    assert report["checks"]["worker_dispatch_available"]["claim"] == (
+        "python-callable-present; no workload dispatched"
+    )

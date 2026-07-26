@@ -14,6 +14,14 @@ from .models import JobStatus
 from .queue import GPUQueue
 
 
+class QueueControlError(RuntimeError):
+    """Aggregate control failed after producing structured mutation accounting."""
+
+    def __init__(self, report: dict):
+        super().__init__(report.get("error_message", "aggregate queue control failed"))
+        self.report = report
+
+
 class QueueRegistry:
     """One-time adapter registry; native queue directories remain state authority."""
 
@@ -83,8 +91,16 @@ class QueueRegistry:
             return list(self._load_unlocked()["queues"])
 
     def status(self, contention_class: str | None = None) -> list[dict]:
+        entries = self.entries()
+        return self._status_entries(entries, contention_class)
+
+    def _status_entries(
+        self,
+        entries: list[dict],
+        contention_class: str | None = None,
+    ) -> list[dict]:
         rows = []
-        for entry in self.entries():
+        for entry in entries:
             if contention_class and entry["contention_class"] != contention_class:
                 continue
             queue_path = Path(entry["queue_dir"])
@@ -124,39 +140,96 @@ class QueueRegistry:
         return rows
 
     def _set_paused(self, contention_class: str, paused: bool) -> dict:
-        selected = [
-            entry for entry in self.entries()
-            if entry["contention_class"] == contention_class
-        ]
-        if not selected:
-            raise KeyError(f"no registered queues for contention class {contention_class}")
-        missing = [
-            Path(entry["queue_dir"])
-            for entry in selected
-            if not Path(entry["queue_dir"]).is_dir()
-        ]
-        if missing:
-            raise FileNotFoundError(
-                "registered queue is missing: " + ", ".join(map(str, missing))
-            )
-        for entry in selected:
-            queue = GPUQueue(entry["queue_dir"])
-            queue.pause() if paused else queue.resume()
-
         action = "pause" if paused else "resume"
-        receipt = {
-            "schema": "gpu-greenroom.queue-control-receipt.v1",
-            "action": action,
-            "contention_class": contention_class,
-            "observed_at": time.time(),
-            "registry_path": str(self.path),
-            "queues": self.status(contention_class),
-        }
-        receipt_name = f"{time.time_ns()}-{action}-{contention_class}.json"
+        receipt_name = f"{time.time_ns()}-{action}-{uuid.uuid4().hex[:8]}.json"
         receipt_path = self.receipts_dir / receipt_name
-        receipt["receipt_path"] = str(receipt_path)
-        self._write_atomic(receipt_path, receipt)
-        return receipt
+        with self._lock():
+            entries = self._load_unlocked()["queues"]
+            selected = [
+                entry for entry in entries
+                if entry["contention_class"] == contention_class
+            ]
+            if not selected:
+                raise KeyError(
+                    f"no registered queues for contention class {contention_class}"
+                )
+            missing = [
+                Path(entry["queue_dir"])
+                for entry in selected
+                if not Path(entry["queue_dir"]).is_dir()
+            ]
+            if missing:
+                raise FileNotFoundError(
+                    "registered queue is missing: " + ", ".join(map(str, missing))
+                )
+
+            mutation_rows = [
+                {
+                    "name": entry["name"],
+                    "queue_dir": entry["queue_dir"],
+                    "attempted": False,
+                    "mutation": "not-attempted",
+                    "previous_paused": (
+                        Path(entry["queue_dir"]) / "paused"
+                    ).exists(),
+                    "observed_paused": (
+                        Path(entry["queue_dir"]) / "paused"
+                    ).exists(),
+                    "error": None,
+                }
+                for entry in selected
+            ]
+            mutation_error = None
+            for entry, row in zip(selected, mutation_rows):
+                queue = GPUQueue(entry["queue_dir"])
+                row["attempted"] = True
+                try:
+                    queue.pause() if paused else queue.resume()
+                    row["mutation"] = "succeeded"
+                except OSError as error:
+                    row["mutation"] = "failed"
+                    row["error"] = str(error)
+                    mutation_error = error
+                finally:
+                    row["observed_paused"] = queue.is_paused()
+                if mutation_error is not None:
+                    break
+
+            report = {
+                "schema": "gpu-greenroom.queue-control-receipt.v1",
+                "status": "failed" if mutation_error else "succeeded",
+                "failure_phase": (
+                    "native-marker-mutation" if mutation_error else None
+                ),
+                "action": action,
+                "contention_class": contention_class,
+                "observed_at": time.time(),
+                "registry_path": str(self.path),
+                "receipt_path": str(receipt_path),
+                "receipt_persisted": True,
+                "rollback_attempted": False,
+                "error_message": str(mutation_error) if mutation_error else None,
+                "queues": self._status_entries(selected),
+                "mutations": mutation_rows,
+            }
+            try:
+                self._write_atomic(receipt_path, report)
+            except OSError as receipt_error:
+                failure_report = {
+                    **report,
+                    "status": "failed",
+                    "failure_phase": "receipt-write",
+                    "primary_failure_phase": report["failure_phase"],
+                    "error_message": str(receipt_error),
+                    "failed_receipt_path": str(receipt_path),
+                    "receipt_path": None,
+                    "receipt_persisted": False,
+                }
+                raise QueueControlError(failure_report) from receipt_error
+
+            if mutation_error is not None:
+                raise QueueControlError(report) from mutation_error
+            return report
 
     def pause(self, contention_class: str) -> dict:
         return self._set_paused(contention_class, True)
