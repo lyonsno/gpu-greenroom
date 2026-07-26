@@ -46,6 +46,7 @@ class JobRequest:
     command_env: dict[str, str] | None = None
     route_identity: str | None = None
     command_timeout: float | None = None
+    required_worker_capabilities: list[str] = field(default_factory=list)
     job_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     submitted_at: float = field(default_factory=time.time)
 

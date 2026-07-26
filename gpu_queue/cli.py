@@ -13,7 +13,12 @@ from pathlib import Path
 
 from .control import QueueControlError, QueueRegistry
 from .models import BumpStatus, JobRequest, JobStatus, LeaseStatus
-from .queue import GPUQueue
+from .queue import (
+    GPUQueue,
+    STRUCTURED_COMMAND_CAPABILITY,
+    effective_worker_capabilities,
+    worker_identity,
+)
 
 DEFAULT_QUEUE_DIR = os.environ.get("GPU_GREENROOM_DIR", os.path.expanduser("~/.local/state/gpu-greenroom"))
 DEFAULT_REGISTRY_PATH = os.environ.get(
@@ -205,6 +210,7 @@ def cmd_submit_command(args):
         command_env=payload["env"],
         route_identity=payload["route_identity"],
         command_timeout=payload["timeout"],
+        required_worker_capabilities=[STRUCTURED_COMMAND_CAPABILITY],
     )
     job_dir = queue.submit(request)
     response = {
@@ -215,6 +221,7 @@ def cmd_submit_command(args):
         "request_path": str((job_dir / "request.json").resolve()),
         "output_dir": request.output_dir,
         "route_identity": request.route_identity,
+        "required_worker_capabilities": request.required_worker_capabilities,
     }
     print(json.dumps(response, indent=2))
 
@@ -271,12 +278,17 @@ def _load_job_types(queue_dir):
 def cmd_worker(args):
     """Run the worker loop — picks and runs jobs sequentially."""
     queue = get_queue(args)
+    claimant = worker_identity()
 
     job_types = _load_job_types(args.queue_dir)
 
     print(f"GPU Greenroom Worker starting")
     print(f"  Queue dir: {args.queue_dir}")
     print(f"  Job types: {', '.join(job_types.keys())}")
+    print(f"  Capabilities: {', '.join(claimant['capabilities']) or '(none)'}")
+    print(f"  Source root: {claimant['source_root']}")
+    print(f"  Commit: {claimant['commit'] or '(unavailable)'}")
+    print(f"  Git dirty: {claimant['git_dirty']}")
     print(f"  Poll interval: {args.poll}s")
 
     # Recover stale jobs on startup
@@ -297,7 +309,7 @@ def cmd_worker(args):
                 print("Queue resumed.")
                 was_paused = False
             job_types = _load_job_types(args.queue_dir)
-            ran = queue.run_one(job_types)
+            ran = queue.run_one(job_types, claimant=claimant)
             if ran:
                 # Check for more immediately
                 continue
@@ -344,6 +356,7 @@ def cmd_doctor(args):
         "worker_dispatch_available": {
             "ok": callable(queue.run_one),
             "claim": "python-callable-present; no workload dispatched",
+            "capabilities": sorted(effective_worker_capabilities()),
         },
     }
     try:

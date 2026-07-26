@@ -175,9 +175,24 @@ Submission returns JSON containing the job id, queue directory, request path,
 output directory, and requested route. Completion and failure receipts preserve
 requested route, exact effective argv, repo root, cwd, environment overlay,
 timeout, stdout/stderr paths, request path, output path, exit code, and failure
-phase. A launch failure still leaves request, status, empty-or-partial logs, and
-a receipt. Manifest validation failures are written under
+phase. They also record the claimant's PID, source checkout, Git commit and
+dirty state, and effective worker capabilities. A launch failure still leaves
+request, status, empty-or-partial logs, and a receipt. Manifest validation failures are written under
 `submission-failures/` and returned as structured stderr.
+
+Structured requests require the `structured-command.v1` worker capability. A
+corrected worker compares request requirements with its effective capabilities
+while holding `gpu.lock` and before moving the FIFO head to `running`. An
+incapable worker leaves request and status bytes unchanged and does not skip to
+younger compatible work; a capable worker can then acquire the same lock and
+claim that oldest job. Workers support all capabilities implemented by their
+code unless `GPU_GREENROOM_WORKER_CAPABILITIES` supplies a comma-separated
+deployment override.
+
+Workers started from versions predating capability-aware claiming cannot learn
+this contract from request metadata. Replace those processes at an observed
+idle boundary before admitting capability-gated jobs; do not run a second queue
+or execution-lock domain as a compatibility workaround.
 
 ## Registered queues and execution-start pause
 

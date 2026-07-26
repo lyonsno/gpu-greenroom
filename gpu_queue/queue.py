@@ -12,9 +12,59 @@ import subprocess
 import time
 import uuid
 from contextlib import contextmanager
+from functools import lru_cache
 from pathlib import Path
 
 from .models import BumpRequest, BumpStatus, ExternalLease, JobRequest, JobState, JobStatus, LeaseStatus
+
+
+STRUCTURED_COMMAND_CAPABILITY = "structured-command.v1"
+DEFAULT_WORKER_CAPABILITIES = frozenset({STRUCTURED_COMMAND_CAPABILITY})
+
+
+def effective_worker_capabilities() -> frozenset[str]:
+    configured = os.environ.get("GPU_GREENROOM_WORKER_CAPABILITIES")
+    if configured is None:
+        return DEFAULT_WORKER_CAPABILITIES
+    return frozenset(
+        capability.strip()
+        for capability in configured.split(",")
+        if capability.strip()
+    )
+
+
+@lru_cache(maxsize=1)
+def _worker_source_identity() -> dict:
+    source_root = Path(__file__).resolve().parent.parent
+    identity = {
+        "source_root": str(source_root),
+        "commit": None,
+        "git_dirty": None,
+    }
+    try:
+        identity["commit"] = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=source_root,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+        identity["git_dirty"] = bool(subprocess.check_output(
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            cwd=source_root,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip())
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    return identity
+
+
+def worker_identity() -> dict:
+    return {
+        **_worker_source_identity(),
+        "pid": os.getpid(),
+        "capabilities": sorted(effective_worker_capabilities()),
+    }
 
 
 class GPUQueue:
@@ -627,6 +677,14 @@ class GPUQueue:
         queue_dir/outputs/<job_id>/. If output_dir is under /tmp or
         /private/tmp, records a volatile_output warning.
         """
+        if (
+            request.command_argv is not None
+            and STRUCTURED_COMMAND_CAPABILITY
+            not in request.required_worker_capabilities
+        ):
+            request.required_worker_capabilities.append(
+                STRUCTURED_COMMAND_CAPABILITY
+            )
         if not request.output_dir:
             request.output_dir = str(self.queue_dir / "outputs" / request.job_id)
 
@@ -758,7 +816,7 @@ class GPUQueue:
         shutil.move(str(job_dir), str(dest))
         return dest
 
-    def run_one(self, job_types: dict) -> bool:
+    def run_one(self, job_types: dict, *, claimant: dict | None = None) -> bool:
         """Pick and run the next pending job under flock.
 
         job_types: mapping of job_type name -> command template list.
@@ -787,6 +845,9 @@ class GPUQueue:
                 return False
 
             request = JobRequest.from_json((job_dir / "request.json").read_text())
+            required_capabilities = frozenset(request.required_worker_capabilities)
+            if not required_capabilities.issubset(effective_worker_capabilities()):
+                return False
 
             # Move to running
             job_dir = self._move_job(job_dir, "running")
@@ -963,6 +1024,7 @@ class GPUQueue:
                 "request_path": str(final_job_dir / "request.json"),
                 "stdout_path": str(final_job_dir / "stdout.log"),
                 "stderr_path": str(final_job_dir / "stderr.log"),
+                "worker": claimant or worker_identity(),
             }
             (job_dir / "receipt.json").write_text(json.dumps(receipt, indent=2))
 

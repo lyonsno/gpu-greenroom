@@ -71,6 +71,7 @@ def test_submit_command_manifest_preserves_exact_structured_identity(tmp_path):
     assert request["repo_root"] == str(repo_root)
     assert request["route_identity"] == manifest["route_identity"]
     assert request["command_timeout"] is None
+    assert request["required_worker_capabilities"] == ["structured-command.v1"]
 
     queue = GPUQueue(queue_dir)
     assert queue.run_one(_load_job_types(queue_dir)) is True
@@ -91,6 +92,16 @@ def test_submit_command_manifest_preserves_exact_structured_identity(tmp_path):
     assert receipt["stdout_path"].endswith("/stdout.log")
     assert receipt["stderr_path"].endswith("/stderr.log")
     assert receipt["request_path"].endswith("/request.json")
+    assert receipt["worker"]["pid"] == os.getpid()
+    assert receipt["worker"]["source_root"] == str(
+        Path(__file__).resolve().parent.parent
+    )
+    assert receipt["worker"]["commit"] == subprocess.check_output(
+        ["git", "rev-parse", "HEAD"],
+        cwd=Path(__file__).resolve().parent.parent,
+        text=True,
+    ).strip()
+    assert receipt["worker"]["capabilities"] == ["structured-command.v1"]
 
 
 def test_command_launch_failure_is_durable_before_primary_output(tmp_path):
@@ -174,6 +185,67 @@ def test_paused_queue_accepts_command_but_does_not_start_it(tmp_path):
     assert queue.get_job(request.job_id).status == JobStatus.PENDING
     assert queue.run_one({}) is False
     assert queue.get_job(request.job_id).status == JobStatus.PENDING
+
+
+def test_worker_without_required_capability_leaves_fifo_head_pending(
+    tmp_path, monkeypatch
+):
+    queue = GPUQueue(tmp_path / "queue")
+    repo_root = tmp_path / "repo"
+    output_dir = tmp_path / "command-output"
+    repo_root.mkdir()
+    command = JobRequest(
+        job_type="command",
+        input_path="",
+        output_dir=str(output_dir),
+        repo_root=str(repo_root),
+        command_argv=[
+            sys.executable,
+            "-c",
+            "from pathlib import Path; Path('command-ran').write_text('yes')",
+        ],
+        command_cwd=str(repo_root),
+        route_identity="fixture/mixed-version-command",
+    )
+    command_dir = queue.submit(command)
+    command_payload = json.loads((command_dir / "request.json").read_text())
+    command_payload["required_worker_capabilities"] = ["structured-command.v1"]
+    (command_dir / "request.json").write_text(json.dumps(command_payload, indent=2))
+
+    legacy_output = tmp_path / "legacy-output"
+    legacy = JobRequest(
+        job_type="write_output",
+        input_path="younger",
+        output_dir=str(legacy_output),
+    )
+    queue.submit(legacy)
+    before_request = (command_dir / "request.json").read_bytes()
+    before_status = (command_dir / "status.json").read_bytes()
+
+    monkeypatch.setenv("GPU_GREENROOM_WORKER_CAPABILITIES", "")
+    assert queue.run_one({
+        "write_output": ["sh", "-c", "echo legacy > {output_dir}/result.txt"]
+    }) is False
+    assert (command_dir / "request.json").read_bytes() == before_request
+    assert (command_dir / "status.json").read_bytes() == before_status
+    assert queue.get_job(command.job_id).status == JobStatus.PENDING
+    assert queue.get_job(legacy.job_id).status == JobStatus.PENDING
+    assert not (repo_root / "command-ran").exists()
+    assert not legacy_output.exists()
+
+    monkeypatch.setenv(
+        "GPU_GREENROOM_WORKER_CAPABILITIES", "structured-command.v1"
+    )
+    assert queue.run_one({}) is True
+    assert queue.get_job(command.job_id).status == JobStatus.DONE
+    assert (repo_root / "command-ran").read_text() == "yes"
+
+    monkeypatch.setenv("GPU_GREENROOM_WORKER_CAPABILITIES", "")
+    assert queue.run_one({
+        "write_output": ["sh", "-c", "echo legacy > {output_dir}/result.txt"]
+    }) is True
+    assert queue.get_job(legacy.job_id).status == JobStatus.DONE
+    assert (legacy_output / "result.txt").read_text().strip() == "legacy"
 
 
 def test_doctor_reports_cli_queue_and_worker_dispatch(tmp_path):
