@@ -25,6 +25,18 @@ gpu-greenroom submit trellis2mlx /path/to/image.png /path/to/output/
 # Submit with custom params
 gpu-greenroom submit trellis2mlx /path/to/image.png /path/to/output/ -p seed=99 resolution=768
 
+# Submit an exact repository-local argv without editing job_types.json
+gpu-greenroom submit-command \
+  --repo-root /path/to/repo \
+  --cwd /path/to/repo \
+  --route-identity "assays/grid32-bounded" \
+  --env BACKEND=mlx \
+  --output-dir /durable/results/grid32 \
+  -- /path/to/repo/.venv/bin/python -u scripts/grid32.py
+
+# Or submit the same contract from a caller-owned JSON manifest
+gpu-greenroom submit-command --manifest /path/to/gpu-command.json
+
 # List queue
 gpu-greenroom list
 gpu-greenroom list -s pending
@@ -43,6 +55,17 @@ gpu-greenroom pause
 
 # Resume a paused queue
 gpu-greenroom resume
+
+# Check that this agent runtime can import the CLI, write queue state, and dispatch
+gpu-greenroom doctor --json
+
+# Register participating queues once, then inspect or gate one collision domain
+gpu-greenroom queues register science \
+  --queue-dir ~/.local/state/gpu-greenroom \
+  --contention-class apple-unified-accelerator
+gpu-greenroom queues status
+gpu-greenroom queues pause --contention-class apple-unified-accelerator
+gpu-greenroom queues resume --contention-class apple-unified-accelerator
 
 # Recover stale jobs after crash
 gpu-greenroom recover
@@ -123,6 +146,58 @@ gpu-greenroom bump wait resident-cold-load --timeout 600
 ```
 
 Override the queue directory with `GPU_GREENROOM_DIR` or `--queue-dir`.
+
+## Structured command jobs
+
+`submit-command` admits a repository-local accelerator command without adding a
+global job type. It accepts flags or a caller-owned
+`gpu-greenroom.command.v1` JSON manifest:
+
+```json
+{
+  "schema": "gpu-greenroom.command.v1",
+  "repo_root": "/path/to/repo",
+  "cwd": "/path/to/repo",
+  "env": {"BACKEND": "mlx"},
+  "output_dir": "/durable/results/grid32",
+  "route_identity": "assays/grid32-bounded",
+  "argv": ["/path/to/repo/.venv/bin/python", "-u", "scripts/grid32.py"],
+  "timeout": null
+}
+```
+
+`argv` is executed directly with `shell=False`; no part is reparsed as a shell
+string and no template substitution is applied. `timeout: null` means no
+Greenroom-authored timeout. The environment is the worker environment plus the
+recorded manifest overlay.
+
+Submission returns JSON containing the job id, queue directory, request path,
+output directory, and requested route. Completion and failure receipts preserve
+requested route, exact effective argv, repo root, cwd, environment overlay,
+timeout, stdout/stderr paths, request path, output path, exit code, and failure
+phase. A launch failure still leaves request, status, empty-or-partial logs, and
+a receipt. Manifest validation failures are written under
+`submission-failures/` and returned as structured stderr.
+
+## Registered queues and execution-start pause
+
+The queue registry stores only one-time adapter identity: name, queue
+directory, contention class, and adapter kind. Paths come from the caller via
+`--registry` or `GPU_GREENROOM_REGISTRY`; the default is
+`~/.local/state/gpu-greenroom/queues.json`.
+
+`queues status` reads pending, running, and paused state from each native queue.
+It does not copy job state into the registry. `queues pause` preflights every
+selected queue and then creates each queue's native `paused` marker. Submission
+and durable enqueue remain open, running jobs finish normally, and workers
+cannot move pending work to running until `queues resume` removes the native
+markers. Control actions write durable receipts under
+`queue-control-receipts/`.
+
+The existing queue lock remains the only execution mutex. Aggregate control
+does not authorize execution and adds no new check to ordinary submission or
+dispatch: workers continue to use the queue-local pause check immediately
+before the pending-to-running transition.
 
 ## Cooperative external leases and bumps
 
@@ -272,6 +347,7 @@ Uses `flock(LOCK_EX | LOCK_NB)` on `gpu.lock`. Only one worker can run a job at 
 
 ```bash
 uv run --extra test python -m pytest tests/ -v
+uv run python benchmarks/bench_control_plane.py --iterations 1000
 ```
 
-105 tests covering serialization, failure receipts, stale recovery, cancel safety, FIFO order, param injection prevention, rich config (cwd/env/defaults), receipt route identity, configurable timeout, pause/resume, durable output dirs, volatile path warnings, CLI, cooperative external leases, bump handoffs, ownership-unknown lease expiry, dead/live PID handling, duplicate bump requests, concurrent grants, release/grant races, handoff identity binding, wait wakeup races, and worker race prevention.
+Tests cover serialization, failure receipts, stale recovery, cancel safety, FIFO order, param injection prevention, rich config (cwd/env/defaults), receipt route identity, configurable timeout, pause/resume, durable output dirs, volatile path warnings, CLI, exact structured command admission, durable pre-output failures, aggregate native queue control, cooperative external leases, bump handoffs, ownership-unknown lease expiry, dead/live PID handling, duplicate bump requests, concurrent grants, release/grant races, handoff identity binding, wait wakeup races, and worker race prevention.

@@ -6,14 +6,20 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
 
+from .control import QueueRegistry
 from .models import BumpStatus, JobRequest, JobStatus, LeaseStatus
 from .queue import GPUQueue
 
 DEFAULT_QUEUE_DIR = os.environ.get("GPU_GREENROOM_DIR", os.path.expanduser("~/.local/state/gpu-greenroom"))
+DEFAULT_REGISTRY_PATH = os.environ.get(
+    "GPU_GREENROOM_REGISTRY",
+    os.path.join(DEFAULT_QUEUE_DIR, "queues.json"),
+)
 
 # Default job type configurations
 # Rich config: cmd, cwd, env, defaults
@@ -85,6 +91,132 @@ def cmd_submit(args):
     if args.cwd:
         print(f"  Cwd: {args.cwd}")
     print(f"  Dir: {job_dir}")
+
+
+def _parse_env_assignments(assignments):
+    env = {}
+    for assignment in assignments or []:
+        if "=" not in assignment:
+            raise ValueError(f"environment assignment must be KEY=VALUE: {assignment!r}")
+        key, value = assignment.split("=", 1)
+        if not key:
+            raise ValueError("environment key must not be empty")
+        env[key] = value
+    return env
+
+
+def _command_payload(args):
+    manifest_path = None
+    if args.manifest:
+        manifest_path = Path(args.manifest).expanduser().resolve()
+        payload = json.loads(manifest_path.read_text())
+    else:
+        argv = list(args.argv or [])
+        if argv and argv[0] == "--":
+            argv = argv[1:]
+        payload = {
+            "schema": "gpu-greenroom.command.v1",
+            "repo_root": args.repo_root,
+            "cwd": args.cwd,
+            "env": _parse_env_assignments(args.env),
+            "output_dir": args.output_dir,
+            "route_identity": args.route_identity,
+            "argv": argv,
+            "timeout": args.timeout,
+        }
+
+    if not isinstance(payload, dict):
+        raise ValueError("command manifest must be a JSON object")
+    if payload.get("schema") != "gpu-greenroom.command.v1":
+        raise ValueError("command manifest schema must be gpu-greenroom.command.v1")
+    argv = payload.get("argv")
+    if not isinstance(argv, list) or not argv or not all(isinstance(item, str) for item in argv):
+        raise ValueError("command manifest argv must be a non-empty list of strings")
+    for key in ("repo_root", "cwd", "route_identity"):
+        if not isinstance(payload.get(key), str) or not payload[key]:
+            raise ValueError(f"command manifest {key} must be a non-empty string")
+    repo_root = Path(payload["repo_root"]).expanduser().resolve()
+    cwd = Path(payload["cwd"]).expanduser().resolve()
+    if not repo_root.is_dir():
+        raise ValueError(f"command repo_root is not a directory: {repo_root}")
+    if not cwd.is_dir():
+        raise ValueError(f"command cwd is not a directory: {cwd}")
+    env = payload.get("env") or {}
+    if (
+        not isinstance(env, dict)
+        or not all(isinstance(key, str) and isinstance(value, str) for key, value in env.items())
+    ):
+        raise ValueError("command manifest env must map strings to strings")
+    timeout = payload.get("timeout")
+    if timeout is not None and (not isinstance(timeout, (int, float)) or timeout <= 0):
+        raise ValueError("command manifest timeout must be null or a positive number")
+    output_dir = payload.get("output_dir") or ""
+    if not isinstance(output_dir, str):
+        raise ValueError("command manifest output_dir must be a string")
+    return {
+        "manifest_path": str(manifest_path) if manifest_path else None,
+        "repo_root": str(repo_root),
+        "cwd": str(cwd),
+        "env": env,
+        "output_dir": output_dir,
+        "route_identity": payload["route_identity"],
+        "argv": argv,
+        "timeout": timeout,
+    }
+
+
+def _write_submission_failure(queue, args, error):
+    failure_dir = queue.queue_dir / "submission-failures"
+    failure_dir.mkdir(parents=True, exist_ok=True)
+    report_path = failure_dir / f"{time.time_ns()}-command-submission.json"
+    manifest_path = (
+        str(Path(args.manifest).expanduser().resolve())
+        if args.manifest else None
+    )
+    report = {
+        "schema": "gpu-greenroom.command-submission-failure.v1",
+        "status": "failed",
+        "failure_phase": "submission-validation",
+        "error_message": str(error),
+        "manifest_path": manifest_path,
+        "effective_queue_dir": str(queue.queue_dir.resolve()),
+        "report_path": str(report_path),
+    }
+    queue._write_json_atomic(report_path, report)
+    return report
+
+
+def cmd_submit_command(args):
+    queue = get_queue(args)
+    try:
+        payload = _command_payload(args)
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        report = _write_submission_failure(queue, args, error)
+        print(json.dumps(report, indent=2), file=sys.stderr)
+        sys.exit(2)
+
+    request = JobRequest(
+        job_type="command",
+        input_path="",
+        output_dir=payload["output_dir"],
+        repo_root=payload["repo_root"],
+        command_argv=payload["argv"],
+        command_cwd=payload["cwd"],
+        command_env=payload["env"],
+        route_identity=payload["route_identity"],
+        command_timeout=payload["timeout"],
+    )
+    job_dir = queue.submit(request)
+    response = {
+        "schema": "gpu-greenroom.command-submission.v1",
+        "job_id": request.job_id,
+        "status": "pending",
+        "effective_queue_dir": str(queue.queue_dir.resolve()),
+        "request_path": str((job_dir / "request.json").resolve()),
+        "output_dir": request.output_dir,
+        "route_identity": request.route_identity,
+    }
+    print(json.dumps(response, indent=2))
 
 
 def cmd_list(args):
@@ -195,6 +327,72 @@ def cmd_recover(args):
             print(f"  {jid}")
     else:
         print("No stale jobs found.")
+
+
+def cmd_doctor(args):
+    queue = get_queue(args)
+    probe_path = queue.queue_dir / f".doctor-write-{os.getpid()}"
+    checks = {
+        "cli_import": {"ok": callable(main)},
+        "queue_writable": {"ok": False},
+        "worker_dispatch": {"ok": callable(queue.run_one)},
+    }
+    try:
+        probe_path.write_text("ok")
+        checks["queue_writable"]["ok"] = probe_path.read_text() == "ok"
+    except OSError as error:
+        checks["queue_writable"]["error"] = str(error)
+    finally:
+        probe_path.unlink(missing_ok=True)
+
+    pending = queue.list_jobs(JobStatus.PENDING)
+    running = queue.list_jobs(JobStatus.RUNNING)
+    report = {
+        "schema": "gpu-greenroom.doctor.v1",
+        "healthy": all(check["ok"] for check in checks.values()),
+        "effective_queue_dir": str(queue.queue_dir.resolve()),
+        "cli_executable": shutil.which("gpu-greenroom"),
+        "checks": checks,
+        "queue": {
+            "paused": queue.is_paused(),
+            "pending": len(pending),
+            "running": len(running),
+        },
+    }
+    print(json.dumps(report, indent=2))
+    if not report["healthy"]:
+        sys.exit(1)
+
+
+def get_registry(args):
+    return QueueRegistry(args.registry)
+
+
+def cmd_queues_register(args):
+    entry = get_registry(args).register(
+        name=args.name,
+        queue_dir=args.registered_queue_dir,
+        contention_class=args.contention_class,
+    )
+    print(json.dumps(entry, indent=2))
+
+
+def cmd_queues_status(args):
+    registry = get_registry(args)
+    report = {
+        "schema": "gpu-greenroom.aggregate-status.v1",
+        "registry_path": str(registry.path),
+        "queues": registry.status(args.contention_class),
+    }
+    print(json.dumps(report, indent=2))
+
+
+def cmd_queues_pause(args):
+    print(json.dumps(get_registry(args).pause(args.contention_class), indent=2))
+
+
+def cmd_queues_resume(args):
+    print(json.dumps(get_registry(args).resume(args.contention_class), indent=2))
 
 
 def _print_model(model):
@@ -325,6 +523,10 @@ def main():
         "--queue-dir", default=DEFAULT_QUEUE_DIR,
         help=f"Queue directory (default: {DEFAULT_QUEUE_DIR})",
     )
+    parser.add_argument(
+        "--registry", default=DEFAULT_REGISTRY_PATH,
+        help=f"Registered queue adapters (default: {DEFAULT_REGISTRY_PATH})",
+    )
 
     sub = parser.add_subparsers(dest="command")
 
@@ -336,6 +538,21 @@ def main():
     p_submit.add_argument("-p", "--params", nargs="*", help="Key=value params (e.g. seed=42)")
     p_submit.add_argument("--cwd", help="Override working directory (e.g. for branch/worktree)")
     p_submit.set_defaults(func=cmd_submit)
+
+    # submit-command
+    p_command = sub.add_parser(
+        "submit-command",
+        help="Submit an exact structured argv without editing job_types.json",
+    )
+    p_command.add_argument("--manifest", help="gpu-greenroom.command.v1 JSON manifest")
+    p_command.add_argument("--repo-root")
+    p_command.add_argument("--cwd")
+    p_command.add_argument("--env", action="append", default=[], metavar="KEY=VALUE")
+    p_command.add_argument("--output-dir", default="")
+    p_command.add_argument("--route-identity")
+    p_command.add_argument("--timeout", type=float)
+    p_command.add_argument("argv", nargs=argparse.REMAINDER)
+    p_command.set_defaults(func=cmd_submit_command)
 
     # list
     p_list = sub.add_parser("list", help="List jobs")
@@ -368,6 +585,37 @@ def main():
     # recover
     p_recover = sub.add_parser("recover", help="Recover stale running jobs")
     p_recover.set_defaults(func=cmd_recover)
+
+    # doctor
+    p_doctor = sub.add_parser("doctor", help="Check CLI, queue, and worker dispatch availability")
+    p_doctor.add_argument("--json", action="store_true")
+    p_doctor.set_defaults(func=cmd_doctor)
+
+    # registered queue aggregate controls
+    p_queues = sub.add_parser("queues", help="Register and control participating queues")
+    queues_sub = p_queues.add_subparsers(dest="queues_command")
+
+    p_queues_register = queues_sub.add_parser("register", help="Register a queue adapter")
+    p_queues_register.add_argument("name")
+    p_queues_register.add_argument("--queue-dir", dest="registered_queue_dir", required=True)
+    p_queues_register.add_argument("--contention-class", required=True)
+    p_queues_register.set_defaults(func=cmd_queues_register)
+
+    p_queues_status = queues_sub.add_parser("status", help="Aggregate native queue status")
+    p_queues_status.add_argument("--contention-class")
+    p_queues_status.set_defaults(func=cmd_queues_status)
+
+    p_queues_pause = queues_sub.add_parser(
+        "pause", help="Pause queued-to-running transitions for a contention class"
+    )
+    p_queues_pause.add_argument("--contention-class", required=True)
+    p_queues_pause.set_defaults(func=cmd_queues_pause)
+
+    p_queues_resume = queues_sub.add_parser(
+        "resume", help="Resume queued-to-running transitions for a contention class"
+    )
+    p_queues_resume.add_argument("--contention-class", required=True)
+    p_queues_resume.set_defaults(func=cmd_queues_resume)
 
     # lease
     p_lease = sub.add_parser("lease", help="Manage cooperative external GPU leases")
@@ -456,6 +704,9 @@ def main():
         sys.exit(1)
     if args.command == "bump" and not getattr(args, "bump_command", None):
         p_bump.print_help()
+        sys.exit(1)
+    if args.command == "queues" and not getattr(args, "queues_command", None):
+        p_queues.print_help()
         sys.exit(1)
     args.func(args)
 

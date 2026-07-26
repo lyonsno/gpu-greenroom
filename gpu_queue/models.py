@@ -40,6 +40,12 @@ class JobRequest:
     input_path: str
     output_dir: str = ""
     params: dict[str, Any] = field(default_factory=dict)
+    repo_root: str | None = None
+    command_argv: list[str] | None = None
+    command_cwd: str | None = None
+    command_env: dict[str, str] | None = None
+    route_identity: str | None = None
+    command_timeout: float | None = None
     job_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     submitted_at: float = field(default_factory=time.time)
 

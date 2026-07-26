@@ -6,6 +6,7 @@ import fcntl
 import json
 import os
 import select
+import shlex
 import shutil
 import subprocess
 import time
@@ -757,7 +758,7 @@ class GPUQueue:
         shutil.move(str(job_dir), str(dest))
         return dest
 
-    def run_one(self, job_types: dict[str, list[str]]) -> bool:
+    def run_one(self, job_types: dict) -> bool:
         """Pick and run the next pending job under flock.
 
         job_types: mapping of job_type name -> command template list.
@@ -796,9 +797,11 @@ class GPUQueue:
             state.started_at = time.time()
             state.pid = os.getpid()
 
-            # Resolve job type config — supports bare list or rich dict
+            # Structured command jobs carry exact argv and bypass the global
+            # job-type registry and all template substitution.
+            is_command_job = request.command_argv is not None
             raw_config = job_types.get(request.job_type)
-            if raw_config is None:
+            if not is_command_job and raw_config is None:
                 state.status = JobStatus.FAILED
                 state.finished_at = time.time()
                 state.failure_phase = "dispatch"
@@ -808,7 +811,22 @@ class GPUQueue:
                 self._move_job(job_dir, "failed")
                 return True
 
-            if isinstance(raw_config, list):
+            if is_command_job:
+                if not request.command_argv:
+                    state.status = JobStatus.FAILED
+                    state.finished_at = time.time()
+                    state.failure_phase = "dispatch"
+                    state.error_message = "Structured command argv must not be empty"
+                    state.exit_code = -1
+                    (job_dir / "status.json").write_text(state.to_json())
+                    self._move_job(job_dir, "failed")
+                    return True
+                cmd_template = list(request.command_argv)
+                job_cwd = request.command_cwd
+                job_env = request.command_env
+                job_defaults = {}
+                job_timeout = request.command_timeout
+            elif isinstance(raw_config, list):
                 # Bare list: backwards compat
                 cmd_template = raw_config
                 job_cwd = None
@@ -823,50 +841,53 @@ class GPUQueue:
                 job_defaults = raw_config.get("defaults", {})
                 job_timeout = raw_config.get("timeout")  # None = no timeout
 
-            # Per-job overrides: cwd and env from params (removed before template subs)
-            OVERRIDE_KEYS = {"cwd", "env"}
-            RESERVED = {"input_path", "output_dir"}
-            if "cwd" in request.params:
-                job_cwd = request.params["cwd"]
-            if "env" in request.params and isinstance(request.params.get("env"), dict):
-                job_env = {**(job_env or {}), **request.params["env"]}
-            safe_params = {k: v for k, v in request.params.items() if k not in RESERVED and k not in OVERRIDE_KEYS}
-            subs = {
-                **job_defaults,
-                **safe_params,
-                "input_path": request.input_path,
-                "output_dir": request.output_dir,
-            }
+            if is_command_job:
+                cmd = list(cmd_template)
+                ignored_params = {}
+            else:
+                # Per-job overrides: cwd and env from params (removed before template subs)
+                override_keys = {"cwd", "env"}
+                reserved = {"input_path", "output_dir"}
+                if "cwd" in request.params:
+                    job_cwd = request.params["cwd"]
+                if "env" in request.params and isinstance(request.params.get("env"), dict):
+                    job_env = {**(job_env or {}), **request.params["env"]}
+                safe_params = {
+                    key: value for key, value in request.params.items()
+                    if key not in reserved and key not in override_keys
+                }
+                substitutions = {
+                    **job_defaults,
+                    **safe_params,
+                    "input_path": request.input_path,
+                    "output_dir": request.output_dir,
+                }
 
-            # Detect ignored params: user-supplied keys not consumed by template
-            template_str = " ".join(cmd_template)
-            used_keys = set()
-            for key in subs:
-                if "{" + key + "}" in template_str:
-                    used_keys.add(key)
-            ignored_params = {
-                k: v for k, v in safe_params.items()
-                if k not in used_keys and k not in RESERVED
-            }
+                template_str = " ".join(cmd_template)
+                used_keys = {
+                    key for key in substitutions
+                    if "{" + key + "}" in template_str
+                }
+                ignored_params = {
+                    key: value for key, value in safe_params.items()
+                    if key not in used_keys and key not in reserved
+                }
 
-            # Safe substitution: replace all placeholders in one pass to prevent
-            # chained expansion (e.g. param value "{input_path}" must stay literal)
-            import re
+                # Replace placeholders in one pass so values containing braces
+                # remain literal rather than becoming a second expansion.
+                import re
 
-            def safe_substitute(template: str, mapping: dict) -> str:
-                def replacer(match):
-                    key = match.group(1)
-                    if key in mapping:
-                        return str(mapping[key])
-                    return match.group(0)  # leave unrecognized placeholders as-is
-                return re.sub(r'\{(\w+)\}', replacer, template)
+                def safe_substitute(template: str, mapping: dict) -> str:
+                    def replacer(match):
+                        key = match.group(1)
+                        if key in mapping:
+                            return str(mapping[key])
+                        return match.group(0)
+                    return re.sub(r'\{(\w+)\}', replacer, template)
 
-            cmd = [safe_substitute(part, subs) for part in cmd_template]
-            state.effective_route = " ".join(cmd)
+                cmd = [safe_substitute(part, substitutions) for part in cmd_template]
+            state.effective_route = shlex.join(cmd)
             (job_dir / "status.json").write_text(state.to_json())
-
-            # Ensure output directory exists
-            os.makedirs(request.output_dir, exist_ok=True)
 
             # Build subprocess environment
             run_env = None
@@ -876,8 +897,11 @@ class GPUQueue:
             # Execute
             stdout_path = job_dir / "stdout.log"
             stderr_path = job_dir / "stderr.log"
+            stdout_path.touch()
+            stderr_path.touch()
 
             try:
+                os.makedirs(request.output_dir, exist_ok=True)
                 with open(stdout_path, "w") as out_f, open(stderr_path, "w") as err_f:
                     proc = subprocess.run(
                         cmd,
@@ -913,15 +937,20 @@ class GPUQueue:
             (job_dir / "status.json").write_text(state.to_json())
 
             # Write receipt with full route identity
+            final_job_dir = self.queue_dir / dest_status / state.job_id
             receipt = {
                 "job_id": state.job_id,
                 "job_type": state.job_type,
                 "status": state.status.value,
                 "input_path": state.input_path,
                 "output_dir": state.output_dir,
+                "repo_root": request.repo_root,
+                "requested_route": request.route_identity,
                 "effective_route": state.effective_route,
+                "effective_argv": cmd,
                 "effective_cwd": job_cwd,
                 "effective_env": job_env,
+                "environment_inheritance": "worker-plus-overlay",
                 "effective_defaults": job_defaults,
                 "effective_timeout": job_timeout,
                 "ignored_params": ignored_params if ignored_params else None,
@@ -931,6 +960,9 @@ class GPUQueue:
                 "failure_phase": state.failure_phase,
                 "error_message": state.error_message,
                 "warnings": state.warnings if state.warnings else None,
+                "request_path": str(final_job_dir / "request.json"),
+                "stdout_path": str(final_job_dir / "stdout.log"),
+                "stderr_path": str(final_job_dir / "stderr.log"),
             }
             (job_dir / "receipt.json").write_text(json.dumps(receipt, indent=2))
 
