@@ -188,6 +188,87 @@ def test_paused_queue_accepts_command_but_does_not_start_it(tmp_path):
     assert queue.get_job(request.job_id).status == JobStatus.PENDING
 
 
+def test_structured_command_composes_pause_recovery_and_capability_claim(
+    tmp_path,
+):
+    queue = GPUQueue(tmp_path / "queue")
+    repo_root = tmp_path / "repo"
+    output_dir = tmp_path / "output"
+    repo_root.mkdir()
+    argv = [
+        sys.executable,
+        "-c",
+        "from pathlib import Path; Path('composed-ran').write_text('yes')",
+    ]
+    request = JobRequest(
+        job_type="command",
+        input_path="",
+        output_dir=str(output_dir),
+        repo_root=str(repo_root),
+        command_argv=argv,
+        command_cwd=str(repo_root),
+        route_identity="fixture/pause-capability-composition",
+        required_worker_capabilities=["structured-command.v1"],
+    )
+    pending_dir = queue.submit(request)
+    before_request = (pending_dir / "request.json").read_bytes()
+    before_status = (pending_dir / "status.json").read_bytes()
+
+    pause = queue.pause(
+        owner="integration-smoke",
+        epoch="integration-pause-1",
+        contention_class="apple-unified-accelerator",
+    )
+    assert pause["effective_paused"] is True
+    assert pause["epoch"] == "integration-pause-1"
+
+    restarted = GPUQueue(queue.queue_dir)
+    assert restarted.pause_state()["owner"] == "integration-smoke"
+    assert restarted.pause_state()["epoch"] == "integration-pause-1"
+    incapable_claimant = {
+        "pid": 1001,
+        "source_root": "/fixture/legacy-worker",
+        "commit": "legacy-fixture",
+        "git_dirty": False,
+        "capabilities": [],
+    }
+    assert restarted.run_one({}, claimant=incapable_claimant) is False
+    assert restarted.get_job(request.job_id).status == JobStatus.PENDING
+
+    resume = restarted.resume(
+        owner="integration-smoke",
+        epoch="integration-pause-1",
+    )
+    assert resume["effective_paused"] is False
+    assert resume["previous_pause"]["owner"] == "integration-smoke"
+    assert resume["previous_pause"]["epoch"] == "integration-pause-1"
+
+    assert restarted.run_one({}, claimant=incapable_claimant) is False
+    assert (pending_dir / "request.json").read_bytes() == before_request
+    assert (pending_dir / "status.json").read_bytes() == before_status
+    assert restarted.get_job(request.job_id).status == JobStatus.PENDING
+    assert not (repo_root / "composed-ran").exists()
+
+    capable_claimant = {
+        "pid": 2002,
+        "source_root": "/fixture/reviewed-worker",
+        "commit": "reviewed-fixture",
+        "git_dirty": False,
+        "capabilities": ["structured-command.v1"],
+    }
+    assert restarted.run_one({}, claimant=capable_claimant) is True
+    assert restarted.get_job(request.job_id).status == JobStatus.DONE
+    assert (repo_root / "composed-ran").read_text() == "yes"
+
+    done_dir = restarted.queue_dir / "done" / request.job_id
+    assert (done_dir / "request.json").read_bytes() == before_request
+    receipt = json.loads((done_dir / "receipt.json").read_text())
+    assert receipt["requested_route"] == request.route_identity
+    assert receipt["effective_argv"] == argv
+    assert receipt["effective_cwd"] == str(repo_root)
+    assert receipt["worker"] == capable_claimant
+
+
 def test_worker_without_required_capability_leaves_fifo_head_pending(
     tmp_path, monkeypatch
 ):
