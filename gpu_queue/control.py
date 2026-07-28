@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from .models import JobStatus
-from .queue import GPUQueue
+from .queue import GPUQueue, PauseStateError
 
 
 class QueueControlError(RuntimeError):
@@ -114,6 +114,7 @@ class QueueRegistry:
                     "pending": None,
                     "running": None,
                     "running_jobs": [],
+                    "pause_state": None,
                 })
                 continue
             try:
@@ -128,15 +129,36 @@ class QueueRegistry:
                     "pending": None,
                     "running": None,
                     "running_jobs": [],
+                    "pause_state": None,
                 })
                 continue
-            pending = queue.list_jobs(JobStatus.PENDING)
-            running = queue.list_jobs(JobStatus.RUNNING)
+            try:
+                pending = queue.list_jobs(JobStatus.PENDING)
+                running = queue.list_jobs(JobStatus.RUNNING)
+            except Exception as error:
+                rows.append({
+                    **entry,
+                    "source": str(queue_path),
+                    "available": True,
+                    "error": f"queue_status_failed: {error}",
+                    "paused": queue.is_paused(),
+                    "pending": None,
+                    "running": None,
+                    "running_jobs": [],
+                    "pause_state": None,
+                })
+                continue
+            pause_state = None
+            pause_state_error = None
+            try:
+                pause_state = queue.pause_state()
+            except Exception as error:
+                pause_state_error = f"pause_state_invalid: {error}"
             rows.append({
                 **entry,
                 "source": str(queue_path),
                 "available": True,
-                "error": None,
+                "error": pause_state_error,
                 "paused": queue.is_paused(),
                 "pending": len(pending),
                 "running": len(running),
@@ -149,11 +171,25 @@ class QueueRegistry:
                     }
                     for state in running
                 ],
+                "pause_state": pause_state,
             })
         return rows
 
-    def _set_paused(self, contention_class: str, paused: bool) -> dict:
+    def _set_paused(
+        self,
+        contention_class: str,
+        paused: bool,
+        *,
+        owner: str,
+        epoch: str | None,
+    ) -> dict:
         action = "pause" if paused else "resume"
+        if not owner.strip():
+            raise ValueError("pause control owner must not be empty")
+        if not paused and not epoch:
+            raise ValueError("resume requires the exact pause epoch")
+        epoch = epoch or uuid.uuid4().hex
+        requested_at = time.time()
         receipt_name = f"{time.time_ns()}-{action}-{uuid.uuid4().hex[:8]}.json"
         receipt_path = self.receipts_dir / receipt_name
         with self._lock():
@@ -189,20 +225,41 @@ class QueueRegistry:
                         Path(entry["queue_dir"]) / "paused"
                     ).exists(),
                     "error": None,
+                    "acknowledgement": None,
                 }
                 for entry in selected
             ]
             mutation_error = None
+            failure_phase = None
             for entry, row in zip(selected, mutation_rows):
                 row["attempted"] = True
                 try:
                     queue = GPUQueue(entry["queue_dir"])
-                    queue.pause() if paused else queue.resume()
+                    acknowledgement = (
+                        queue.pause(
+                            owner=owner,
+                            epoch=epoch,
+                            contention_class=contention_class,
+                            requested_at=requested_at,
+                        )
+                        if paused
+                        else queue.resume(owner=owner, epoch=epoch)
+                    )
+                    row["acknowledgement"] = {
+                        "name": entry["name"],
+                        "adapter": entry["adapter"],
+                        **acknowledgement,
+                    }
                     row["mutation"] = "succeeded"
-                except OSError as error:
+                except (OSError, PauseStateError, ValueError) as error:
                     row["mutation"] = "failed"
                     row["error"] = str(error)
                     mutation_error = error
+                    failure_phase = (
+                        "pause-epoch-mismatch"
+                        if isinstance(error, PauseStateError)
+                        else "native-marker-mutation"
+                    )
                 finally:
                     row["observed_paused"] = (
                         Path(entry["queue_dir"]) / "paused"
@@ -210,20 +267,60 @@ class QueueRegistry:
                 if mutation_error is not None:
                     break
 
+            request_queues = [
+                {
+                    "name": entry["name"],
+                    "queue_dir": str(Path(entry["queue_dir"]).resolve()),
+                    "adapter": entry["adapter"],
+                }
+                for entry in selected
+            ]
+            acknowledgements = []
+            for entry, row in zip(selected, mutation_rows):
+                acknowledgement = row["acknowledgement"]
+                if acknowledgement is None:
+                    acknowledgement = {
+                        "name": entry["name"],
+                        "adapter": entry["adapter"],
+                        "schema": "gpu-greenroom.pause-acknowledgement.v1",
+                        "action": action,
+                        "owner": owner,
+                        "epoch": epoch,
+                        "queue_dir": str(Path(entry["queue_dir"]).resolve()),
+                        "acknowledged_at": None,
+                        "effective_paused": row["observed_paused"],
+                        "idempotent": False,
+                        "error": row["error"],
+                    }
+                acknowledgements.append(acknowledgement)
+            fully_effective = (
+                mutation_error is None
+                and all(row["observed_paused"] is paused for row in mutation_rows)
+            )
             report = {
                 "schema": "gpu-greenroom.queue-control-receipt.v1",
                 "status": "failed" if mutation_error else "succeeded",
-                "failure_phase": (
-                    "native-marker-mutation" if mutation_error else None
-                ),
+                "failure_phase": failure_phase,
                 "action": action,
                 "contention_class": contention_class,
+                "requested_at": requested_at,
                 "observed_at": time.time(),
                 "registry_path": str(self.path),
                 "receipt_path": str(receipt_path),
                 "receipt_persisted": True,
                 "rollback_attempted": False,
                 "error_message": str(mutation_error) if mutation_error else None,
+                "request": {
+                    "action": action,
+                    "owner": owner,
+                    "epoch": epoch,
+                    "contention_class": contention_class,
+                    "queues": request_queues,
+                },
+                "effective": {
+                    "fully_effective": fully_effective,
+                    "acknowledgements": acknowledgements,
+                },
                 "queues": self._status_entries(selected),
                 "mutations": mutation_rows,
             }
@@ -246,8 +343,30 @@ class QueueRegistry:
                 raise QueueControlError(report) from mutation_error
             return report
 
-    def pause(self, contention_class: str) -> dict:
-        return self._set_paused(contention_class, True)
+    def pause(
+        self,
+        contention_class: str,
+        *,
+        owner: str = "unspecified",
+        epoch: str | None = None,
+    ) -> dict:
+        return self._set_paused(
+            contention_class,
+            True,
+            owner=owner,
+            epoch=epoch,
+        )
 
-    def resume(self, contention_class: str) -> dict:
-        return self._set_paused(contention_class, False)
+    def resume(
+        self,
+        contention_class: str,
+        *,
+        owner: str = "unspecified",
+        epoch: str | None = None,
+    ) -> dict:
+        return self._set_paused(
+            contention_class,
+            False,
+            owner=owner,
+            epoch=epoch,
+        )

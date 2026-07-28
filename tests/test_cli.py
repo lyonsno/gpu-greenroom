@@ -95,7 +95,10 @@ class TestCLIPauseResume:
         run_cli("pause", queue_dir=queue_dir)
         rc, out, _ = run_cli("resume", queue_dir=queue_dir)
         assert rc == 0
-        assert "resumed" in out.lower()
+        acknowledgement = json.loads(out)
+        assert acknowledgement["action"] == "resume"
+        assert acknowledgement["effective_paused"] is False
+        assert acknowledgement["previous_pause"]["owner"] == "local-cli"
         assert not (queue_dir / "paused").exists()
 
     def test_resume_when_not_paused(self, queue_dir):

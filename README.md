@@ -51,10 +51,10 @@ gpu-greenroom cancel <job-id>
 gpu-greenroom worker
 
 # Pause the queue (finishes current job, then waits)
-gpu-greenroom pause
+gpu-greenroom pause --owner local-operator --epoch maintenance-20260727
 
 # Resume a paused queue
-gpu-greenroom resume
+gpu-greenroom resume --owner local-operator --epoch maintenance-20260727
 
 # Check executable discovery, CLI import, queue writes, and dispatch availability
 gpu-greenroom doctor --json
@@ -64,8 +64,14 @@ gpu-greenroom queues register science \
   --queue-dir ~/.local/state/gpu-greenroom \
   --contention-class apple-unified-accelerator
 gpu-greenroom queues status
-gpu-greenroom queues pause --contention-class apple-unified-accelerator
-gpu-greenroom queues resume --contention-class apple-unified-accelerator
+gpu-greenroom queues pause \
+  --contention-class apple-unified-accelerator \
+  --owner operations \
+  --epoch maintenance-20260727
+gpu-greenroom queues resume \
+  --contention-class apple-unified-accelerator \
+  --owner operations \
+  --epoch maintenance-20260727
 
 # Recover stale jobs after crash
 gpu-greenroom recover
@@ -207,12 +213,18 @@ selected queue and then creates each queue's native `paused` marker. Submission
 and durable enqueue remain open, running jobs finish normally, and workers
 cannot move pending work to running until `queues resume` removes the native
 markers. Control actions write durable receipts under
-`queue-control-receipts/`.
+`queue-control-receipts/`. The marker contains its owner, epoch, requested time,
+effective acknowledgement time, queue identity, and contention class. Resume
+requires the exact epoch for aggregate control, so a stale controller cannot
+remove a newer pause. Aggregate receipts preserve the requested queue set,
+per-queue effective acknowledgements, partial failures, and the prior pause
+identity used during recovery.
 
 The existing queue lock remains the only execution mutex. Aggregate control
 does not authorize execution and adds no new check to ordinary submission or
-dispatch: workers continue to use the queue-local pause check immediately
-before the pending-to-running transition.
+dispatch. The existing short-lived coordination lock linearizes native marker
+creation against the final pending-to-running transition and releases before
+workload execution.
 
 ## Cooperative external leases and bumps
 

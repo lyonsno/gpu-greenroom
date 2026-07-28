@@ -20,6 +20,17 @@ from .models import BumpRequest, BumpStatus, ExternalLease, JobRequest, JobState
 
 STRUCTURED_COMMAND_CAPABILITY = "structured-command.v1"
 DEFAULT_WORKER_CAPABILITIES = frozenset({STRUCTURED_COMMAND_CAPABILITY})
+PAUSE_STATE_SCHEMA = "gpu-greenroom.pause-state.v1"
+PAUSE_ACK_SCHEMA = "gpu-greenroom.pause-acknowledgement.v1"
+
+
+class PauseStateError(RuntimeError):
+    """Pause state cannot be changed under the requested epoch."""
+
+    def __init__(self, message: str, *, expected_epoch: str | None, observed_epoch: str | None):
+        super().__init__(message)
+        self.expected_epoch = expected_epoch
+        self.observed_epoch = observed_epoch
 
 
 def effective_worker_capabilities() -> frozenset[str]:
@@ -229,16 +240,134 @@ class GPUQueue:
 
     def _external_execution_blocked(self) -> bool:
         with self._coordination_lock():
-            lease = self._refresh_lease_observation_locked()
-            return lease is not None and lease.lifecycle_state != LeaseStatus.RELEASED
+            return self._external_execution_blocked_locked()
 
-    def pause(self) -> None:
-        """Pause the queue. The worker finishes its current job then waits."""
-        self.pause_path.touch()
+    def _external_execution_blocked_locked(self) -> bool:
+        lease = self._refresh_lease_observation_locked()
+        return lease is not None and lease.lifecycle_state != LeaseStatus.RELEASED
 
-    def resume(self) -> None:
-        """Resume a paused queue."""
-        self.pause_path.unlink(missing_ok=True)
+    def _read_pause_state_locked(self) -> dict | None:
+        if not self.pause_path.exists():
+            return None
+        text = self.pause_path.read_text().strip()
+        if not text:
+            return {
+                "schema": "gpu-greenroom.pause-state.legacy-marker",
+                "status": "effective",
+                "owner": None,
+                "epoch": None,
+                "contention_class": None,
+                "queue_dir": str(self.queue_dir.resolve()),
+                "requested_at": None,
+                "effective_at": None,
+            }
+        payload = json.loads(text)
+        if payload.get("schema") != PAUSE_STATE_SCHEMA:
+            raise ValueError(f"unsupported pause state schema: {payload.get('schema')!r}")
+        return payload
+
+    def pause_state(self) -> dict | None:
+        """Return durable effective pause identity, including legacy markers."""
+        with self._coordination_lock():
+            return self._read_pause_state_locked()
+
+    def pause(
+        self,
+        *,
+        owner: str = "local",
+        epoch: str | None = None,
+        contention_class: str | None = None,
+        requested_at: float | None = None,
+    ) -> dict:
+        """Linearize queued-to-running pause and return the native acknowledgement."""
+        explicit_epoch = epoch is not None
+        requested_at = time.time() if requested_at is None else requested_at
+        with self._coordination_lock():
+            existing = self._read_pause_state_locked()
+            if existing is not None:
+                observed_epoch = existing.get("epoch")
+                if explicit_epoch and observed_epoch != epoch:
+                    raise PauseStateError(
+                        f"queue is already paused under epoch {observed_epoch!r}",
+                        expected_epoch=epoch,
+                        observed_epoch=observed_epoch,
+                    )
+                return {
+                    "schema": PAUSE_ACK_SCHEMA,
+                    "action": "pause",
+                    "owner": existing.get("owner"),
+                    "epoch": observed_epoch,
+                    "queue_dir": str(self.queue_dir.resolve()),
+                    "acknowledged_at": time.time(),
+                    "effective_paused": True,
+                    "idempotent": True,
+                    "pause_state": existing,
+                }
+
+            effective_at = time.time()
+            state = {
+                "schema": PAUSE_STATE_SCHEMA,
+                "status": "effective",
+                "owner": owner,
+                "epoch": epoch or uuid.uuid4().hex,
+                "contention_class": contention_class,
+                "queue_dir": str(self.queue_dir.resolve()),
+                "requested_at": requested_at,
+                "effective_at": effective_at,
+            }
+            self._write_json_atomic(self.pause_path, state)
+            return {
+                "schema": PAUSE_ACK_SCHEMA,
+                "action": "pause",
+                "owner": state["owner"],
+                "epoch": state["epoch"],
+                "queue_dir": state["queue_dir"],
+                "acknowledged_at": effective_at,
+                "effective_paused": True,
+                "idempotent": False,
+                "pause_state": state,
+            }
+
+    def resume(
+        self,
+        *,
+        owner: str = "local",
+        epoch: str | None = None,
+    ) -> dict:
+        """Resume a paused queue, rejecting a stale explicit pause epoch."""
+        with self._coordination_lock():
+            existing = self._read_pause_state_locked()
+            if existing is None:
+                return {
+                    "schema": PAUSE_ACK_SCHEMA,
+                    "action": "resume",
+                    "owner": owner,
+                    "epoch": epoch,
+                    "queue_dir": str(self.queue_dir.resolve()),
+                    "acknowledged_at": time.time(),
+                    "effective_paused": False,
+                    "idempotent": True,
+                    "previous_pause": None,
+                }
+            observed_epoch = existing.get("epoch")
+            if epoch is not None and observed_epoch != epoch:
+                raise PauseStateError(
+                    f"pause epoch mismatch: requested {epoch!r}, observed {observed_epoch!r}",
+                    expected_epoch=epoch,
+                    observed_epoch=observed_epoch,
+                )
+            self.pause_path.unlink()
+            return {
+                "schema": PAUSE_ACK_SCHEMA,
+                "action": "resume",
+                "owner": owner,
+                "epoch": observed_epoch,
+                "queue_dir": str(self.queue_dir.resolve()),
+                "acknowledged_at": time.time(),
+                "effective_paused": False,
+                "idempotent": False,
+                "previous_pause": existing,
+            }
 
     def is_paused(self) -> bool:
         return self.pause_path.exists()
@@ -842,33 +971,35 @@ class GPUQueue:
             return False
 
         try:
-            if self.is_paused():
-                return False
-            if self._external_execution_blocked():
-                return False
+            with self._coordination_lock():
+                if self.is_paused():
+                    return False
+                if self._external_execution_blocked_locked():
+                    return False
 
-            job_dir = self._next_pending()
-            if job_dir is None:
-                return False
+                job_dir = self._next_pending()
+                if job_dir is None:
+                    return False
 
-            request = JobRequest.from_json((job_dir / "request.json").read_text())
-            effective_claimant = claimant or worker_identity()
-            claimant_capabilities = frozenset(
-                effective_claimant.get("capabilities", [])
-            )
-            if not required_worker_capabilities(request).issubset(
-                claimant_capabilities
-            ):
-                return False
+                request = JobRequest.from_json((job_dir / "request.json").read_text())
+                effective_claimant = claimant or worker_identity()
+                claimant_capabilities = frozenset(
+                    effective_claimant.get("capabilities", [])
+                )
+                if not required_worker_capabilities(request).issubset(
+                    claimant_capabilities
+                ):
+                    return False
 
-            # Move to running
-            job_dir = self._move_job(job_dir, "running")
-
-            # Update status
-            state = JobState.from_json((job_dir / "status.json").read_text())
-            state.status = JobStatus.RUNNING
-            state.started_at = time.time()
-            state.pid = os.getpid()
+                # Pause creation shares this short-lived transition lock, so
+                # returning from pause means no later pending-to-running move
+                # can belong to the paused epoch.
+                job_dir = self._move_job(job_dir, "running")
+                state = JobState.from_json((job_dir / "status.json").read_text())
+                state.status = JobStatus.RUNNING
+                state.started_at = time.time()
+                state.pid = os.getpid()
+                (job_dir / "status.json").write_text(state.to_json())
 
             # Structured command jobs carry exact argv and bypass the global
             # job-type registry and all template substitution.

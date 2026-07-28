@@ -15,6 +15,7 @@ from .control import QueueControlError, QueueRegistry
 from .models import BumpStatus, JobRequest, JobStatus, LeaseStatus
 from .queue import (
     GPUQueue,
+    PauseStateError,
     STRUCTURED_COMMAND_CAPABILITY,
     effective_worker_capabilities,
     worker_identity,
@@ -320,14 +321,29 @@ def cmd_worker(args):
 
 def cmd_pause(args):
     queue = get_queue(args)
-    queue.pause()
-    print("Queue paused. Worker will finish current job then wait.")
+    acknowledgement = queue.pause(owner=args.owner, epoch=args.epoch)
+    print(json.dumps(acknowledgement, indent=2))
 
 
 def cmd_resume(args):
     queue = get_queue(args)
-    queue.resume()
-    print("Queue resumed.")
+    try:
+        acknowledgement = queue.resume(owner=args.owner, epoch=args.epoch)
+    except PauseStateError as error:
+        report = {
+            "schema": "gpu-greenroom.pause-control-failure.v1",
+            "status": "failed",
+            "failure_phase": "pause-epoch-mismatch",
+            "action": "resume",
+            "owner": args.owner,
+            "requested_epoch": error.expected_epoch,
+            "observed_epoch": error.observed_epoch,
+            "effective_queue_dir": str(queue.queue_dir.resolve()),
+            "error_message": str(error),
+        }
+        print(json.dumps(report, indent=2), file=sys.stderr)
+        sys.exit(2)
+    print(json.dumps(acknowledgement, indent=2))
 
 
 def cmd_recover(args):
@@ -411,7 +427,11 @@ def cmd_queues_status(args):
 
 def cmd_queues_pause(args):
     try:
-        report = get_registry(args).pause(args.contention_class)
+        report = get_registry(args).pause(
+            args.contention_class,
+            owner=args.owner,
+            epoch=args.epoch,
+        )
     except QueueControlError as error:
         print(json.dumps(error.report, indent=2), file=sys.stderr)
         sys.exit(2)
@@ -420,7 +440,11 @@ def cmd_queues_pause(args):
 
 def cmd_queues_resume(args):
     try:
-        report = get_registry(args).resume(args.contention_class)
+        report = get_registry(args).resume(
+            args.contention_class,
+            owner=args.owner,
+            epoch=args.epoch,
+        )
     except QueueControlError as error:
         print(json.dumps(error.report, indent=2), file=sys.stderr)
         sys.exit(2)
@@ -608,10 +632,14 @@ def main():
 
     # pause
     p_pause = sub.add_parser("pause", help="Pause the queue (finish current job, then wait)")
+    p_pause.add_argument("--owner", default="local-cli")
+    p_pause.add_argument("--epoch")
     p_pause.set_defaults(func=cmd_pause)
 
     # resume
     p_resume = sub.add_parser("resume", help="Resume a paused queue")
+    p_resume.add_argument("--owner", default="local-cli")
+    p_resume.add_argument("--epoch")
     p_resume.set_defaults(func=cmd_resume)
 
     # recover
@@ -641,12 +669,16 @@ def main():
         "pause", help="Pause queued-to-running transitions for a contention class"
     )
     p_queues_pause.add_argument("--contention-class", required=True)
+    p_queues_pause.add_argument("--owner", required=True)
+    p_queues_pause.add_argument("--epoch")
     p_queues_pause.set_defaults(func=cmd_queues_pause)
 
     p_queues_resume = queues_sub.add_parser(
         "resume", help="Resume queued-to-running transitions for a contention class"
     )
     p_queues_resume.add_argument("--contention-class", required=True)
+    p_queues_resume.add_argument("--owner", required=True)
+    p_queues_resume.add_argument("--epoch", required=True)
     p_queues_resume.set_defaults(func=cmd_queues_resume)
 
     # lease
