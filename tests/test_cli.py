@@ -70,6 +70,7 @@ class TestCLISubmit:
             "delivery_mode": "immediate",
             "notify_on": "failure",
             "producer_report_locator": str(producer_report),
+            "evidence_manifest_locator": None,
         }
 
 

@@ -83,9 +83,13 @@ def cmd_submit(args):
             delivery_mode=args.delivery_mode,
             notify_on=args.notify_on,
             producer_report_locator=args.producer_report,
+            evidence_manifest_locator=args.evidence_manifest,
         )
-    elif args.producer_report:
-        print("--producer-report requires an exact completion receiver", file=sys.stderr)
+    elif args.producer_report or args.evidence_manifest:
+        print(
+            "--producer-report and --evidence-manifest require an exact completion receiver",
+            file=sys.stderr,
+        )
         raise SystemExit(2)
 
     request = JobRequest(
@@ -388,6 +392,10 @@ def main():
     p_submit.add_argument(
         "--producer-report",
         help="Absolute producer-report path whose evidence can demote process success",
+    )
+    p_submit.add_argument(
+        "--evidence-manifest",
+        help="Absolute producer-owned evidence-manifest path to bind to completion",
     )
     p_submit.set_defaults(func=cmd_submit)
 

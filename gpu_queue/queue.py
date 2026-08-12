@@ -94,11 +94,137 @@ class GPUQueue:
     def _write_text_atomic(self, path: Path, text: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-        tmp.write_text(text)
-        os.replace(tmp, path)
+        try:
+            with tmp.open("w") as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)
+            self._fsync_directory(path.parent)
+        finally:
+            tmp.unlink(missing_ok=True)
 
     def _write_json_atomic(self, path: Path, payload: dict) -> None:
         self._write_text_atomic(path, json.dumps(payload, indent=2))
+
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        directory_fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+
+    def _write_text_create_only(self, path: Path, text: str) -> bool:
+        """Atomically create immutable text, or verify the identical existing bytes."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        expected = text.encode()
+        tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            with tmp.open("wb") as handle:
+                handle.write(expected)
+                handle.flush()
+                os.fsync(handle.fileno())
+            try:
+                os.link(tmp, path)
+            except FileExistsError:
+                if path.read_bytes() != expected:
+                    raise RuntimeError(f"conflicting completion outbox event at {path}")
+                return False
+            self._fsync_directory(path.parent)
+            return True
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    @staticmethod
+    def _file_snapshot(path: Path | None) -> dict:
+        if path is None:
+            return {"exists": False, "sha256": None, "size": None, "mtime_ns": None}
+        try:
+            payload = path.read_bytes()
+            stat_result = path.stat()
+        except OSError:
+            return {"exists": False, "sha256": None, "size": None, "mtime_ns": None}
+        event = {
+            "exists": True,
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "size": len(payload),
+            "mtime_ns": stat_result.st_mtime_ns,
+        }
+        return event
+
+    @staticmethod
+    def _output_file_snapshot(output_dir: Path) -> dict[str, dict]:
+        if not output_dir.is_dir():
+            return {}
+        snapshot = {}
+        for path in sorted(output_dir.rglob("*")):
+            relative = path.relative_to(output_dir).as_posix()
+            if relative == "metadata.json" or path.is_dir():
+                continue
+            try:
+                if path.is_symlink():
+                    payload = os.readlink(path).encode()
+                    kind = "symlink"
+                else:
+                    payload = path.read_bytes()
+                    kind = "file"
+                stat_result = path.lstat()
+            except OSError:
+                continue
+            snapshot[relative] = {
+                "kind": kind,
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "size": len(payload),
+                "mtime_ns": stat_result.st_mtime_ns,
+            }
+        return snapshot
+
+    def _capture_completion_evidence_boundary(
+        self, request: JobRequest, job_dir: Path
+    ) -> dict | None:
+        contract = request.completion_outbox
+        if contract is None:
+            return None
+        request_bytes = (job_dir / "request.json").read_bytes()
+        report_path = (
+            Path(contract.producer_report_locator).expanduser()
+            if contract.producer_report_locator
+            else None
+        )
+        manifest_path = (
+            Path(contract.evidence_manifest_locator).expanduser()
+            if contract.evidence_manifest_locator
+            else None
+        )
+        boundary = {
+            "schema": "gpu-greenroom.completion-evidence-boundary.v1",
+            "captured_at_ns": time.time_ns(),
+            "request_sha256": hashlib.sha256(request_bytes).hexdigest(),
+            "output_dir_auto_assigned": request.output_dir_auto_assigned,
+            "producer_report": self._file_snapshot(report_path),
+            "evidence_manifest": self._file_snapshot(manifest_path),
+            "output_files": self._output_file_snapshot(Path(request.output_dir)),
+        }
+        self._write_json_atomic(job_dir / "completion-evidence-boundary.json", boundary)
+        return boundary
+
+    def _current_output_evidence(self, request: JobRequest, boundary: dict | None) -> dict:
+        before = (boundary or {}).get("output_files") or {}
+        after = self._output_file_snapshot(Path(request.output_dir))
+        changed = sorted(
+            relative for relative, identity in after.items()
+            if before.get(relative) != identity
+        )
+        return {
+            "boundary_schema": (boundary or {}).get("schema"),
+            "output_dir_auto_assigned": request.output_dir_auto_assigned,
+            "preexisting_file_count": len(before),
+            "terminal_file_count": len(after),
+            "changed_files": changed,
+            "current_job_attributed": bool(changed),
+            "failure_reasons": [],
+        }
 
     def _write_lease_locked(self, lease: ExternalLease) -> None:
         self._write_text_atomic(self.current_lease_path, lease.to_json())
@@ -137,34 +263,98 @@ class GPUQueue:
         }
         self._write_json_atomic(directory / name, payload)
 
-    def _producer_report_evidence(self, locator: str | None, receipt: dict) -> dict:
+    def _bound_json_evidence(
+        self,
+        *,
+        locator: str | None,
+        label: str,
+        expected_schema: str,
+        request: JobRequest,
+        request_sha256: str,
+        receipt: dict,
+        boundary_snapshot: dict | None,
+    ) -> tuple[dict, dict | None]:
         evidence = {
+            "configured": locator is not None,
             "locator": locator,
             "sha256": None,
-            "status": None,
-            "failure_phase": None,
+            "schema": None,
+            "job_id": None,
+            "request_sha256": None,
+            "output_dir": None,
             "effective_route": None,
-            "primary_output_validated": None,
             "failure_reasons": [],
         }
         if locator is None:
-            return evidence
+            return evidence, None
 
-        report_path = Path(locator).expanduser()
+        evidence_path = Path(locator).expanduser()
         try:
-            report_bytes = report_path.read_bytes()
+            evidence_bytes = evidence_path.read_bytes()
         except OSError:
-            evidence["failure_reasons"].append("producer_report_unreadable")
-            return evidence
-        evidence["sha256"] = hashlib.sha256(report_bytes).hexdigest()
+            evidence["failure_reasons"].append(f"{label}_unreadable")
+            return evidence, None
+        evidence["sha256"] = hashlib.sha256(evidence_bytes).hexdigest()
+        if boundary_snapshot is None:
+            evidence["failure_reasons"].append(f"{label}_freshness_boundary_missing")
+        elif (
+            boundary_snapshot.get("exists")
+            and boundary_snapshot.get("sha256") == evidence["sha256"]
+        ):
+            evidence["failure_reasons"].append(f"{label}_not_fresh")
         try:
-            report = json.loads(report_bytes)
+            document = json.loads(evidence_bytes)
         except (UnicodeDecodeError, json.JSONDecodeError):
-            evidence["failure_reasons"].append("producer_report_malformed")
-            return evidence
-        if not isinstance(report, dict):
-            evidence["failure_reasons"].append("producer_report_malformed")
-            return evidence
+            evidence["failure_reasons"].append(f"{label}_malformed")
+            return evidence, None
+        if not isinstance(document, dict):
+            evidence["failure_reasons"].append(f"{label}_malformed")
+            return evidence, None
+
+        for key in ("schema", "job_id", "request_sha256", "output_dir", "effective_route"):
+            evidence[key] = document.get(key)
+        if evidence["schema"] != expected_schema:
+            evidence["failure_reasons"].append(f"{label}_schema_mismatch")
+        identity_prefix = "producer" if label == "producer_report" else label
+        if evidence["job_id"] != request.job_id:
+            evidence["failure_reasons"].append(f"{identity_prefix}_job_identity_mismatch")
+        if evidence["request_sha256"] != request_sha256:
+            evidence["failure_reasons"].append(f"{identity_prefix}_request_identity_mismatch")
+        if evidence["output_dir"] != request.output_dir:
+            evidence["failure_reasons"].append(f"{identity_prefix}_output_identity_mismatch")
+        route_reason = (
+            "effective_route_mismatch"
+            if label == "producer_report"
+            else f"{label}_route_identity_mismatch"
+        )
+        if evidence["effective_route"] != receipt.get("effective_route"):
+            evidence["failure_reasons"].append(route_reason)
+        return evidence, document
+
+    def _producer_report_evidence(
+        self,
+        locator: str | None,
+        receipt: dict,
+        request: JobRequest,
+        request_sha256: str,
+        boundary_snapshot: dict | None,
+    ) -> tuple[dict, dict | None]:
+        evidence, report = self._bound_json_evidence(
+            locator=locator,
+            label="producer_report",
+            expected_schema="gpu-greenroom.producer-report.v1",
+            request=request,
+            request_sha256=request_sha256,
+            receipt=receipt,
+            boundary_snapshot=boundary_snapshot,
+        )
+        evidence.update({
+            "status": None,
+            "failure_phase": None,
+            "primary_output_validated": None,
+        })
+        if report is None:
+            return evidence, None
 
         status = str(report.get("status") or "").strip().lower()
         failure_phase = report.get("failure_phase")
@@ -182,11 +372,27 @@ class GPUQueue:
             evidence["failure_reasons"].append("producer_status_unrecognized")
         if failure_phase:
             evidence["failure_reasons"].append("producer_failure_phase")
-        if effective_route is not None and effective_route != receipt.get("effective_route"):
-            evidence["failure_reasons"].append("effective_route_mismatch")
         if primary_validated is not True:
             evidence["failure_reasons"].append("primary_output_unvalidated")
-        return evidence
+        return evidence, report
+
+    def _evidence_manifest_evidence(
+        self,
+        locator: str | None,
+        receipt: dict,
+        request: JobRequest,
+        request_sha256: str,
+        boundary_snapshot: dict | None,
+    ) -> tuple[dict, dict | None]:
+        return self._bound_json_evidence(
+            locator=locator,
+            label="evidence_manifest",
+            expected_schema="gpu-greenroom.evidence-manifest.v1",
+            request=request,
+            request_sha256=request_sha256,
+            receipt=receipt,
+            boundary_snapshot=boundary_snapshot,
+        )
 
     def _build_terminal_completion(
         self,
@@ -201,11 +407,42 @@ class GPUQueue:
 
         receipt = json.loads(receipt_bytes)
         request_bytes = (source_job_dir / "request.json").read_bytes()
+        request_sha256 = hashlib.sha256(request_bytes).hexdigest()
         receipt_digest = hashlib.sha256(receipt_bytes).hexdigest()
-        producer_report = self._producer_report_evidence(
+        try:
+            boundary = json.loads(
+                (source_job_dir / "completion-evidence-boundary.json").read_text()
+            )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            boundary = None
+        producer_report, producer_report_document = self._producer_report_evidence(
             contract.producer_report_locator,
             receipt,
+            request,
+            request_sha256,
+            (boundary or {}).get("producer_report"),
         )
+        evidence_manifest_validation, _ = self._evidence_manifest_evidence(
+            contract.evidence_manifest_locator,
+            receipt,
+            request,
+            request_sha256,
+            (boundary or {}).get("evidence_manifest"),
+        )
+        if contract.producer_report_locator and contract.evidence_manifest_locator:
+            declared_manifest = (
+                producer_report_document.get("evidence_manifest")
+                if producer_report_document is not None
+                else None
+            )
+            expected_manifest = {
+                "locator": evidence_manifest_validation["locator"],
+                "sha256": evidence_manifest_validation["sha256"],
+            }
+            if declared_manifest != expected_manifest:
+                producer_report["failure_reasons"].append(
+                    "producer_evidence_manifest_identity_mismatch"
+                )
         observer_status = str(receipt.get("status") or "")
         observer_exit = receipt.get("exit_code")
         if observer_status == "cancelled":
@@ -214,13 +451,40 @@ class GPUQueue:
             terminal_class = "succeeded"
         else:
             terminal_class = "failed"
-        if producer_report["failure_reasons"] and terminal_class == "succeeded":
+        output_evidence = receipt.get("output_evidence") or {
+            "boundary_schema": (boundary or {}).get("schema"),
+            "output_dir_auto_assigned": request.output_dir_auto_assigned,
+            "preexisting_file_count": None,
+            "terminal_file_count": None,
+            "changed_files": [],
+            "current_job_attributed": False,
+            "failure_reasons": ["current_output_evidence_unavailable"],
+        }
+        configured_evidence_valid = any((
+            producer_report["configured"] and not producer_report["failure_reasons"],
+            evidence_manifest_validation["configured"]
+            and not evidence_manifest_validation["failure_reasons"],
+        ))
+        if terminal_class == "succeeded" and not (
+            output_evidence.get("current_job_attributed") or configured_evidence_valid
+        ):
+            reason = (
+                "auto_output_has_no_current_evidence"
+                if request.output_dir_auto_assigned
+                else "explicit_output_has_no_current_delta"
+            )
+            output_evidence["failure_reasons"] = [reason]
+        if terminal_class == "succeeded" and any((
+            producer_report["failure_reasons"],
+            evidence_manifest_validation["failure_reasons"],
+            output_evidence["failure_reasons"],
+        )):
             terminal_class = "failed"
         notification_required = (
             contract.notify_on == "always" or terminal_class != "succeeded"
         )
         event_id = f"{request.job_id}:{receipt_digest}"
-        return {
+        event = {
             "schema": "gpu-greenroom.terminal-completion-outbox.v1",
             "schema_version": 1,
             "event_kind": "gpu_greenroom.job_terminal",
@@ -231,7 +495,7 @@ class GPUQueue:
                 "queue_root": str(self.queue_dir.resolve()),
             },
             "request_locator": str(terminal_dir / "request.json"),
-            "request_sha256": hashlib.sha256(request_bytes).hexdigest(),
+            "request_sha256": request_sha256,
             "receipt_locator": str(terminal_dir / "receipt.json"),
             "terminal_receipt_sha256": receipt_digest,
             "terminal_status": observer_status,
@@ -248,6 +512,7 @@ class GPUQueue:
             "requested_route": request.job_type,
             "effective_route": receipt.get("effective_route"),
             "producer_report": producer_report,
+            "output_evidence": output_evidence,
             "artifact_locator": request.output_dir,
             "log_locators": {
                 "stdout": (
@@ -267,6 +532,16 @@ class GPUQueue:
             ),
             "emitted_at": receipt.get("finished_at"),
         }
+        if (
+            evidence_manifest_validation["configured"]
+            and not evidence_manifest_validation["failure_reasons"]
+        ):
+            event["evidence_manifest"] = {
+                "locator": evidence_manifest_validation["locator"],
+                "sha256": evidence_manifest_validation["sha256"],
+            }
+        event["evidence_manifest_validation"] = evidence_manifest_validation
+        return event
 
     def _write_completion_outbox_state(
         self,
@@ -327,19 +602,11 @@ class GPUQueue:
             raise RuntimeError(
                 f"completion receipt digest mismatch for {request.job_id}"
             )
-        if not event.get("notification_required", True):
-            return None
-
         event_path = (
             self.completion_outbox_dir
             / f"{request.job_id}-{actual_receipt_digest}.json"
         )
-        if event_path.exists():
-            existing = json.loads(event_path.read_text())
-            if existing != event:
-                raise RuntimeError(f"conflicting completion outbox event at {event_path}")
-            return event_path
-        self._write_json_atomic(event_path, event)
+        self._write_text_create_only(event_path, json.dumps(event, indent=2))
         return event_path
 
     def _terminalize_job(
@@ -387,13 +654,6 @@ class GPUQueue:
         if not completion_path.is_file():
             return
         event = json.loads(completion_path.read_text())
-        if not event["notification_required"]:
-            self._write_completion_outbox_state(
-                terminal_dir,
-                event,
-                "not_requested",
-            )
-            return
         request = JobRequest.from_json((terminal_dir / "request.json").read_text())
         receipt_bytes = (terminal_dir / "receipt.json").read_bytes()
         try:
@@ -414,7 +674,7 @@ class GPUQueue:
             self._write_completion_outbox_state(
                 terminal_dir,
                 event,
-                "ready",
+                "ready" if event["notification_required"] else "not_requested",
                 increment_attempt=True,
             )
 
@@ -451,13 +711,6 @@ class GPUQueue:
             for completion_path in terminal_root.glob("*/completion.json"):
                 terminal_dir = completion_path.parent
                 event = json.loads(completion_path.read_text())
-                if not event.get("notification_required", True):
-                    self._write_completion_outbox_state(
-                        terminal_dir,
-                        event,
-                        "not_requested",
-                    )
-                    continue
                 request = JobRequest.from_json((terminal_dir / "request.json").read_text())
                 receipt_bytes = (terminal_dir / "receipt.json").read_bytes()
                 outbox_path = (
@@ -483,7 +736,7 @@ class GPUQueue:
                 self._write_completion_outbox_state(
                     terminal_dir,
                     event,
-                    "ready",
+                    "ready" if event["notification_required"] else "not_requested",
                     increment_attempt=True,
                 )
                 if not existed:
@@ -992,6 +1245,7 @@ class GPUQueue:
         /private/tmp, records a volatile_output warning.
         """
         if not request.output_dir:
+            request.output_dir_auto_assigned = True
             request.output_dir = str(self.queue_dir / "outputs" / request.job_id)
 
         job_dir = self.queue_dir / "pending" / request.job_id
@@ -1141,7 +1395,12 @@ class GPUQueue:
     def _move_job(self, job_dir: Path, dest_status: str) -> Path:
         """Move a job directory to a new status folder."""
         dest = self.queue_dir / dest_status / job_dir.name
+        source_parent = job_dir.parent
+        destination_parent = dest.parent
         shutil.move(str(job_dir), str(dest))
+        self._fsync_directory(source_parent)
+        if destination_parent != source_parent:
+            self._fsync_directory(destination_parent)
         return dest
 
     @staticmethod
@@ -1334,10 +1593,23 @@ class GPUQueue:
             state.effective_route = " ".join(cmd)
             (job_dir / "status.json").write_text(state.to_json())
 
-            # Ensure output directory exists
-            run_env = None
-            if job_env:
-                run_env = {**os.environ, **job_env}
+            evidence_boundary = self._capture_completion_evidence_boundary(
+                request,
+                job_dir,
+            )
+
+            # Build subprocess environment
+            request_sha256 = hashlib.sha256(
+                (job_dir / "request.json").read_bytes()
+            ).hexdigest()
+            run_env = {
+                **os.environ,
+                **(job_env or {}),
+                "GPU_GREENROOM_JOB_ID": request.job_id,
+                "GPU_GREENROOM_REQUEST_SHA256": request_sha256,
+                "GPU_GREENROOM_OUTPUT_DIR": request.output_dir,
+                "GPU_GREENROOM_EFFECTIVE_ROUTE": state.effective_route,
+            }
 
             input_artifact = None
             source_attestation = None
@@ -1533,6 +1805,10 @@ class GPUQueue:
                 "artifact_manifest": artifact_manifest,
             }
 
+            receipt["output_evidence"] = self._current_output_evidence(
+                request,
+                evidence_boundary,
+            )
             terminal_dir_for_outbox = self._terminalize_job(
                 request,
                 state,

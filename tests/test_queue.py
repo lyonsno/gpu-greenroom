@@ -13,9 +13,11 @@ import fcntl
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -1277,12 +1279,259 @@ class TestTerminalCompletionOutbox:
         assert event["producer_report"]["sha256"] == hashlib.sha256(
             producer_report.read_bytes()
         ).hexdigest()
-        assert set(event["producer_report"]["failure_reasons"]) == {
+        assert {
             "producer_status_failed",
             "producer_failure_phase",
             "effective_route_mismatch",
             "primary_output_unvalidated",
+        }.issubset(event["producer_report"]["failure_reasons"])
+
+    def test_failure_only_success_still_materializes_suppressed_global_row(
+        self, queue, echo_job_types
+    ):
+        request = self._opted_request(job_type="write_output")
+        request.completion_outbox = CompletionOutboxRequest(
+            target_consumer="asset-consumer",
+            target_consumer_id="consumer-asset",
+            delivery_mode="immediate",
+            notify_on="failure",
+        )
+        queue.submit(request)
+
+        assert queue.run_one(echo_job_types) is True
+
+        event_path, event = self._single_event(queue)
+        original_bytes = event_path.read_bytes()
+        assert event["notification_required"] is False
+        assert event["publication_state"] == "not_requested"
+        assert event["receiver_disposition_state"] == "not_requested"
+        assert queue.reconcile_completion_outbox() == []
+        assert event_path.read_bytes() == original_bytes
+
+    def test_current_bound_producer_report_carries_revalidatable_schema(
+        self, queue, tmp_path
+    ):
+        producer_report = tmp_path / "producer-report.json"
+        output_dir = tmp_path / "output"
+        script = (
+            "import json,os,pathlib; "
+            "out=pathlib.Path(os.environ['GPU_GREENROOM_OUTPUT_DIR']); "
+            "out.mkdir(parents=True,exist_ok=True); (out/'current.txt').write_text('current'); "
+            "pathlib.Path(os.environ['REPORT_PATH']).write_text(json.dumps({"
+            "'schema':'gpu-greenroom.producer-report.v1',"
+            "'job_id':os.environ['GPU_GREENROOM_JOB_ID'],"
+            "'request_sha256':os.environ['GPU_GREENROOM_REQUEST_SHA256'],"
+            "'output_dir':os.environ['GPU_GREENROOM_OUTPUT_DIR'],"
+            "'effective_route':os.environ['GPU_GREENROOM_EFFECTIVE_ROUTE'],"
+            "'status':'succeeded','failure_phase':None,"
+            "'primary_output_validated':True}))"
+        )
+        request = JobRequest(
+            job_type="reporting",
+            input_path="/tmp/input.png",
+            output_dir=str(output_dir),
+            params={"env": {"REPORT_PATH": str(producer_report)}},
+            completion_outbox=CompletionOutboxRequest(
+                target_consumer="asset-consumer",
+                target_consumer_id="consumer-asset",
+                delivery_mode="checkpoint",
+                producer_report_locator=str(producer_report),
+            ),
+        )
+        queue.submit(request)
+
+        assert queue.run_one({"reporting": [sys.executable, "-c", script]}) is True
+
+        _, event = self._single_event(queue)
+        request_digest = hashlib.sha256(
+            (queue.queue_dir / "done" / request.job_id / "request.json").read_bytes()
+        ).hexdigest()
+        evidence = event["producer_report"]
+        assert event["terminal_class"] == "succeeded"
+        assert evidence["configured"] is True
+        assert evidence["schema"] == "gpu-greenroom.producer-report.v1"
+        assert evidence["job_id"] == request.job_id
+        assert evidence["request_sha256"] == request_digest
+        assert evidence["output_dir"] == str(output_dir)
+        assert evidence["effective_route"] == event["effective_route"]
+        assert evidence["failure_reasons"] == []
+
+    def test_stale_prior_success_report_cannot_author_current_job(
+        self, queue, echo_job_types, tmp_path
+    ):
+        producer_report = tmp_path / "producer-report.json"
+        producer_report.write_text(json.dumps({
+            "status": "succeeded",
+            "primary_output_validated": True,
+        }))
+        request = self._opted_request(job_type="write_output")
+        request.completion_outbox = CompletionOutboxRequest(
+            target_consumer="asset-consumer",
+            target_consumer_id="consumer-asset",
+            delivery_mode="checkpoint",
+            producer_report_locator=str(producer_report),
+        )
+        queue.submit(request)
+
+        assert queue.run_one(echo_job_types) is True
+
+        _, event = self._single_event(queue)
+        assert event["terminal_class"] == "failed"
+        assert "producer_report_not_fresh" in event["producer_report"]["failure_reasons"]
+        assert "producer_job_identity_mismatch" in event["producer_report"]["failure_reasons"]
+
+    def test_prepopulated_explicit_output_without_current_delta_is_demoted(
+        self, queue, echo_job_types, tmp_path
+    ):
+        output_dir = tmp_path / "reused-output"
+        output_dir.mkdir()
+        (output_dir / "stale.glb").write_text("stale success")
+        request = self._opted_request(output_dir=str(output_dir))
+        queue.submit(request)
+
+        assert queue.run_one(echo_job_types) is True
+
+        _, event = self._single_event(queue)
+        assert event["observer_terminal_state"] == "done"
+        assert event["observer_exit_code"] == 0
+        assert event["terminal_class"] == "failed"
+        assert event["output_evidence"]["current_job_attributed"] is False
+        assert event["output_evidence"]["failure_reasons"] == [
+            "explicit_output_has_no_current_delta"
+        ]
+
+    def test_current_bound_evidence_manifest_carries_exact_digest(
+        self, queue, tmp_path
+    ):
+        manifest = tmp_path / "evidence-manifest.json"
+        output_dir = tmp_path / "manifest-output"
+        script = (
+            "import json,os,pathlib; "
+            "out=pathlib.Path(os.environ['GPU_GREENROOM_OUTPUT_DIR']); "
+            "out.mkdir(parents=True,exist_ok=True); (out/'current.glb').write_text('current'); "
+            "pathlib.Path(os.environ['MANIFEST_PATH']).write_text(json.dumps({"
+            "'schema':'gpu-greenroom.evidence-manifest.v1',"
+            "'job_id':os.environ['GPU_GREENROOM_JOB_ID'],"
+            "'request_sha256':os.environ['GPU_GREENROOM_REQUEST_SHA256'],"
+            "'output_dir':os.environ['GPU_GREENROOM_OUTPUT_DIR'],"
+            "'effective_route':os.environ['GPU_GREENROOM_EFFECTIVE_ROUTE'],"
+            "'artifacts':['current.glb']}))"
+        )
+        request = JobRequest(
+            job_type="manifesting",
+            input_path="/tmp/input.png",
+            output_dir=str(output_dir),
+            params={"env": {"MANIFEST_PATH": str(manifest)}},
+            completion_outbox=CompletionOutboxRequest(
+                target_consumer="asset-consumer",
+                target_consumer_id="consumer-asset",
+                delivery_mode="checkpoint",
+                evidence_manifest_locator=str(manifest),
+            ),
+        )
+        queue.submit(request)
+
+        assert queue.run_one({"manifesting": [sys.executable, "-c", script]}) is True
+
+        _, event = self._single_event(queue)
+        assert event["terminal_class"] == "succeeded"
+        assert event["evidence_manifest"] == {
+            "locator": str(manifest),
+            "sha256": hashlib.sha256(manifest.read_bytes()).hexdigest(),
         }
+        assert event["evidence_manifest_validation"]["failure_reasons"] == []
+
+    def test_missing_registered_evidence_manifest_demotes_success(
+        self, queue, echo_job_types, tmp_path
+    ):
+        manifest = tmp_path / "missing-manifest.json"
+        request = self._opted_request(job_type="write_output")
+        request.completion_outbox = CompletionOutboxRequest(
+            target_consumer="asset-consumer",
+            target_consumer_id="consumer-asset",
+            delivery_mode="checkpoint",
+            evidence_manifest_locator=str(manifest),
+        )
+        queue.submit(request)
+
+        assert queue.run_one(echo_job_types) is True
+
+        _, event = self._single_event(queue)
+        assert event["terminal_class"] == "failed"
+        assert "evidence_manifest_unreadable" in event[
+            "evidence_manifest_validation"
+        ]["failure_reasons"]
+        assert "evidence_manifest" not in event
+
+    def test_global_row_is_create_only_and_fsync_durable(
+        self, queue, echo_job_types, monkeypatch
+    ):
+        request = self._opted_request(job_type="write_output")
+        queue.submit(request)
+        assert queue.run_one(echo_job_types) is True
+        terminal_dir = queue.queue_dir / "done" / request.job_id
+        receipt_bytes = (terminal_dir / "receipt.json").read_bytes()
+        event_path, _ = self._single_event(queue)
+        event_path.unlink()
+
+        original_replace = os.replace
+        original_fsync = os.fsync
+        fsync_kinds = []
+
+        def reject_global_replace(source, destination):
+            if Path(destination).parent == queue.completion_outbox_dir:
+                raise AssertionError("immutable global row used replace semantics")
+            return original_replace(source, destination)
+
+        def record_fsync(fd):
+            mode = os.fstat(fd).st_mode
+            fsync_kinds.append("directory" if stat.S_ISDIR(mode) else "file")
+            return original_fsync(fd)
+
+        monkeypatch.setattr(os, "replace", reject_global_replace)
+        monkeypatch.setattr(os, "fsync", record_fsync)
+
+        assert queue._emit_terminal_completion_outbox(
+            request, terminal_dir, receipt_bytes
+        ) == event_path
+        assert "file" in fsync_kinds
+        assert "directory" in fsync_kinds
+
+    def test_concurrent_identical_global_writers_preserve_one_event(
+        self, queue, echo_job_types
+    ):
+        request = self._opted_request(job_type="write_output")
+        queue.submit(request)
+        assert queue.run_one(echo_job_types) is True
+        terminal_dir = queue.queue_dir / "done" / request.job_id
+        receipt_bytes = (terminal_dir / "receipt.json").read_bytes()
+        event_path, _ = self._single_event(queue)
+        expected_bytes = event_path.read_bytes()
+        event_path.unlink()
+        barrier = threading.Barrier(3)
+        results = []
+        errors = []
+
+        def emit():
+            barrier.wait()
+            try:
+                results.append(queue._emit_terminal_completion_outbox(
+                    request, terminal_dir, receipt_bytes
+                ))
+            except Exception as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=emit) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join()
+
+        assert errors == []
+        assert results == [event_path, event_path]
+        assert list(queue.completion_outbox_dir.glob("*.json")) == [event_path]
+        assert event_path.read_bytes() == expected_bytes
 
     def test_non_opted_jobs_do_not_emit_or_change_cancel_receipts(self, queue, echo_job_types):
         completed = make_request()
