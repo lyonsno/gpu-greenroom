@@ -937,7 +937,7 @@ class TestTerminalCompletionOutbox:
 
         self._assert_terminal_event(queue, request, "failed", "timeout")
 
-    def test_stale_recovery_emits_completion_once(self, queue):
+    def test_stale_recovery_preserves_terminal_evidence_in_completion(self, queue):
         request = self._opted_request()
         job_dir = queue.submit(request)
         running_dir = queue.queue_dir / "running" / request.job_id
@@ -946,12 +946,26 @@ class TestTerminalCompletionOutbox:
         state.status = JobStatus.RUNNING
         state.started_at = time.time() - 100
         state.pid = 99999999
+        state.effective_route = "echo processed /tmp/test.png"
+        state.warnings = ["stale-route-warning"]
         (running_dir / "status.json").write_text(state.to_json())
 
         assert queue.recover_stale() == [request.job_id]
         assert queue.recover_stale() == []
 
-        self._assert_terminal_event(queue, request, "failed", "stale_recovery")
+        _, event = self._assert_terminal_event(
+            queue, request, "failed", "stale_recovery"
+        )
+        receipt = json.loads(
+            (queue.queue_dir / "failed" / request.job_id / "receipt.json").read_text()
+        )
+        assert receipt["input_path"] == request.input_path
+        assert receipt["output_dir"] == request.output_dir
+        assert receipt["effective_route"] == state.effective_route
+        assert receipt["exit_code"] == -1
+        assert receipt["warnings"] == state.warnings
+        assert event["effective_route"] == state.effective_route
+        assert event["observer_exit_code"] == -1
 
     def test_pending_cancellation_emits_completion(self, queue):
         request = self._opted_request()
