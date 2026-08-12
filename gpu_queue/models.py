@@ -34,6 +34,34 @@ class BumpStatus(str, Enum):
     CLOSED = "closed"
 
 
+@dataclass(frozen=True)
+class CompletionOutboxRequest:
+    """Opt-in routing contract for a producer-local terminal event."""
+
+    target_consumer: str
+    target_consumer_id: str
+    delivery_mode: str
+    notify_on: str = "always"
+    producer_report_locator: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.target_consumer:
+            raise ValueError("completion outbox target_consumer must not be empty")
+        if not self.target_consumer_id:
+            raise ValueError("completion outbox target_consumer_id must not be empty")
+        if self.delivery_mode not in {"checkpoint", "immediate", "passive"}:
+            raise ValueError(
+                "completion outbox delivery_mode must be checkpoint, immediate, or passive"
+            )
+        if self.notify_on not in {"always", "failure"}:
+            raise ValueError("completion outbox notify_on must be always or failure")
+        if (
+            self.producer_report_locator is not None
+            and not Path(self.producer_report_locator).expanduser().is_absolute()
+        ):
+            raise ValueError("completion outbox producer_report_locator must be absolute")
+
+
 @dataclass
 class JobRequest:
     job_type: str
@@ -42,6 +70,7 @@ class JobRequest:
     params: dict[str, Any] = field(default_factory=dict)
     job_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     submitted_at: float = field(default_factory=time.time)
+    completion_outbox: CompletionOutboxRequest | None = None
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2)
@@ -49,6 +78,10 @@ class JobRequest:
     @classmethod
     def from_json(cls, text: str) -> JobRequest:
         d = json.loads(text)
+        if isinstance(d.get("completion_outbox"), dict):
+            d["completion_outbox"] = CompletionOutboxRequest(
+                **_known_fields(CompletionOutboxRequest, d["completion_outbox"])
+            )
         return cls(**_known_fields(cls, d))
 
 

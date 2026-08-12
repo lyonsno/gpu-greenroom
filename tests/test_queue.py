@@ -10,15 +10,17 @@ Evidence harness contract (from Kynormous council pressure):
 """
 
 import fcntl
+import hashlib
 import json
 import os
+import subprocess
 import tempfile
 import time
 from pathlib import Path
 
 import pytest
 
-from gpu_queue.models import JobRequest, JobState, JobStatus
+from gpu_queue.models import CompletionOutboxRequest, JobRequest, JobState, JobStatus
 from gpu_queue.queue import GPUQueue
 
 
@@ -832,3 +834,288 @@ class TestMetadataSidecar:
         meta = json.loads((Path(out_dir) / "metadata.json").read_text())
         assert isinstance(meta["duration_s"], (int, float))
         assert meta["duration_s"] >= 0
+
+
+# --- Terminal completion outbox ---
+
+class TestTerminalCompletionOutbox:
+    def _opted_request(self, **kwargs):
+        request = make_request(**kwargs)
+        request.completion_outbox = CompletionOutboxRequest(
+            target_consumer="asset-consumer",
+            target_consumer_id="consumer-asset",
+            delivery_mode="checkpoint",
+        )
+        return request
+
+    def _single_event(self, queue):
+        event_paths = list(queue.completion_outbox_dir.glob("*.json"))
+        assert len(event_paths) == 1
+        return event_paths[0], json.loads(event_paths[0].read_text())
+
+    def _assert_terminal_event(self, queue, request, terminal_status, failure_phase=None):
+        terminal_dir = queue.queue_dir / terminal_status / request.job_id
+        receipt_path = terminal_dir / "receipt.json"
+        receipt_digest = hashlib.sha256(receipt_path.read_bytes()).hexdigest()
+        event_path, event = self._single_event(queue)
+
+        assert event_path.name == f"{request.job_id}-{receipt_digest}.json"
+        assert event["event_kind"] == "gpu_greenroom.job_terminal"
+        assert event["event_id"] == f"{request.job_id}:{receipt_digest}"
+        assert event["job_id"] == request.job_id
+        assert event["terminal_receipt_sha256"] == receipt_digest
+        assert event["terminal_status"] == terminal_status
+        assert event["failure_phase"] == failure_phase
+        assert event["target_consumer"] == "asset-consumer"
+        assert event["target_consumer_id"] == "consumer-asset"
+        assert event["delivery_mode"] == "checkpoint"
+        assert event["request_locator"] == str(terminal_dir / "request.json")
+        assert event["receipt_locator"] == str(receipt_path)
+        assert event["artifact_locator"] == request.output_dir
+        return event_path, event
+
+    def test_request_contract_tolerates_additive_fields(self):
+        request = self._opted_request()
+        payload = json.loads(request.to_json())
+        payload["completion_outbox"]["consumer_schema"] = "future.v2"
+
+        restored = JobRequest.from_json(json.dumps(payload))
+
+        assert restored.completion_outbox == request.completion_outbox
+
+    def test_success_emits_completion_with_terminal_locators(self, queue, echo_job_types):
+        request = self._opted_request(input_path="/tmp/completion.png")
+        queue.submit(request)
+
+        assert queue.run_one(echo_job_types) is True
+
+        _, event = self._assert_terminal_event(queue, request, "done")
+        terminal_dir = queue.queue_dir / "done" / request.job_id
+        assert event["log_locators"] == {
+            "stdout": str(terminal_dir / "stdout.log"),
+            "stderr": str(terminal_dir / "stderr.log"),
+        }
+
+    def test_execution_failure_emits_completion(self, queue, echo_job_types):
+        request = self._opted_request(job_type="failing")
+        queue.submit(request)
+
+        queue.run_one(echo_job_types)
+
+        self._assert_terminal_event(queue, request, "failed", "execution")
+
+    def test_dispatch_failure_emits_completion(self, queue):
+        request = self._opted_request(job_type="missing")
+        queue.submit(request)
+
+        queue.run_one({})
+
+        _, event = self._assert_terminal_event(queue, request, "failed", "dispatch")
+        assert event["log_locators"] == {"stdout": None, "stderr": None}
+
+    def test_launch_failure_emits_completion(self, queue, monkeypatch):
+        request = self._opted_request(job_type="broken-launch")
+        queue.submit(request)
+
+        def fail_launch(*args, **kwargs):
+            raise OSError("deterministic launch failure")
+
+        monkeypatch.setattr("gpu_queue.queue.subprocess.run", fail_launch)
+        queue.run_one({"broken-launch": ["does-not-matter"]})
+
+        self._assert_terminal_event(queue, request, "failed", "launch")
+
+    def test_timeout_emits_completion(self, queue, monkeypatch):
+        request = self._opted_request(job_type="timed-out")
+        queue.submit(request)
+
+        def time_out(*args, **kwargs):
+            raise subprocess.TimeoutExpired(args[0], kwargs["timeout"])
+
+        monkeypatch.setattr("gpu_queue.queue.subprocess.run", time_out)
+        queue.run_one({"timed-out": {"cmd": ["does-not-matter"], "timeout": 1}})
+
+        self._assert_terminal_event(queue, request, "failed", "timeout")
+
+    def test_stale_recovery_emits_completion_once(self, queue):
+        request = self._opted_request()
+        job_dir = queue.submit(request)
+        running_dir = queue.queue_dir / "running" / request.job_id
+        job_dir.rename(running_dir)
+        state = JobState.from_json((running_dir / "status.json").read_text())
+        state.status = JobStatus.RUNNING
+        state.started_at = time.time() - 100
+        state.pid = 99999999
+        (running_dir / "status.json").write_text(state.to_json())
+
+        assert queue.recover_stale() == [request.job_id]
+        assert queue.recover_stale() == []
+
+        self._assert_terminal_event(queue, request, "failed", "stale_recovery")
+
+    def test_pending_cancellation_emits_completion(self, queue):
+        request = self._opted_request()
+        queue.submit(request)
+
+        assert queue.cancel(request.job_id) is True
+
+        _, event = self._assert_terminal_event(queue, request, "cancelled")
+        assert event["log_locators"] == {"stdout": None, "stderr": None}
+
+    def test_duplicate_emit_keeps_one_identical_event(self, queue, echo_job_types):
+        request = self._opted_request()
+        queue.submit(request)
+        queue.run_one(echo_job_types)
+        terminal_dir = queue.queue_dir / "done" / request.job_id
+        receipt_bytes = (terminal_dir / "receipt.json").read_bytes()
+        event_path, _ = self._single_event(queue)
+        original_bytes = event_path.read_bytes()
+        original_mtime = event_path.stat().st_mtime_ns
+
+        duplicate_path = queue._emit_terminal_completion_outbox(
+            request,
+            terminal_dir,
+            receipt_bytes,
+        )
+
+        assert duplicate_path == event_path
+        assert list(queue.completion_outbox_dir.glob("*.json")) == [event_path]
+        assert event_path.read_bytes() == original_bytes
+        assert event_path.stat().st_mtime_ns == original_mtime
+
+    def test_duplicate_emit_fails_loud_for_conflicting_cached_event(self, queue, echo_job_types):
+        request = self._opted_request()
+        queue.submit(request)
+        queue.run_one(echo_job_types)
+        terminal_dir = queue.queue_dir / "done" / request.job_id
+        receipt_bytes = (terminal_dir / "receipt.json").read_bytes()
+        event_path, event = self._single_event(queue)
+        event["target_consumer"] = "wrong-consumer"
+        event_path.write_text(json.dumps(event, indent=2))
+
+        with pytest.raises(RuntimeError, match="conflicting completion outbox event"):
+            queue._emit_terminal_completion_outbox(request, terminal_dir, receipt_bytes)
+
+    def test_terminal_move_crash_recovers_original_terminal_event(
+        self, queue, echo_job_types, monkeypatch
+    ):
+        request = self._opted_request()
+        queue.submit(request)
+        original_move = queue._move_job
+
+        def crash_before_terminal_move(job_dir, dest_status):
+            if dest_status == "done":
+                raise OSError("deterministic crash before terminal move")
+            return original_move(job_dir, dest_status)
+
+        monkeypatch.setattr(queue, "_move_job", crash_before_terminal_move)
+        with pytest.raises(OSError, match="deterministic crash"):
+            queue.run_one(echo_job_types)
+
+        running_dir = queue.queue_dir / "running" / request.job_id
+        state = JobState.from_json((running_dir / "status.json").read_text())
+        state.pid = 99999999
+        (running_dir / "status.json").write_text(state.to_json())
+        monkeypatch.setattr(queue, "_move_job", original_move)
+
+        assert queue.recover_stale() == [request.job_id]
+        assert not running_dir.exists()
+        assert (queue.queue_dir / "done" / request.job_id / "receipt.json").is_file()
+        self._assert_terminal_event(queue, request, "done")
+
+    def test_outbox_write_gap_keeps_terminal_receipt_and_reconciles(
+        self, queue, echo_job_types, monkeypatch
+    ):
+        request = self._opted_request()
+        queue.submit(request)
+        original_emit = queue._emit_terminal_completion_outbox
+
+        def fail_emit(*args, **kwargs):
+            raise OSError("deterministic outbox write failure")
+
+        monkeypatch.setattr(queue, "_emit_terminal_completion_outbox", fail_emit)
+
+        assert queue.run_one(echo_job_types) is True
+        terminal_dir = queue.queue_dir / "done" / request.job_id
+        assert (terminal_dir / "receipt.json").is_file()
+        assert (terminal_dir / "completion.json").is_file()
+        assert list(queue.completion_outbox_dir.glob("*.json")) == []
+
+        monkeypatch.setattr(queue, "_emit_terminal_completion_outbox", original_emit)
+        reconciled = queue.reconcile_completion_outbox()
+
+        assert len(reconciled) == 1
+        self._assert_terminal_event(queue, request, "done")
+
+    def test_outbox_visibility_happens_after_gpu_lock_release(
+        self, queue, echo_job_types, monkeypatch
+    ):
+        request = self._opted_request()
+        queue.submit(request)
+        original_emit = queue._emit_terminal_completion_outbox
+        observed_lock_released = []
+
+        def emit_after_lock_release(*args, **kwargs):
+            with open(queue.lock_path, "w") as probe_fd:
+                fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                observed_lock_released.append(True)
+                fcntl.flock(probe_fd, fcntl.LOCK_UN)
+            return original_emit(*args, **kwargs)
+
+        monkeypatch.setattr(
+            queue,
+            "_emit_terminal_completion_outbox",
+            emit_after_lock_release,
+        )
+
+        assert queue.run_one(echo_job_types) is True
+        assert observed_lock_released == [True]
+
+    def test_zero_exit_failed_producer_report_cannot_emit_success(
+        self, queue, echo_job_types, tmp_path
+    ):
+        producer_report = tmp_path / "producer-report.json"
+        producer_report.write_text(json.dumps({
+            "status": "failed",
+            "failure_phase": "primary_validation",
+            "effective_route": "wrong-route",
+            "primary_output_validated": False,
+        }))
+        request = make_request()
+        request.completion_outbox = CompletionOutboxRequest(
+            target_consumer="asset-consumer",
+            target_consumer_id="consumer-asset",
+            delivery_mode="checkpoint",
+            producer_report_locator=str(producer_report),
+        )
+        queue.submit(request)
+
+        assert queue.run_one(echo_job_types) is True
+
+        _, event = self._single_event(queue)
+        assert event["observer_terminal_state"] == "done"
+        assert event["observer_exit_code"] == 0
+        assert event["terminal_class"] == "failed"
+        assert event["claim_ceiling"] == "process_terminality_only"
+        assert event["producer_report"]["locator"] == str(producer_report)
+        assert event["producer_report"]["sha256"] == hashlib.sha256(
+            producer_report.read_bytes()
+        ).hexdigest()
+        assert set(event["producer_report"]["failure_reasons"]) == {
+            "producer_status_failed",
+            "producer_failure_phase",
+            "effective_route_mismatch",
+            "primary_output_unvalidated",
+        }
+
+    def test_non_opted_jobs_do_not_emit_or_change_cancel_receipts(self, queue, echo_job_types):
+        completed = make_request()
+        cancelled = make_request()
+        queue.submit(completed)
+        queue.submit(cancelled)
+
+        queue.run_one(echo_job_types)
+        queue.cancel(cancelled.job_id)
+
+        assert list(queue.completion_outbox_dir.glob("*.json")) == []
+        assert not (queue.queue_dir / "cancelled" / cancelled.job_id / "receipt.json").exists()

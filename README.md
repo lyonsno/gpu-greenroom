@@ -38,6 +38,14 @@ gpu-greenroom cancel <job-id>
 # Start the worker (runs jobs sequentially, polls every 2s)
 gpu-greenroom worker
 
+# Opt into one durable terminal-completion event for an exact consumer
+gpu-greenroom submit trellis2mlx /path/to/image.png /path/to/output/ \
+  --completion-target research-consumer \
+  --completion-target-id consumer-8f47f13f \
+  --delivery-mode immediate \
+  --notify-on always \
+  --producer-report /path/to/output/report.json
+
 # Pause the queue (finishes current job, then waits)
 gpu-greenroom pause
 
@@ -99,6 +107,9 @@ gpu-greenroom bump wait resident-cold-load --timeout 600
     <bump-id>.json      # inbound cooperative bump request state
     receipts/           # request, grant, and decline receipts
   events/               # filesystem-watch wake events for bump wait
+  outbox/
+    terminal-completions/
+      <job-id>-<receipt-sha256>.json # immutable A2 publisher input
   pending/
     <job-id>/
       request.json      # what was submitted
@@ -116,6 +127,9 @@ gpu-greenroom bump wait resident-cold-load --timeout 600
       stdout.log
       stderr.log
       receipt.json      # full route identity and outcome
+      completion.json   # immutable completion envelope for opted-in jobs
+      completion-outbox-state.json # mutable A1 materialization attempts
+      terminalization.json # replayable receipt/outbox transaction
   failed/
     <job-id>/...        # same as done, with failure_phase
   cancelled/
@@ -123,6 +137,30 @@ gpu-greenroom bump wait resident-cold-load --timeout 600
 ```
 
 Override the queue directory with `GPU_GREENROOM_DIR` or `--queue-dir`.
+
+## Terminal completion outbox
+
+Completion delivery is opt-in. Registration binds both the consumer name and
+stable consumer id, delivery cadence, and `always` versus `failure` policy into
+`request.json`. The queue worker, pending cancellation, and stale recovery
+remain the only terminal authorities. They first write one replayable local
+terminalization transaction and move the job to its terminal bucket while
+holding `gpu.lock`; only after releasing that lock does Greenroom materialize
+the immutable global outbox row.
+
+The outbox row separates observer terminal state/exit code, producer-report
+evidence, and a `process_terminality_only` claim ceiling. A configured producer
+report that is missing, malformed, failed, carries a failure phase, reports a
+different effective route, or does not validate primary output cannot turn an
+exit-zero process into a successful completion. Publication and receiver
+disposition remain pending A2 state; Greenroom performs no Git, directive,
+network, broker, or scientific-acceptance work.
+
+If the process dies between local terminalization and global outbox creation,
+`worker` startup and `recover` replay the local transaction and reconcile the
+same logical event without rerunning the job. `completion-outbox-state.json`
+retains materialization attempts and the last error; a conflicting existing
+event fails that attempt rather than minting a duplicate.
 
 ## Cooperative external leases and bumps
 

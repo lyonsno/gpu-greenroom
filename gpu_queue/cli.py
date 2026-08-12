@@ -10,7 +10,7 @@ import sys
 import time
 from pathlib import Path
 
-from .models import BumpStatus, JobRequest, JobStatus, LeaseStatus
+from .models import BumpStatus, CompletionOutboxRequest, JobRequest, JobStatus, LeaseStatus
 from .queue import GPUQueue
 
 DEFAULT_QUEUE_DIR = os.environ.get("GPU_GREENROOM_DIR", os.path.expanduser("~/.local/state/gpu-greenroom"))
@@ -69,11 +69,31 @@ def cmd_submit(args):
     if args.cwd:
         params["cwd"] = args.cwd
 
+    completion_outbox = None
+    if args.completion_target or args.completion_target_id:
+        if not args.completion_target or not args.completion_target_id:
+            print(
+                "--completion-target and --completion-target-id must be provided together",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+        completion_outbox = CompletionOutboxRequest(
+            target_consumer=args.completion_target,
+            target_consumer_id=args.completion_target_id,
+            delivery_mode=args.delivery_mode,
+            notify_on=args.notify_on,
+            producer_report_locator=args.producer_report,
+        )
+    elif args.producer_report:
+        print("--producer-report requires an exact completion receiver", file=sys.stderr)
+        raise SystemExit(2)
+
     request = JobRequest(
         job_type=args.job_type,
         input_path=args.input,
         output_dir=args.output_dir,
         params=params,
+        completion_outbox=completion_outbox,
     )
     job_dir = queue.submit(request)
     print(f"Submitted job {request.job_id}")
@@ -84,6 +104,16 @@ def cmd_submit(args):
         print(f"  (auto-assigned durable output dir)")
     if args.cwd:
         print(f"  Cwd: {args.cwd}")
+    if completion_outbox is not None:
+        print(
+            "  Completion target: "
+            f"{completion_outbox.target_consumer} "
+            f"({completion_outbox.target_consumer_id})"
+        )
+        print(
+            "  Completion delivery: "
+            f"{completion_outbox.delivery_mode} on={completion_outbox.notify_on}"
+        )
     print(f"  Dir: {job_dir}")
 
 
@@ -151,6 +181,9 @@ def cmd_worker(args):
     recovered = queue.recover_stale()
     if recovered:
         print(f"  Recovered {len(recovered)} stale job(s): {', '.join(recovered)}")
+    reconciled = queue.reconcile_completion_outbox()
+    if reconciled:
+        print(f"  Reconciled {len(reconciled)} completion outbox event(s)")
 
     was_paused = False
     try:
@@ -189,12 +222,15 @@ def cmd_resume(args):
 def cmd_recover(args):
     queue = get_queue(args)
     recovered = queue.recover_stale()
+    reconciled = queue.reconcile_completion_outbox()
     if recovered:
         print(f"Recovered {len(recovered)} stale job(s):")
         for jid in recovered:
             print(f"  {jid}")
     else:
         print("No stale jobs found.")
+    if reconciled:
+        print(f"Reconciled {len(reconciled)} completion outbox event(s).")
 
 
 def _print_model(model):
@@ -335,6 +371,24 @@ def main():
     p_submit.add_argument("output_dir", nargs="?", default="", help="Output directory (default: durable path in queue dir)")
     p_submit.add_argument("-p", "--params", nargs="*", help="Key=value params (e.g. seed=42)")
     p_submit.add_argument("--cwd", help="Override working directory (e.g. for branch/worktree)")
+    p_submit.add_argument("--completion-target", help="Exact consumer name for terminal completion")
+    p_submit.add_argument("--completion-target-id", help="Stable consumer id resolved at registration")
+    p_submit.add_argument(
+        "--delivery-mode",
+        choices=("checkpoint", "immediate", "passive"),
+        default="checkpoint",
+        help="Completion delivery cadence (default: checkpoint)",
+    )
+    p_submit.add_argument(
+        "--notify-on",
+        choices=("always", "failure"),
+        default="always",
+        help="Emit completion for every terminal state or failures only",
+    )
+    p_submit.add_argument(
+        "--producer-report",
+        help="Absolute producer-report path whose evidence can demote process success",
+    )
     p_submit.set_defaults(func=cmd_submit)
 
     # list
