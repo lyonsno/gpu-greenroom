@@ -1593,11 +1593,16 @@ class GPUQueue:
                         receipt = {
                             "job_id": state.job_id,
                             "job_type": state.job_type,
+                            "input_path": state.input_path,
+                            "output_dir": state.output_dir,
                             "status": "failed",
+                            "effective_route": state.effective_route,
+                            "exit_code": state.exit_code,
                             "failure_phase": "stale_recovery",
                             "error_message": state.error_message,
                             "started_at": state.started_at,
                             "finished_at": state.finished_at,
+                            "warnings": state.warnings,
                         }
                         terminal_dir = self._terminalize_job(
                             request,
