@@ -35,7 +35,14 @@ class GPUQueue:
         self.queue_dir = Path(queue_dir)
         for sub in ("pending", "running", "done", "failed", "cancelled", "outputs"):
             (self.queue_dir / sub).mkdir(parents=True, exist_ok=True)
-        for sub in ("leases", "leases/receipts", "bumps", "bumps/receipts", "events"):
+        for sub in (
+            "leases",
+            "leases/receipts",
+            "bumps",
+            "bumps/receipts",
+            "events",
+            "outbox/terminal-completions",
+        ):
             (self.queue_dir / sub).mkdir(parents=True, exist_ok=True)
 
     @property
@@ -69,6 +76,10 @@ class GPUQueue:
     @property
     def events_dir(self) -> Path:
         return self.queue_dir / "events"
+
+    @property
+    def completion_outbox_dir(self) -> Path:
+        return self.queue_dir / "outbox" / "terminal-completions"
 
     @contextmanager
     def _coordination_lock(self):
@@ -125,6 +136,359 @@ class GPUQueue:
             "receipt_written_at": time.time(),
         }
         self._write_json_atomic(directory / name, payload)
+
+    def _producer_report_evidence(self, locator: str | None, receipt: dict) -> dict:
+        evidence = {
+            "locator": locator,
+            "sha256": None,
+            "status": None,
+            "failure_phase": None,
+            "effective_route": None,
+            "primary_output_validated": None,
+            "failure_reasons": [],
+        }
+        if locator is None:
+            return evidence
+
+        report_path = Path(locator).expanduser()
+        try:
+            report_bytes = report_path.read_bytes()
+        except OSError:
+            evidence["failure_reasons"].append("producer_report_unreadable")
+            return evidence
+        evidence["sha256"] = hashlib.sha256(report_bytes).hexdigest()
+        try:
+            report = json.loads(report_bytes)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            evidence["failure_reasons"].append("producer_report_malformed")
+            return evidence
+        if not isinstance(report, dict):
+            evidence["failure_reasons"].append("producer_report_malformed")
+            return evidence
+
+        status = str(report.get("status") or "").strip().lower()
+        failure_phase = report.get("failure_phase")
+        effective_route = report.get("effective_route")
+        primary_validated = report.get("primary_output_validated")
+        evidence.update({
+            "status": status or None,
+            "failure_phase": failure_phase,
+            "effective_route": effective_route,
+            "primary_output_validated": primary_validated,
+        })
+        if status in {"failed", "failure", "error", "cancelled", "lost"}:
+            evidence["failure_reasons"].append("producer_status_failed")
+        elif status not in {"complete", "completed", "done", "success", "succeeded"}:
+            evidence["failure_reasons"].append("producer_status_unrecognized")
+        if failure_phase:
+            evidence["failure_reasons"].append("producer_failure_phase")
+        if effective_route is not None and effective_route != receipt.get("effective_route"):
+            evidence["failure_reasons"].append("effective_route_mismatch")
+        if primary_validated is not True:
+            evidence["failure_reasons"].append("primary_output_unvalidated")
+        return evidence
+
+    def _build_terminal_completion(
+        self,
+        request: JobRequest,
+        terminal_dir: Path,
+        receipt_bytes: bytes,
+        source_job_dir: Path,
+    ) -> dict:
+        contract = request.completion_outbox
+        if contract is None:
+            raise ValueError("completion outbox event requested for a job that did not opt in")
+
+        receipt = json.loads(receipt_bytes)
+        request_bytes = (source_job_dir / "request.json").read_bytes()
+        receipt_digest = hashlib.sha256(receipt_bytes).hexdigest()
+        producer_report = self._producer_report_evidence(
+            contract.producer_report_locator,
+            receipt,
+        )
+        observer_status = str(receipt.get("status") or "")
+        observer_exit = receipt.get("exit_code")
+        if observer_status == "cancelled":
+            terminal_class = "cancelled"
+        elif observer_status == "done" and observer_exit == 0:
+            terminal_class = "succeeded"
+        else:
+            terminal_class = "failed"
+        if producer_report["failure_reasons"] and terminal_class == "succeeded":
+            terminal_class = "failed"
+        notification_required = (
+            contract.notify_on == "always" or terminal_class != "succeeded"
+        )
+        event_id = f"{request.job_id}:{receipt_digest}"
+        return {
+            "schema": "gpu-greenroom.terminal-completion-outbox.v1",
+            "schema_version": 1,
+            "event_kind": "gpu_greenroom.job_terminal",
+            "event_id": event_id,
+            "job_id": request.job_id,
+            "producer_identity": {
+                "adapter": "gpu-greenroom",
+                "queue_root": str(self.queue_dir.resolve()),
+            },
+            "request_locator": str(terminal_dir / "request.json"),
+            "request_sha256": hashlib.sha256(request_bytes).hexdigest(),
+            "receipt_locator": str(terminal_dir / "receipt.json"),
+            "terminal_receipt_sha256": receipt_digest,
+            "terminal_status": observer_status,
+            "observer_terminal_state": observer_status,
+            "observer_exit_code": observer_exit,
+            "failure_phase": receipt.get("failure_phase"),
+            "terminal_class": terminal_class,
+            "claim_ceiling": "process_terminality_only",
+            "target_consumer": contract.target_consumer,
+            "target_consumer_id": contract.target_consumer_id,
+            "delivery_mode": contract.delivery_mode,
+            "notify_on": contract.notify_on,
+            "notification_required": notification_required,
+            "requested_route": request.job_type,
+            "effective_route": receipt.get("effective_route"),
+            "producer_report": producer_report,
+            "artifact_locator": request.output_dir,
+            "log_locators": {
+                "stdout": (
+                    str(terminal_dir / "stdout.log")
+                    if (source_job_dir / "stdout.log").exists()
+                    else None
+                ),
+                "stderr": (
+                    str(terminal_dir / "stderr.log")
+                    if (source_job_dir / "stderr.log").exists()
+                    else None
+                ),
+            },
+            "publication_state": "pending" if notification_required else "not_requested",
+            "receiver_disposition_state": (
+                "pending" if notification_required else "not_requested"
+            ),
+            "emitted_at": receipt.get("finished_at"),
+        }
+
+    def _write_completion_outbox_state(
+        self,
+        terminal_dir: Path,
+        event: dict,
+        state: str,
+        *,
+        error: str | None = None,
+        increment_attempt: bool = False,
+    ) -> None:
+        state_path = terminal_dir / "completion-outbox-state.json"
+        attempts = 0
+        if state_path.exists():
+            try:
+                attempts = int(json.loads(state_path.read_text()).get("attempt_count", 0))
+            except (OSError, ValueError, TypeError):
+                attempts = 0
+        if increment_attempt:
+            attempts += 1
+        receipt_digest = event["terminal_receipt_sha256"]
+        self._write_json_atomic(state_path, {
+            "schema": "gpu-greenroom.completion-outbox-state.v1",
+            "event_id": event["event_id"],
+            "state": state,
+            "attempt_count": attempts,
+            "last_attempted_at": time.time() if increment_attempt else None,
+            "last_error": error,
+            "outbox_locator": str(
+                self.completion_outbox_dir
+                / f"{event['job_id']}-{receipt_digest}.json"
+            ),
+        })
+
+    def _emit_terminal_completion_outbox(
+        self,
+        request: JobRequest,
+        terminal_dir: Path,
+        receipt_bytes: bytes,
+        source_job_dir: Path | None = None,
+    ) -> Path | None:
+        contract = request.completion_outbox
+        if contract is None:
+            return None
+
+        completion_path = terminal_dir / "completion.json"
+        if completion_path.exists():
+            event = json.loads(completion_path.read_text())
+        else:
+            event = self._build_terminal_completion(
+                request,
+                terminal_dir,
+                receipt_bytes,
+                source_job_dir or terminal_dir,
+            )
+            self._write_json_atomic(completion_path, event)
+        actual_receipt_digest = hashlib.sha256(receipt_bytes).hexdigest()
+        if event.get("terminal_receipt_sha256") != actual_receipt_digest:
+            raise RuntimeError(
+                f"completion receipt digest mismatch for {request.job_id}"
+            )
+        if not event.get("notification_required", True):
+            return None
+
+        event_path = (
+            self.completion_outbox_dir
+            / f"{request.job_id}-{actual_receipt_digest}.json"
+        )
+        if event_path.exists():
+            existing = json.loads(event_path.read_text())
+            if existing != event:
+                raise RuntimeError(f"conflicting completion outbox event at {event_path}")
+            return event_path
+        self._write_json_atomic(event_path, event)
+        return event_path
+
+    def _terminalize_job(
+        self,
+        request: JobRequest,
+        state: JobState,
+        job_dir: Path,
+        dest_status: str,
+        receipt: dict,
+        *,
+        write_receipt: bool,
+    ) -> Path:
+        receipt_bytes = json.dumps(receipt, indent=2).encode()
+        event = None
+        if request.completion_outbox is not None:
+            terminal_dir = self.queue_dir / dest_status / request.job_id
+            event = self._build_terminal_completion(
+                request,
+                terminal_dir,
+                receipt_bytes,
+                job_dir,
+            )
+            self._write_json_atomic(job_dir / "terminalization.json", {
+                "schema": "gpu-greenroom.terminalization.v1",
+                "destination_status": dest_status,
+                "state": json.loads(state.to_json()),
+                "receipt": receipt,
+                "completion": event,
+            })
+        self._write_text_atomic(job_dir / "status.json", state.to_json())
+        if write_receipt or event is not None:
+            self._write_text_atomic(job_dir / "receipt.json", receipt_bytes.decode())
+        if event is not None:
+            self._write_json_atomic(job_dir / "completion.json", event)
+            self._write_completion_outbox_state(
+                job_dir,
+                event,
+                "pending" if event["notification_required"] else "not_requested",
+            )
+        terminal_dir = self._move_job(job_dir, dest_status)
+        return terminal_dir
+
+    def _materialize_terminal_completion(self, terminal_dir: Path) -> None:
+        completion_path = terminal_dir / "completion.json"
+        if not completion_path.is_file():
+            return
+        event = json.loads(completion_path.read_text())
+        if not event["notification_required"]:
+            self._write_completion_outbox_state(
+                terminal_dir,
+                event,
+                "not_requested",
+            )
+            return
+        request = JobRequest.from_json((terminal_dir / "request.json").read_text())
+        receipt_bytes = (terminal_dir / "receipt.json").read_bytes()
+        try:
+            self._emit_terminal_completion_outbox(
+                request,
+                terminal_dir,
+                receipt_bytes,
+            )
+        except Exception as exc:
+            self._write_completion_outbox_state(
+                terminal_dir,
+                event,
+                "failed",
+                error=f"{type(exc).__name__}: {exc}",
+                increment_attempt=True,
+            )
+        else:
+            self._write_completion_outbox_state(
+                terminal_dir,
+                event,
+                "ready",
+                increment_attempt=True,
+            )
+
+    def _finish_interrupted_terminalization(self, job_dir: Path) -> Path:
+        transaction = json.loads((job_dir / "terminalization.json").read_text())
+        if transaction.get("schema") != "gpu-greenroom.terminalization.v1":
+            raise RuntimeError(f"invalid terminalization transaction in {job_dir}")
+        destination_status = transaction["destination_status"]
+        state = JobState.from_json(json.dumps(transaction["state"]))
+        receipt = transaction["receipt"]
+        event = transaction["completion"]
+        if state.job_id != job_dir.name or event.get("job_id") != job_dir.name:
+            raise RuntimeError(f"terminalization identity mismatch in {job_dir}")
+        if state.status.value != destination_status:
+            raise RuntimeError(f"terminalization destination mismatch in {job_dir}")
+
+        receipt_bytes = json.dumps(receipt, indent=2).encode()
+        self._write_text_atomic(job_dir / "status.json", state.to_json())
+        self._write_text_atomic(job_dir / "receipt.json", receipt_bytes.decode())
+        self._write_json_atomic(job_dir / "completion.json", event)
+        self._write_completion_outbox_state(
+            job_dir,
+            event,
+            "pending" if event["notification_required"] else "not_requested",
+        )
+        terminal_dir = self._move_job(job_dir, destination_status)
+        return terminal_dir
+
+    def reconcile_completion_outbox(self) -> list[str]:
+        """Materialize missing opted-in outbox rows without rerunning jobs."""
+        reconciled = []
+        for terminal_status in ("done", "failed", "cancelled"):
+            terminal_root = self.queue_dir / terminal_status
+            for completion_path in terminal_root.glob("*/completion.json"):
+                terminal_dir = completion_path.parent
+                event = json.loads(completion_path.read_text())
+                if not event.get("notification_required", True):
+                    self._write_completion_outbox_state(
+                        terminal_dir,
+                        event,
+                        "not_requested",
+                    )
+                    continue
+                request = JobRequest.from_json((terminal_dir / "request.json").read_text())
+                receipt_bytes = (terminal_dir / "receipt.json").read_bytes()
+                outbox_path = (
+                    self.completion_outbox_dir
+                    / f"{request.job_id}-{event['terminal_receipt_sha256']}.json"
+                )
+                existed = outbox_path.exists()
+                try:
+                    self._emit_terminal_completion_outbox(
+                        request,
+                        terminal_dir,
+                        receipt_bytes,
+                    )
+                except Exception as exc:
+                    self._write_completion_outbox_state(
+                        terminal_dir,
+                        event,
+                        "failed",
+                        error=f"{type(exc).__name__}: {exc}",
+                        increment_attempt=True,
+                    )
+                    continue
+                self._write_completion_outbox_state(
+                    terminal_dir,
+                    event,
+                    "ready",
+                    increment_attempt=True,
+                )
+                if not existed:
+                    reconciled.append(event["event_id"])
+        return reconciled
 
     def _pid_alive(self, pid: int | None) -> bool | None:
         if pid is None:
@@ -661,6 +1025,7 @@ class GPUQueue:
         Acquires flock to prevent race with run_one().
         """
         lock_fd = open(self.lock_path, "w")
+        terminal_dir_for_outbox = None
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
 
@@ -668,17 +1033,38 @@ class GPUQueue:
             if not pending_dir.exists():
                 return False
 
+            request = JobRequest.from_json((pending_dir / "request.json").read_text())
             state = JobState.from_json((pending_dir / "status.json").read_text())
             state.status = JobStatus.CANCELLED
             state.finished_at = time.time()
-            (pending_dir / "status.json").write_text(state.to_json())
-
-            dest = self.queue_dir / "cancelled" / job_id
-            shutil.move(str(pending_dir), str(dest))
+            receipt = {
+                "job_id": state.job_id,
+                "job_type": state.job_type,
+                "status": state.status.value,
+                "input_path": state.input_path,
+                "output_dir": state.output_dir,
+                "effective_route": state.effective_route,
+                "started_at": state.started_at,
+                "finished_at": state.finished_at,
+                "exit_code": state.exit_code,
+                "failure_phase": state.failure_phase,
+                "error_message": state.error_message,
+                "warnings": state.warnings if state.warnings else None,
+            }
+            terminal_dir_for_outbox = self._terminalize_job(
+                request,
+                state,
+                pending_dir,
+                "cancelled",
+                receipt,
+                write_receipt=False,
+            )
             return True
         finally:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
             lock_fd.close()
+            if terminal_dir_for_outbox is not None:
+                self._materialize_terminal_completion(terminal_dir_for_outbox)
 
     def list_jobs(self, status: JobStatus | None = None) -> list[JobState]:
         """List jobs, optionally filtered by status."""
@@ -831,6 +1217,7 @@ class GPUQueue:
         if lock_fd is None:
             return False
 
+        terminal_dir_for_outbox = None
         try:
             if self.is_paused():
                 return False
@@ -860,8 +1247,28 @@ class GPUQueue:
                 state.failure_phase = "dispatch"
                 state.error_message = f"Unknown job type: {request.job_type}"
                 state.exit_code = -1
-                (job_dir / "status.json").write_text(state.to_json())
-                self._move_job(job_dir, "failed")
+                receipt = {
+                    "job_id": state.job_id,
+                    "job_type": state.job_type,
+                    "status": state.status.value,
+                    "input_path": state.input_path,
+                    "output_dir": state.output_dir,
+                    "effective_route": state.effective_route,
+                    "started_at": state.started_at,
+                    "finished_at": state.finished_at,
+                    "exit_code": state.exit_code,
+                    "failure_phase": state.failure_phase,
+                    "error_message": state.error_message,
+                    "warnings": state.warnings if state.warnings else None,
+                }
+                terminal_dir_for_outbox = self._terminalize_job(
+                    request,
+                    state,
+                    job_dir,
+                    "failed",
+                    receipt,
+                    write_receipt=False,
+                )
                 return True
 
             if isinstance(raw_config, list):
@@ -1100,7 +1507,6 @@ class GPUQueue:
                 state.error_message = "job did not reach a terminal state"
                 state.exit_code = -1
                 dest_status = "failed"
-            (job_dir / "status.json").write_text(state.to_json())
 
             # Write receipt with full route identity
             receipt = {
@@ -1126,14 +1532,22 @@ class GPUQueue:
                 "runtime_identity": runtime_identity,
                 "artifact_manifest": artifact_manifest,
             }
-            (job_dir / "receipt.json").write_text(json.dumps(receipt, indent=2))
 
-            self._move_job(job_dir, dest_status)
+            terminal_dir_for_outbox = self._terminalize_job(
+                request,
+                state,
+                job_dir,
+                dest_status,
+                receipt,
+                write_receipt=True,
+            )
             return True
 
         finally:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
             lock_fd.close()
+            if terminal_dir_for_outbox is not None:
+                self._materialize_terminal_completion(terminal_dir_for_outbox)
 
     def recover_stale(self) -> list[str]:
         """Check for stale running jobs (process no longer alive) and move to failed.
@@ -1142,6 +1556,7 @@ class GPUQueue:
         Returns list of recovered job IDs.
         """
         lock_fd = open(self.lock_path, "w")
+        terminal_dirs_for_outbox = []
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
 
@@ -1151,6 +1566,11 @@ class GPUQueue:
                 return recovered
 
             for job_dir in list(running_dir.iterdir()):
+                if (job_dir / "terminalization.json").is_file():
+                    terminal_dir = self._finish_interrupted_terminalization(job_dir)
+                    terminal_dirs_for_outbox.append(terminal_dir)
+                    recovered.append(terminal_dir.name)
+                    continue
                 status_file = job_dir / "status.json"
                 if not status_file.exists():
                     continue
@@ -1163,12 +1583,12 @@ class GPUQueue:
                         continue
                     except ProcessLookupError:
                         # PID does not exist — stale job
+                        request = JobRequest.from_json((job_dir / "request.json").read_text())
                         state.status = JobStatus.FAILED
                         state.finished_at = time.time()
                         state.failure_phase = "stale_recovery"
                         state.error_message = f"Process {state.pid} no longer alive; recovered by stale detection"
                         state.exit_code = -1
-                        (status_file).write_text(state.to_json())
 
                         receipt = {
                             "job_id": state.job_id,
@@ -1179,11 +1599,19 @@ class GPUQueue:
                             "started_at": state.started_at,
                             "finished_at": state.finished_at,
                         }
-                        (job_dir / "receipt.json").write_text(json.dumps(receipt, indent=2))
-
-                        self._move_job(job_dir, "failed")
+                        terminal_dir = self._terminalize_job(
+                            request,
+                            state,
+                            job_dir,
+                            "failed",
+                            receipt,
+                            write_receipt=True,
+                        )
+                        terminal_dirs_for_outbox.append(terminal_dir)
                         recovered.append(state.job_id)
             return recovered
         finally:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
             lock_fd.close()
+            for terminal_dir in terminal_dirs_for_outbox:
+                self._materialize_terminal_completion(terminal_dir)

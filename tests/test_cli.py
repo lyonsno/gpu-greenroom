@@ -48,6 +48,30 @@ class TestCLISubmit:
         assert req["params"]["seed"] == "123"
         assert req["params"]["resolution"] == "512"
 
+    def test_submit_registers_exact_completion_receiver(self, queue_dir, tmp_path):
+        producer_report = tmp_path / "producer-report.json"
+        rc, out, err = run_cli(
+            "submit", "trellis2mlx", "/tmp/test.png", "/tmp/out",
+            "--completion-target", "asset-consumer",
+            "--completion-target-id", "consumer-asset",
+            "--delivery-mode", "immediate",
+            "--notify-on", "failure",
+            "--producer-report", str(producer_report),
+            queue_dir=queue_dir,
+        )
+
+        assert rc == 0, err
+        assert "Completion target: asset-consumer (consumer-asset)" in out
+        job_dir = next((queue_dir / "pending").iterdir())
+        request = json.loads((job_dir / "request.json").read_text())
+        assert request["completion_outbox"] == {
+            "target_consumer": "asset-consumer",
+            "target_consumer_id": "consumer-asset",
+            "delivery_mode": "immediate",
+            "notify_on": "failure",
+            "producer_report_locator": str(producer_report),
+        }
+
 
 class TestCLIList:
     def test_list_empty(self, queue_dir):
