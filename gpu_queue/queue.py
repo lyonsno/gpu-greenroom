@@ -33,7 +33,15 @@ class GPUQueue:
 
     def __init__(self, queue_dir: str | Path):
         self.queue_dir = Path(queue_dir)
-        for sub in ("pending", "running", "done", "failed", "cancelled", "outputs"):
+        for sub in (
+            "admitting",
+            "pending",
+            "running",
+            "done",
+            "failed",
+            "cancelled",
+            "outputs",
+        ):
             (self.queue_dir / sub).mkdir(parents=True, exist_ok=True)
         for sub in (
             "leases",
@@ -135,6 +143,176 @@ class GPUQueue:
             return True
         finally:
             tmp.unlink(missing_ok=True)
+
+    @staticmethod
+    def _completion_registration_bytes(payload: dict) -> bytes:
+        return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+
+    def _queue_admission_payload(
+        self,
+        request: JobRequest,
+        request_bytes: bytes,
+    ) -> dict:
+        completion_registration = json.loads(request_bytes).get("completion_outbox")
+        registration_digest = None
+        if completion_registration is not None:
+            registration_digest = hashlib.sha256(
+                self._completion_registration_bytes(completion_registration)
+            ).hexdigest()
+        return {
+            "schema": "gpu-greenroom.queue-admission.v1",
+            "job_id": request.job_id,
+            "request_sha256": hashlib.sha256(request_bytes).hexdigest(),
+            "completion_registration_required": completion_registration is not None,
+            "completion_registration_sha256": registration_digest,
+            "admitted_at": time.time(),
+        }
+
+    def _completion_registration_violation(self, job_dir: Path) -> dict | None:
+        """Return a fail-closed admission violation for new-schema jobs.
+
+        Jobs predating queue-admission.v1 remain readable as legacy jobs. Every
+        new submission carries the admission record, so an opted-in request
+        cannot lose its completion registration and still retain execution
+        authority.
+        """
+        admission_path = job_dir / "admission.json"
+        if not admission_path.exists():
+            return None
+        try:
+            admission = json.loads(admission_path.read_text())
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            return {
+                "failure_phase": "queue_admission_invalid",
+                "completion_registration_state": "unknown",
+                "error_message": f"Unreadable queue admission: {type(exc).__name__}: {exc}",
+                "admission": None,
+            }
+        if (
+            admission.get("schema") != "gpu-greenroom.queue-admission.v1"
+            or admission.get("job_id") != job_dir.name
+        ):
+            return {
+                "failure_phase": "queue_admission_invalid",
+                "completion_registration_state": "unknown",
+                "error_message": "Queue admission schema or job identity mismatch",
+                "admission": admission,
+            }
+
+        registration_required = admission.get("completion_registration_required")
+        if not isinstance(registration_required, bool):
+            return {
+                "failure_phase": "queue_admission_invalid",
+                "completion_registration_state": "unknown",
+                "error_message": "Queue admission lacks a boolean registration requirement",
+                "admission": admission,
+            }
+        request_path = job_dir / "request.json"
+        try:
+            request_bytes = request_path.read_bytes()
+            request_payload = json.loads(request_bytes)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            return {
+                "failure_phase": (
+                    "completion_registration_missing"
+                    if registration_required
+                    else "queue_admission_request_invalid"
+                ),
+                "completion_registration_state": (
+                    "missing" if registration_required else "not_requested"
+                ),
+                "error_message": f"Admitted request is unreadable: {type(exc).__name__}: {exc}",
+                "admission": admission,
+            }
+
+        completion_registration = request_payload.get("completion_outbox")
+        if registration_required and not isinstance(completion_registration, dict):
+            return {
+                "failure_phase": "completion_registration_missing",
+                "completion_registration_state": "missing",
+                "error_message": "Admitted opted-in job has no completion registration",
+                "admission": admission,
+            }
+        if not registration_required and completion_registration is not None:
+            return {
+                "failure_phase": "completion_registration_unadmitted",
+                "completion_registration_state": "unexpected",
+                "error_message": "Request gained a completion registration after admission",
+                "admission": admission,
+            }
+
+        actual_request_digest = hashlib.sha256(request_bytes).hexdigest()
+        if admission.get("request_sha256") != actual_request_digest:
+            return {
+                "failure_phase": "queue_admission_request_mismatch",
+                "completion_registration_state": (
+                    "present" if registration_required else "not_requested"
+                ),
+                "error_message": "Admitted request digest no longer matches queue admission",
+                "admission": admission,
+            }
+        if registration_required:
+            actual_registration_digest = hashlib.sha256(
+                self._completion_registration_bytes(completion_registration)
+            ).hexdigest()
+            if admission.get("completion_registration_sha256") != actual_registration_digest:
+                return {
+                    "failure_phase": "completion_registration_mismatch",
+                    "completion_registration_state": "mismatch",
+                    "error_message": "Completion registration digest no longer matches admission",
+                    "admission": admission,
+                }
+        elif admission.get("completion_registration_sha256") is not None:
+            return {
+                "failure_phase": "queue_admission_invalid",
+                "completion_registration_state": "not_requested",
+                "error_message": "Non-opted admission carries a registration digest",
+                "admission": admission,
+            }
+        return None
+
+    def _terminalize_completion_registration_orphan(
+        self,
+        job_dir: Path,
+        state: JobState,
+        violation: dict,
+    ) -> Path:
+        previous_status = state.status
+        execution_disposition = (
+            "not_admitted" if previous_status == JobStatus.PENDING else "lost"
+        )
+        state.status = JobStatus.FAILED
+        state.finished_at = time.time()
+        state.exit_code = -1
+        state.failure_phase = violation["failure_phase"]
+        state.error_message = violation["error_message"]
+        receipt = {
+            "schema": "gpu-greenroom.completion-registration-recovery.v1",
+            "job_id": state.job_id,
+            "job_type": state.job_type,
+            "status": "failed",
+            "previous_status": previous_status.value,
+            "execution_disposition": execution_disposition,
+            "completion_registration_state": violation[
+                "completion_registration_state"
+            ],
+            "failure_phase": state.failure_phase,
+            "error_message": state.error_message,
+            "started_at": state.started_at,
+            "finished_at": state.finished_at,
+            "exit_code": state.exit_code,
+            "effective_route": state.effective_route,
+            "command_replayed": False,
+            "claim_ceiling": "queue_reconciliation_only",
+            "admission": violation.get("admission"),
+        }
+        self._write_text_atomic(job_dir / "status.json", state.to_json())
+        self._write_json_atomic(job_dir / "receipt.json", receipt)
+        self._write_json_atomic(
+            job_dir / "completion-registration-recovery.json",
+            receipt,
+        )
+        return self._move_job(job_dir, "failed")
 
     @staticmethod
     def _file_snapshot(path: Path | None) -> dict:
@@ -1248,17 +1426,20 @@ class GPUQueue:
             request.output_dir_auto_assigned = True
             request.output_dir = str(self.queue_dir / "outputs" / request.job_id)
 
+        admitting_dir = self.queue_dir / "admitting" / request.job_id
         job_dir = self.queue_dir / "pending" / request.job_id
-        job_dir.mkdir(parents=True, exist_ok=True)
+        if admitting_dir.exists() or job_dir.exists():
+            raise FileExistsError(f"job {request.job_id} already exists")
+        admitting_dir.mkdir(parents=True)
 
-        # Write request
-        (job_dir / "request.json").write_text(request.to_json())
+        request_text = request.to_json()
+        request_bytes = request_text.encode()
+        self._write_text_atomic(admitting_dir / "request.json", request_text)
 
         warnings = []
         if self._is_volatile(request.output_dir):
             warnings.append("volatile_output")
 
-        # Write initial status
         state = JobState(
             job_id=request.job_id,
             status=JobStatus.PENDING,
@@ -1269,7 +1450,17 @@ class GPUQueue:
             submitted_at=request.submitted_at,
             warnings=warnings,
         )
-        (job_dir / "status.json").write_text(state.to_json())
+        self._write_text_atomic(admitting_dir / "status.json", state.to_json())
+        self._write_json_atomic(
+            admitting_dir / "admission.json",
+            self._queue_admission_payload(request, request_bytes),
+        )
+
+        # A worker can observe the job only after request, status, registration
+        # requirement, and their digests are all durable in one directory.
+        os.rename(admitting_dir, job_dir)
+        self._fsync_directory(admitting_dir.parent)
+        self._fsync_directory(job_dir.parent)
 
         return job_dir
 
@@ -1287,8 +1478,18 @@ class GPUQueue:
             if not pending_dir.exists():
                 return False
 
-            request = JobRequest.from_json((pending_dir / "request.json").read_text())
             state = JobState.from_json((pending_dir / "status.json").read_text())
+            violation = self._completion_registration_violation(pending_dir)
+            if violation is not None:
+                terminal_dir_for_outbox = (
+                    self._terminalize_completion_registration_orphan(
+                        pending_dir,
+                        state,
+                        violation,
+                    )
+                )
+                return True
+            request = JobRequest.from_json((pending_dir / "request.json").read_text())
             state.status = JobStatus.CANCELLED
             state.finished_at = time.time()
             receipt = {
@@ -1487,13 +1688,23 @@ class GPUQueue:
             if job_dir is None:
                 return False
 
+            state = JobState.from_json((job_dir / "status.json").read_text())
+            violation = self._completion_registration_violation(job_dir)
+            if violation is not None:
+                terminal_dir_for_outbox = (
+                    self._terminalize_completion_registration_orphan(
+                        job_dir,
+                        state,
+                        violation,
+                    )
+                )
+                return True
             request = JobRequest.from_json((job_dir / "request.json").read_text())
 
             # Move to running
             job_dir = self._move_job(job_dir, "running")
 
             # Update status
-            state = JobState.from_json((job_dir / "status.json").read_text())
             state.status = JobStatus.RUNNING
             state.started_at = time.time()
             state.pid = os.getpid()
@@ -1837,6 +2048,23 @@ class GPUQueue:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
 
             recovered = []
+            pending_dir = self.queue_dir / "pending"
+            for job_dir in list(pending_dir.iterdir()):
+                status_file = job_dir / "status.json"
+                if not status_file.exists():
+                    continue
+                state = JobState.from_json(status_file.read_text())
+                violation = self._completion_registration_violation(job_dir)
+                if violation is None:
+                    continue
+                terminal_dir = self._terminalize_completion_registration_orphan(
+                    job_dir,
+                    state,
+                    violation,
+                )
+                terminal_dirs_for_outbox.append(terminal_dir)
+                recovered.append(state.job_id)
+
             running_dir = self.queue_dir / "running"
             if not running_dir.exists():
                 return recovered
@@ -1851,6 +2079,16 @@ class GPUQueue:
                 if not status_file.exists():
                     continue
                 state = JobState.from_json(status_file.read_text())
+                violation = self._completion_registration_violation(job_dir)
+                if violation is not None:
+                    terminal_dir = self._terminalize_completion_registration_orphan(
+                        job_dir,
+                        state,
+                        violation,
+                    )
+                    terminal_dirs_for_outbox.append(terminal_dir)
+                    recovered.append(state.job_id)
+                    continue
                 if state.pid is not None:
                     try:
                         os.kill(state.pid, 0)  # check if process is alive
