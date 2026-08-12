@@ -856,6 +856,30 @@ class TestTerminalCompletionOutbox:
         assert len(event_paths) == 1
         return event_paths[0], json.loads(event_paths[0].read_text())
 
+    def _inject_admitted_registration_orphan(self, job_dir, request):
+        """Model a crash-persisted admission whose opt-in registration vanished."""
+        request_path = job_dir / "request.json"
+        original_bytes = request_path.read_bytes()
+        original_payload = json.loads(original_bytes)
+        completion_registration = original_payload["completion_outbox"]
+        registration_bytes = json.dumps(
+            completion_registration,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        (job_dir / "admission.json").write_text(json.dumps({
+            "schema": "gpu-greenroom.queue-admission.v1",
+            "job_id": request.job_id,
+            "request_sha256": hashlib.sha256(original_bytes).hexdigest(),
+            "completion_registration_required": True,
+            "completion_registration_sha256": hashlib.sha256(
+                registration_bytes
+            ).hexdigest(),
+            "admitted_at": request.submitted_at,
+        }, indent=2))
+        original_payload["completion_outbox"] = None
+        request_path.write_text(json.dumps(original_payload, indent=2))
+
     def _assert_terminal_event(self, queue, request, terminal_status, failure_phase=None):
         terminal_dir = queue.queue_dir / terminal_status / request.job_id
         receipt_path = terminal_dir / "receipt.json"
@@ -885,6 +909,52 @@ class TestTerminalCompletionOutbox:
         restored = JobRequest.from_json(json.dumps(payload))
 
         assert restored.completion_outbox == request.completion_outbox
+
+    def test_admitted_pending_registration_orphan_never_executes(
+        self, queue, monkeypatch
+    ):
+        request = self._opted_request()
+        job_dir = queue.submit(request)
+        self._inject_admitted_registration_orphan(job_dir, request)
+
+        def forbidden_execution(*args, **kwargs):
+            raise AssertionError("registration-orphaned command was executed")
+
+        monkeypatch.setattr("gpu_queue.queue.subprocess.run", forbidden_execution)
+
+        assert queue.run_one({request.job_type: ["ignored"]}) is True
+
+        terminal_dir = queue.queue_dir / "failed" / request.job_id
+        state = JobState.from_json((terminal_dir / "status.json").read_text())
+        receipt = json.loads((terminal_dir / "receipt.json").read_text())
+        assert state.failure_phase == "completion_registration_missing"
+        assert receipt["execution_disposition"] == "not_admitted"
+        assert receipt["command_replayed"] is False
+        assert receipt["completion_registration_state"] == "missing"
+        assert list(queue.completion_outbox_dir.glob("*.json")) == []
+
+    def test_admitted_running_registration_orphan_recovers_as_lost(self, queue):
+        request = self._opted_request()
+        job_dir = queue.submit(request)
+        self._inject_admitted_registration_orphan(job_dir, request)
+        running_dir = queue.queue_dir / "running" / request.job_id
+        job_dir.rename(running_dir)
+        state = JobState.from_json((running_dir / "status.json").read_text())
+        state.status = JobStatus.RUNNING
+        state.started_at = time.time() - 100
+        state.pid = 99999999
+        (running_dir / "status.json").write_text(state.to_json())
+
+        assert queue.recover_stale() == [request.job_id]
+
+        terminal_dir = queue.queue_dir / "failed" / request.job_id
+        state = JobState.from_json((terminal_dir / "status.json").read_text())
+        receipt = json.loads((terminal_dir / "receipt.json").read_text())
+        assert state.failure_phase == "completion_registration_missing"
+        assert receipt["execution_disposition"] == "lost"
+        assert receipt["command_replayed"] is False
+        assert receipt["completion_registration_state"] == "missing"
+        assert list(queue.completion_outbox_dir.glob("*.json")) == []
 
     def test_success_emits_completion_with_terminal_locators(self, queue, echo_job_types):
         request = self._opted_request(input_path="/tmp/completion.png")

@@ -100,6 +100,7 @@ gpu-greenroom bump wait resident-cold-load --timeout 600
   paused                # present when queue is paused (touch to pause, rm to resume)
   job_types.json        # optional: custom job type configs (overrides defaults)
   outputs/              # durable output directory for jobs submitted without explicit output_dir
+  admitting/            # fully written submissions not yet visible to workers
   leases/
     current.json        # current external lease, released lease, handoff, or ownership_unknown
     receipts/           # claim, renew, release, handoff, and unknown-state receipts
@@ -112,6 +113,7 @@ gpu-greenroom bump wait resident-cold-load --timeout 600
       <job-id>-<receipt-sha256>.json # immutable A2 publisher input
   pending/
     <job-id>/
+      admission.json    # request/registration digests that grant queue authority
       request.json      # what was submitted
       status.json       # current state
   running/              # at most one job
@@ -142,7 +144,14 @@ Override the queue directory with `GPU_GREENROOM_DIR` or `--queue-dir`.
 
 Completion delivery is opt-in. Registration binds both the consumer name and
 stable consumer id, delivery cadence, and `always` versus `failure` policy into
-`request.json`. The queue worker, pending cancellation, and stale recovery
+`request.json`. Submission writes request, pending status, and an admission
+record into `admitting/`, fsyncs them, and only then atomically publishes the
+complete directory under `pending/`. The admission record binds the exact
+request and completion-registration digests. If an admitted opted-in queued or
+running job later lacks that registration, worker dispatch and startup recovery
+move it to `failed` with an explicit `not_admitted` or `lost` local receipt;
+they do not run or rerun the command and do not manufacture an outbox event
+without receiver authority. The queue worker, pending cancellation, and stale recovery
 remain the only terminal authorities. They first write one replayable local
 terminalization transaction and move the job to its terminal bucket while
 holding `gpu.lock`; only after releasing that lock does Greenroom materialize
