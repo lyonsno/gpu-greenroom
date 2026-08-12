@@ -43,6 +43,7 @@ class CompletionOutboxRequest:
     delivery_mode: str
     notify_on: str = "always"
     producer_report_locator: str | None = None
+    evidence_manifest_locator: str | None = None
 
     def __post_init__(self) -> None:
         if not self.target_consumer:
@@ -60,6 +61,11 @@ class CompletionOutboxRequest:
             and not Path(self.producer_report_locator).expanduser().is_absolute()
         ):
             raise ValueError("completion outbox producer_report_locator must be absolute")
+        if (
+            self.evidence_manifest_locator is not None
+            and not Path(self.evidence_manifest_locator).expanduser().is_absolute()
+        ):
+            raise ValueError("completion outbox evidence_manifest_locator must be absolute")
 
 
 @dataclass
@@ -71,6 +77,7 @@ class JobRequest:
     job_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     submitted_at: float = field(default_factory=time.time)
     completion_outbox: CompletionOutboxRequest | None = None
+    output_dir_auto_assigned: bool = False
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2)
