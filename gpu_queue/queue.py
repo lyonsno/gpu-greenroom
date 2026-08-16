@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import select
@@ -757,6 +758,61 @@ class GPUQueue:
         shutil.move(str(job_dir), str(dest))
         return dest
 
+    @staticmethod
+    def _file_artifact(path: Path, *, recorded_path: str | None = None) -> dict:
+        if not path.is_file():
+            raise FileNotFoundError(f"artifact is not a file: {path}")
+        digest = hashlib.sha256()
+        with path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return {
+            "path": recorded_path if recorded_path is not None else str(path),
+            "sha256": digest.hexdigest(),
+            "size_bytes": path.stat().st_size,
+        }
+
+    @staticmethod
+    def _git_source_snapshot(input_path: Path) -> dict:
+        if not input_path.is_file():
+            raise FileNotFoundError(f"attested input is not a file: {input_path}")
+
+        def git(*args: str) -> str:
+            result = subprocess.run(
+                ["git", "-C", str(input_path.parent), *args],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            return result.stdout.strip()
+
+        root = git("rev-parse", "--show-toplevel")
+        commit = git("rev-parse", "HEAD")
+        status = git("status", "--porcelain=v1", "--untracked-files=all")
+        return {
+            "root": root,
+            "commit": commit,
+            "clean": not bool(status),
+            "status": status.splitlines(),
+        }
+
+    @classmethod
+    def _terminal_artifact_manifest(cls, output_dir: Path, patterns: list[str]) -> list[dict]:
+        manifest = {}
+        for pattern in patterns:
+            pattern_path = Path(pattern)
+            if pattern_path.is_absolute() or ".." in pattern_path.parts:
+                raise ValueError(f"artifact manifest pattern must stay under output_dir: {pattern}")
+            matches = sorted(output_dir.glob(pattern))
+            if not matches:
+                raise FileNotFoundError(f"artifact manifest pattern matched no files: {pattern}")
+            for path in matches:
+                if not path.is_file():
+                    raise ValueError(f"artifact manifest matched a non-file: {path}")
+                relative = path.relative_to(output_dir).as_posix()
+                manifest[relative] = cls._file_artifact(path, recorded_path=relative)
+        return [manifest[path] for path in sorted(manifest)]
+
     def run_one(self, job_types: dict[str, list[str]]) -> bool:
         """Pick and run the next pending job under flock.
 
@@ -815,6 +871,9 @@ class GPUQueue:
                 job_env = None
                 job_defaults = {}
                 job_timeout = None
+                source_attestation_mode = None
+                runtime_identity_template = None
+                artifact_manifest_patterns = None
             else:
                 # Rich dict config
                 cmd_template = raw_config["cmd"]
@@ -822,6 +881,9 @@ class GPUQueue:
                 job_env = raw_config.get("env")
                 job_defaults = raw_config.get("defaults", {})
                 job_timeout = raw_config.get("timeout")  # None = no timeout
+                source_attestation_mode = raw_config.get("source_attestation")
+                runtime_identity_template = raw_config.get("runtime_identity_cmd")
+                artifact_manifest_patterns = raw_config.get("artifact_manifest")
 
             # Per-job overrides: cwd and env from params (removed before template subs)
             OVERRIDE_KEYS = {"cwd", "env"}
@@ -866,18 +928,82 @@ class GPUQueue:
             (job_dir / "status.json").write_text(state.to_json())
 
             # Ensure output directory exists
-            os.makedirs(request.output_dir, exist_ok=True)
-
-            # Build subprocess environment
             run_env = None
             if job_env:
                 run_env = {**os.environ, **job_env}
+
+            input_artifact = None
+            source_attestation = None
+            runtime_identity = None
+            artifact_manifest = None
+            dest_status = "failed"
+
+            if source_attestation_mode not in (None, "git-clean-input"):
+                state.status = JobStatus.FAILED
+                state.failure_phase = "source_preflight"
+                state.error_message = f"Unsupported source attestation mode: {source_attestation_mode}"
+                state.exit_code = -1
+
+            if state.status == JobStatus.RUNNING and source_attestation_mode == "git-clean-input":
+                try:
+                    input_path = Path(request.input_path)
+                    input_artifact = self._file_artifact(input_path, recorded_path=request.input_path)
+                    snapshot = self._git_source_snapshot(input_path)
+                    source_attestation = {
+                        "mode": source_attestation_mode,
+                        "root": snapshot["root"],
+                        "commit": snapshot["commit"],
+                        "clean_before": snapshot["clean"],
+                        "status_before": snapshot["status"],
+                    }
+                    if not snapshot["clean"]:
+                        raise RuntimeError("attested input source is not clean")
+                except Exception as exc:
+                    state.status = JobStatus.FAILED
+                    state.failure_phase = "source_preflight"
+                    state.error_message = str(exc)
+                    state.exit_code = -1
+
+            if state.status == JobStatus.RUNNING and runtime_identity_template:
+                runtime_cmd = [safe_substitute(part, subs) for part in runtime_identity_template]
+                try:
+                    probe = subprocess.run(
+                        runtime_cmd,
+                        capture_output=True,
+                        text=True,
+                        cwd=job_cwd,
+                        env=run_env,
+                    )
+                    runtime_identity = {
+                        "command": runtime_cmd,
+                        "exit_code": probe.returncode,
+                        "stdout": probe.stdout,
+                        "stderr": probe.stderr,
+                    }
+                    executable = Path(runtime_cmd[0])
+                    if not executable.is_file():
+                        resolved = shutil.which(runtime_cmd[0])
+                        executable = Path(resolved) if resolved else executable
+                    if executable.is_file():
+                        runtime_identity["executable"] = self._file_artifact(executable)
+                    if probe.returncode != 0:
+                        raise RuntimeError(f"runtime identity command exited with code {probe.returncode}")
+                except Exception as exc:
+                    state.status = JobStatus.FAILED
+                    state.failure_phase = "runtime_identity"
+                    state.error_message = str(exc)
+                    state.exit_code = runtime_identity["exit_code"] if runtime_identity else -1
+
+            if state.status == JobStatus.RUNNING:
+                os.makedirs(request.output_dir, exist_ok=True)
 
             # Execute
             stdout_path = job_dir / "stdout.log"
             stderr_path = job_dir / "stderr.log"
 
             try:
+                if state.status != JobStatus.RUNNING:
+                    raise RuntimeError("preflight failed")
                 with open(stdout_path, "w") as out_f, open(stderr_path, "w") as err_f:
                     proc = subprocess.run(
                         cmd,
@@ -903,13 +1029,77 @@ class GPUQueue:
                 state.exit_code = -1
                 dest_status = "failed"
             except Exception as e:
-                state.status = JobStatus.FAILED
-                state.failure_phase = "launch"
-                state.error_message = str(e)
-                state.exit_code = -1
-                dest_status = "failed"
+                if state.status != JobStatus.RUNNING:
+                    pass
+                else:
+                    state.status = JobStatus.FAILED
+                    state.failure_phase = "launch"
+                    state.error_message = str(e)
+                    state.exit_code = -1
+                    dest_status = "failed"
+
+            if state.status == JobStatus.DONE and source_attestation_mode == "git-clean-input":
+                try:
+                    snapshot = self._git_source_snapshot(Path(request.input_path))
+                    source_attestation.update({
+                        "commit_after": snapshot["commit"],
+                        "clean_after": snapshot["clean"],
+                        "status_after": snapshot["status"],
+                    })
+                    if (
+                        not snapshot["clean"]
+                        or snapshot["root"] != source_attestation["root"]
+                        or snapshot["commit"] != source_attestation["commit"]
+                        or self._file_artifact(
+                            Path(request.input_path), recorded_path=request.input_path
+                        ) != input_artifact
+                    ):
+                        raise RuntimeError("attested input source changed during execution")
+                except Exception as exc:
+                    state.status = JobStatus.FAILED
+                    state.failure_phase = "source_postflight"
+                    state.error_message = str(exc)
+                    state.exit_code = -1
+                    dest_status = "failed"
 
             state.finished_at = time.time()
+
+            # Metadata must exist before terminal artifacts are hashed.
+            if state.status == JobStatus.DONE:
+                try:
+                    self._write_metadata_sidecar(request, state)
+                except Exception as exc:
+                    state.status = JobStatus.FAILED
+                    state.failure_phase = "metadata"
+                    state.error_message = str(exc)
+                    state.exit_code = -1
+                    dest_status = "failed"
+
+            if state.status == JobStatus.DONE and artifact_manifest_patterns:
+                try:
+                    artifact_manifest = self._terminal_artifact_manifest(
+                        Path(request.output_dir), artifact_manifest_patterns
+                    )
+                except Exception as exc:
+                    state.status = JobStatus.FAILED
+                    state.failure_phase = "artifact_manifest"
+                    state.error_message = str(exc)
+                    state.exit_code = -1
+                    dest_status = "failed"
+
+            if source_attestation is not None and "clean_after" not in source_attestation:
+                source_attestation["clean_after"] = None
+                source_attestation["status_after"] = None
+
+            if state.status == JobStatus.FAILED and dest_status != "failed":
+                dest_status = "failed"
+
+            if state.status == JobStatus.RUNNING:
+                state.status = JobStatus.FAILED
+                state.failure_phase = "launch"
+                state.error_message = "job did not reach a terminal state"
+                state.exit_code = -1
+                dest_status = "failed"
             (job_dir / "status.json").write_text(state.to_json())
 
             # Write receipt with full route identity
@@ -931,12 +1121,12 @@ class GPUQueue:
                 "failure_phase": state.failure_phase,
                 "error_message": state.error_message,
                 "warnings": state.warnings if state.warnings else None,
+                "input_artifact": input_artifact,
+                "source_attestation": source_attestation,
+                "runtime_identity": runtime_identity,
+                "artifact_manifest": artifact_manifest,
             }
             (job_dir / "receipt.json").write_text(json.dumps(receipt, indent=2))
-
-            # Write metadata sidecar into output_dir for asset browsers
-            if state.status == JobStatus.DONE:
-                self._write_metadata_sidecar(request, state)
 
             self._move_job(job_dir, dest_status)
             return True

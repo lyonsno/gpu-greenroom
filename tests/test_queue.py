@@ -10,8 +10,11 @@ Evidence harness contract (from Kynormous council pressure):
 """
 
 import fcntl
+import hashlib
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -551,6 +554,167 @@ class TestRichJobTypeConfig:
 # --- Receipt route identity ---
 
 class TestReceiptRouteIdentity:
+    @staticmethod
+    def _committed_source_repo(tmp_path, script_body):
+        source_root = tmp_path / "source"
+        source_root.mkdir()
+        script = source_root / "worker.py"
+        script.write_text(script_body)
+        subprocess.run(["git", "init", "-q"], cwd=source_root, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=source_root, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=source_root, check=True)
+        subprocess.run(["git", "add", "worker.py"], cwd=source_root, check=True)
+        subprocess.run(["git", "commit", "-qm", "fixture"], cwd=source_root, check=True)
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=source_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        return source_root, script, commit
+
+    def test_attested_receipt_binds_source_runtime_and_terminal_outputs(self, queue, tmp_path):
+        source_root, script, commit = self._committed_source_repo(
+            tmp_path,
+            "import pathlib, sys\n"
+            "out = pathlib.Path(sys.argv[1])\n"
+            "out.mkdir(parents=True, exist_ok=True)\n"
+            "(out / 'result.txt').write_text('bound output')\n",
+        )
+        out = tmp_path / "out"
+        req = make_request(job_type="t", input_path=str(script), output_dir=str(out))
+        queue.submit(req)
+        job_types = {
+            "t": {
+                "cmd": [sys.executable, "{input_path}", "{output_dir}"],
+                "source_attestation": "git-clean-input",
+                "runtime_identity_cmd": [
+                    sys.executable,
+                    "-c",
+                    "print('FixtureRuntime 1.2')",
+                ],
+                "artifact_manifest": ["result.txt", "metadata.json"],
+            }
+        }
+
+        queue.run_one(job_types)
+
+        receipt = json.loads((queue.queue_dir / "done" / req.job_id / "receipt.json").read_text())
+        assert receipt["input_artifact"] == {
+            "path": str(script),
+            "sha256": hashlib.sha256(script.read_bytes()).hexdigest(),
+            "size_bytes": script.stat().st_size,
+        }
+        assert receipt["source_attestation"]["root"] == str(source_root)
+        assert receipt["source_attestation"]["commit"] == commit
+        assert receipt["source_attestation"]["clean_before"] is True
+        assert receipt["source_attestation"]["clean_after"] is True
+        assert receipt["runtime_identity"]["exit_code"] == 0
+        assert receipt["runtime_identity"]["stdout"].strip() == "FixtureRuntime 1.2"
+        assert receipt["artifact_manifest"] == [
+            {
+                "path": "metadata.json",
+                "sha256": hashlib.sha256((out / "metadata.json").read_bytes()).hexdigest(),
+                "size_bytes": (out / "metadata.json").stat().st_size,
+            },
+            {
+                "path": "result.txt",
+                "sha256": hashlib.sha256((out / "result.txt").read_bytes()).hexdigest(),
+                "size_bytes": (out / "result.txt").stat().st_size,
+            },
+        ]
+
+    def test_dirty_attested_source_fails_before_execution(self, queue, tmp_path):
+        _source_root, script, _commit = self._committed_source_repo(
+            tmp_path,
+            "import pathlib, sys\npathlib.Path(sys.argv[1]).write_text('ran')\n",
+        )
+        script.write_text(script.read_text() + "# dirty\n")
+        marker = tmp_path / "marker"
+        req = make_request(job_type="t", input_path=str(script), output_dir=str(marker))
+        queue.submit(req)
+
+        queue.run_one({
+            "t": {
+                "cmd": [sys.executable, "{input_path}", "{output_dir}"],
+                "source_attestation": "git-clean-input",
+            }
+        })
+
+        state = queue.get_job(req.job_id)
+        assert state.status == JobStatus.FAILED
+        assert state.failure_phase == "source_preflight"
+        assert not marker.exists()
+        receipt = json.loads((queue.queue_dir / "failed" / req.job_id / "receipt.json").read_text())
+        assert receipt["source_attestation"]["clean_before"] is False
+
+    def test_runtime_probe_failure_prevents_execution(self, queue, tmp_path):
+        marker = tmp_path / "marker"
+        req = make_request(job_type="t", output_dir=str(marker))
+        queue.submit(req)
+
+        queue.run_one({
+            "t": {
+                "cmd": ["sh", "-c", "echo ran > {output_dir}"],
+                "runtime_identity_cmd": [sys.executable, "-c", "raise SystemExit(7)"],
+            }
+        })
+
+        state = queue.get_job(req.job_id)
+        assert state.status == JobStatus.FAILED
+        assert state.failure_phase == "runtime_identity"
+        assert not marker.exists()
+        receipt = json.loads((queue.queue_dir / "failed" / req.job_id / "receipt.json").read_text())
+        assert receipt["runtime_identity"]["exit_code"] == 7
+
+    def test_attested_source_mutation_during_execution_fails_postflight(self, queue, tmp_path):
+        _source_root, script, _commit = self._committed_source_repo(
+            tmp_path,
+            "import pathlib, sys\n"
+            "pathlib.Path(__file__).write_text(pathlib.Path(__file__).read_text() + '# changed\\n')\n"
+            "out = pathlib.Path(sys.argv[1])\n"
+            "out.mkdir(parents=True, exist_ok=True)\n"
+            "(out / 'result.txt').write_text('untrusted')\n",
+        )
+        out = tmp_path / "out"
+        req = make_request(job_type="t", input_path=str(script), output_dir=str(out))
+        queue.submit(req)
+
+        queue.run_one({
+            "t": {
+                "cmd": [sys.executable, "{input_path}", "{output_dir}"],
+                "source_attestation": "git-clean-input",
+                "artifact_manifest": ["result.txt"],
+            }
+        })
+
+        state = queue.get_job(req.job_id)
+        assert state.status == JobStatus.FAILED
+        assert state.failure_phase == "source_postflight"
+        receipt = json.loads((queue.queue_dir / "failed" / req.job_id / "receipt.json").read_text())
+        assert receipt["source_attestation"]["clean_before"] is True
+        assert receipt["source_attestation"]["clean_after"] is False
+
+    def test_missing_terminal_artifact_fails_with_durable_receipt(self, queue, tmp_path):
+        out = tmp_path / "out"
+        req = make_request(job_type="t", output_dir=str(out))
+        queue.submit(req)
+
+        queue.run_one({
+            "t": {
+                "cmd": ["sh", "-c", "true"],
+                "artifact_manifest": ["required.png"],
+            }
+        })
+
+        state = queue.get_job(req.job_id)
+        assert state.status == JobStatus.FAILED
+        assert state.failure_phase == "artifact_manifest"
+        receipt = json.loads((queue.queue_dir / "failed" / req.job_id / "receipt.json").read_text())
+        assert receipt["status"] == "failed"
+        assert "matched no files" in receipt["error_message"]
+
     def test_receipt_records_effective_cwd(self, queue, tmp_path):
         out = str(tmp_path / "out")
         work_dir = str(tmp_path / "workdir")
