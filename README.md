@@ -83,6 +83,20 @@ gpu-greenroom bump decline resident-cold-load --declined-by neural-fire --reason
 gpu-greenroom bump wait resident-cold-load --timeout 600
 ```
 
+## Generator operating guidance
+
+Greenroom owns execution serialization, route identity, and receipts. Prompting,
+source-plate preparation, and route-comparison practice live in the
+[generator field guide](docs/generator-field-guide.md). Read it before designing
+an image-conditioning or image-to-3D assay; in particular, do not let Greenroom
+route success stand in for model-quality evidence.
+
+Implementation-specific setup remains in each generator repository's README:
+
+- `~/dev/mlx-ideogram4/README.md` for FLUX/MFLUX;
+- `~/dev/trellis2mlx/README.md` for TRELLIS.2 on Apple Silicon;
+- `~/dev/sf3d/README.md` for Stable Fast 3D.
+
 ## Queue directory layout
 
 ```
