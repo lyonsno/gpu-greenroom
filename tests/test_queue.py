@@ -103,6 +103,33 @@ class TestSubmit:
         assert state.job_id == req.job_id
         assert state.warnings == ["volatile_output"]
 
+    def test_submit_rejects_partial_cooperation_metadata(self, queue):
+        request = make_request()
+        request.yields_to_waiters = True
+
+        with pytest.raises(ValueError, match="cooperation metadata"):
+            queue.submit(request)
+
+        assert queue.list_jobs() == []
+
+    def test_submit_receipt_does_not_invent_yield_notice(self, queue):
+        running = make_request()
+        running_dir = queue.submit(running)
+        destination = queue.queue_dir / "running" / running.job_id
+        running_dir.rename(destination)
+        state = JobState.from_json((destination / "status.json").read_text())
+        state.status = JobStatus.RUNNING
+        state.started_at = time.time()
+        (destination / "status.json").write_text(state.to_json())
+
+        submitted = make_request()
+        submitted_dir = queue.submit(submitted)
+        receipt = json.loads((submitted_dir / "submission_receipt.json").read_text())
+
+        assert receipt["running_job"]["job_id"] == running.job_id
+        assert receipt["running_job"]["yields_to_waiters"] is False
+        assert receipt["notice"] is None
+
 
 # --- Execution ---
 

@@ -25,6 +25,14 @@ gpu-greenroom submit trellis2mlx /path/to/image.png /path/to/output/
 # Submit with custom params
 gpu-greenroom submit trellis2mlx /path/to/image.png /path/to/output/ -p seed=99 resolution=768
 
+# Submit a cooperative, self-resubmitting route. The four cooperation flags are
+# one contract: partial metadata is rejected instead of implying a false yield.
+gpu-greenroom submit command /path/to/request.json /path/to/output/ \
+  --route-identity sjb/grid48-curriculum-r1 \
+  --yields-to-waiters \
+  --expected-handoff-seconds 60 \
+  --generation 3
+
 # List queue
 gpu-greenroom list
 gpu-greenroom list -s pending
@@ -117,6 +125,7 @@ Implementation-specific setup remains in each generator repository's README:
     <job-id>/
       request.json      # what was submitted
       status.json       # current state
+      submission_receipt.json  # queue identity and observed running-job cooperation
   running/              # at most one job
     <job-id>/
       request.json
@@ -137,6 +146,23 @@ Implementation-specific setup remains in each generator repository's README:
 ```
 
 Override the queue directory with `GPU_GREENROOM_DIR` or `--queue-dir`.
+
+## Cooperative queued-job visibility
+
+A queued job may publish a stable `route_identity` independently. A route that
+promises to yield when another job arrives must also publish the complete
+cooperation contract: `yields_to_waiters=true`, a positive
+`expected_handoff_seconds`, and a lineage `generation` of at least 1. Submission
+rejects partial contracts before creating the job directory.
+
+`list` renders the route identity, yield bound, and generation. At submit time,
+Greenroom observes the current `running/` status and writes
+`submission_receipt.json`. A valid cooperation contract produces a decision-time
+notice such as `Current running job sjb/grid48-curriculum-r1 is yield-aware;
+expect the GPU within <=60s`. Missing, unreadable, multiple, or internally
+inconsistent running-job state produces an explicit warning and no yield
+promise. The receipt preserves the effective queue directory, submitted-job
+cooperation fields, observed running-job fields, validation result, and notice.
 
 ## Cooperative external leases and bumps
 
@@ -288,4 +314,4 @@ Uses `flock(LOCK_EX | LOCK_NB)` on `gpu.lock`. Only one worker can run a job at 
 uv run --extra test python -m pytest tests/ -v
 ```
 
-105 tests covering serialization, failure receipts, stale recovery, cancel safety, FIFO order, param injection prevention, rich config (cwd/env/defaults), receipt route identity, configurable timeout, pause/resume, durable output dirs, volatile path warnings, CLI, cooperative external leases, bump handoffs, ownership-unknown lease expiry, dead/live PID handling, duplicate bump requests, concurrent grants, release/grant races, handoff identity binding, wait wakeup races, and worker race prevention.
+124 tests covering serialization, failure receipts, stale recovery, cancel safety, FIFO order, param injection prevention, rich config (cwd/env/defaults), receipt route identity, configurable timeout, pause/resume, durable output dirs, volatile path warnings, CLI, cooperative queued-job visibility, submission-time evidence, cooperative external leases, bump handoffs, ownership-unknown lease expiry, dead/live PID handling, duplicate bump requests, concurrent grants, release/grant races, handoff identity binding, wait wakeup races, and worker race prevention.

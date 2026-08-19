@@ -17,6 +17,13 @@ from pathlib import Path
 from .models import BumpRequest, BumpStatus, ExternalLease, JobRequest, JobState, JobStatus, LeaseStatus
 
 
+def _format_seconds(value: float | None) -> str:
+    if value is None:
+        return "unknown"
+    value = float(value)
+    return str(int(value)) if value.is_integer() else f"{value:g}"
+
+
 class GPUQueue:
     """Filesystem-backed job queue.
 
@@ -627,6 +634,8 @@ class GPUQueue:
         queue_dir/outputs/<job_id>/. If output_dir is under /tmp or
         /private/tmp, records a volatile_output warning.
         """
+        request.validate_cooperation()
+
         if not request.output_dir:
             request.output_dir = str(self.queue_dir / "outputs" / request.job_id)
 
@@ -648,12 +657,79 @@ class GPUQueue:
             input_path=request.input_path,
             output_dir=request.output_dir,
             params=request.params,
+            route_identity=request.route_identity,
+            yields_to_waiters=request.yields_to_waiters,
+            expected_handoff_seconds=request.expected_handoff_seconds,
+            generation=request.generation,
             submitted_at=request.submitted_at,
             warnings=warnings,
         )
         (job_dir / "status.json").write_text(state.to_json())
 
+        running_job, observation_error = self._observe_running_job()
+        running_payload = None
+        notice = None
+        if running_job is not None:
+            cooperation_error = running_job.cooperation_error()
+            running_payload = {
+                "job_id": running_job.job_id,
+                "route_identity": running_job.route_identity,
+                "yields_to_waiters": running_job.yields_to_waiters,
+                "expected_handoff_seconds": running_job.expected_handoff_seconds,
+                "generation": running_job.generation,
+                "cooperation_valid": cooperation_error is None,
+                "cooperation_error": cooperation_error,
+            }
+            if running_job.yields_to_waiters and cooperation_error is None:
+                seconds = _format_seconds(running_job.expected_handoff_seconds)
+                notice = f"current running job is yield-aware; expect the GPU within <={seconds}s"
+        submission_receipt = {
+            "schema": "gpu-greenroom.submission-receipt.v1",
+            "job_id": request.job_id,
+            "submitted_at": request.submitted_at,
+            "effective_queue_dir": str(self.queue_dir.resolve()),
+            "submitted_job": {
+                "route_identity": request.route_identity,
+                "yields_to_waiters": request.yields_to_waiters,
+                "expected_handoff_seconds": request.expected_handoff_seconds,
+                "generation": request.generation,
+            },
+            "running_observation": "unverified" if observation_error else (
+                "observed" if running_job is not None else "none"
+            ),
+            "running_observation_error": observation_error,
+            "running_job": running_payload,
+            "notice": notice,
+        }
+        self._write_json_atomic(job_dir / "submission_receipt.json", submission_receipt)
+
         return job_dir
+
+    def _observe_running_job(self) -> tuple[JobState | None, str | None]:
+        try:
+            running_dirs = sorted(path for path in (self.queue_dir / "running").iterdir() if path.is_dir())
+        except OSError as exc:
+            return None, f"could not inspect running jobs: {exc}"
+        if not running_dirs:
+            return None, None
+        if len(running_dirs) != 1:
+            return None, f"expected at most one running job, found {len(running_dirs)}"
+        status_path = running_dirs[0] / "status.json"
+        if not status_path.exists():
+            return None, f"running job {running_dirs[0].name} has no status.json"
+        try:
+            state = JobState.from_json(status_path.read_text())
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            return None, f"could not read running job {running_dirs[0].name}: {exc}"
+        if state.job_id != running_dirs[0].name:
+            return None, (
+                f"running directory {running_dirs[0].name} contains status for job {state.job_id}"
+            )
+        if state.status != JobStatus.RUNNING:
+            return None, (
+                f"running job {state.job_id} has stale status {state.status.value}"
+            )
+        return state, None
 
     def cancel(self, job_id: str) -> bool:
         """Cancel a pending job. Returns True if cancelled, False if not found/not pending.

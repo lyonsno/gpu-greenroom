@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 import uuid
 from dataclasses import dataclass, field, asdict, fields
@@ -40,8 +41,22 @@ class JobRequest:
     input_path: str
     output_dir: str = ""
     params: dict[str, Any] = field(default_factory=dict)
+    route_identity: str | None = None
+    yields_to_waiters: bool = False
+    expected_handoff_seconds: float | None = None
+    generation: int | None = None
     job_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     submitted_at: float = field(default_factory=time.time)
+
+    def validate_cooperation(self) -> None:
+        error = _cooperation_error(
+            route_identity=self.route_identity,
+            yields_to_waiters=self.yields_to_waiters,
+            expected_handoff_seconds=self.expected_handoff_seconds,
+            generation=self.generation,
+        )
+        if error:
+            raise ValueError(error)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2)
@@ -60,6 +75,10 @@ class JobState:
     input_path: str
     output_dir: str
     params: dict[str, Any] = field(default_factory=dict)
+    route_identity: str | None = None
+    yields_to_waiters: bool = False
+    expected_handoff_seconds: float | None = None
+    generation: int | None = None
     submitted_at: float = 0.0
     started_at: float | None = None
     finished_at: float | None = None
@@ -82,6 +101,14 @@ class JobState:
         if d.get("warnings") is None:
             d["warnings"] = []
         return cls(**_known_fields(cls, d))
+
+    def cooperation_error(self) -> str | None:
+        return _cooperation_error(
+            route_identity=self.route_identity,
+            yields_to_waiters=self.yields_to_waiters,
+            expected_handoff_seconds=self.expected_handoff_seconds,
+            generation=self.generation,
+        )
 
 
 @dataclass
@@ -163,3 +190,40 @@ def _known_fields(cls: type, values: dict[str, Any]) -> dict[str, Any]:
     """Keep persisted JSON forward-compatible with additive fields."""
     names = {field.name for field in fields(cls)}
     return {key: value for key, value in values.items() if key in names}
+
+
+def _cooperation_error(
+    *,
+    route_identity: str | None,
+    yields_to_waiters: bool,
+    expected_handoff_seconds: float | None,
+    generation: int | None,
+) -> str | None:
+    cooperation_present = (
+        yields_to_waiters
+        or expected_handoff_seconds is not None
+        or generation is not None
+    )
+    if not cooperation_present:
+        return None
+    missing = []
+    if yields_to_waiters is not True:
+        missing.append("yields_to_waiters=true")
+    if not isinstance(route_identity, str) or not route_identity.strip():
+        missing.append("route_identity")
+    if expected_handoff_seconds is None:
+        missing.append("expected_handoff_seconds")
+    elif (
+        isinstance(expected_handoff_seconds, bool)
+        or not isinstance(expected_handoff_seconds, (int, float))
+        or not math.isfinite(expected_handoff_seconds)
+        or expected_handoff_seconds <= 0
+    ):
+        return "cooperation metadata expected_handoff_seconds must be positive"
+    if generation is None:
+        missing.append("generation")
+    elif isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+        return "cooperation metadata generation must be at least 1"
+    if missing:
+        return "cooperation metadata requires: " + ", ".join(missing)
+    return None

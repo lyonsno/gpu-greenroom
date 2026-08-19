@@ -74,8 +74,16 @@ def cmd_submit(args):
         input_path=args.input,
         output_dir=args.output_dir,
         params=params,
+        route_identity=args.route_identity,
+        yields_to_waiters=args.yields_to_waiters,
+        expected_handoff_seconds=args.expected_handoff_seconds,
+        generation=args.generation,
     )
-    job_dir = queue.submit(request)
+    try:
+        job_dir = queue.submit(request)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(2)
     print(f"Submitted job {request.job_id}")
     print(f"  Type: {request.job_type}")
     print(f"  Input: {request.input_path}")
@@ -84,7 +92,33 @@ def cmd_submit(args):
         print(f"  (auto-assigned durable output dir)")
     if args.cwd:
         print(f"  Cwd: {args.cwd}")
+    if request.route_identity:
+        print(f"  Route: {request.route_identity}")
+    if request.yields_to_waiters:
+        seconds = _format_seconds(request.expected_handoff_seconds)
+        print(f"  Cooperation: yields to waiters within <={seconds}s (generation {request.generation})")
     print(f"  Dir: {job_dir}")
+    receipt = json.loads((job_dir / "submission_receipt.json").read_text())
+    if receipt["running_observation"] == "unverified":
+        print(
+            "  Warning: current running-job cooperation could not be verified: "
+            f"{receipt['running_observation_error']}",
+            file=sys.stderr,
+        )
+    elif receipt["notice"]:
+        running = receipt["running_job"]
+        route = running["route_identity"] or running["job_id"]
+        seconds = _format_seconds(running["expected_handoff_seconds"])
+        print(
+            f"  Current running job {route} is yield-aware; "
+            f"expect the GPU within <={seconds}s"
+        )
+    elif receipt["running_job"] and receipt["running_job"]["cooperation_error"]:
+        print(
+            "  Warning: current running job has invalid cooperation metadata: "
+            f"{receipt['running_job']['cooperation_error']}",
+            file=sys.stderr,
+        )
 
 
 def cmd_list(args):
@@ -97,12 +131,31 @@ def cmd_list(args):
         return
 
     for job in jobs:
-        elapsed = ""
+        details = []
         if job.started_at and job.finished_at:
-            elapsed = f" ({job.finished_at - job.started_at:.1f}s)"
+            details.append(f"{job.finished_at - job.started_at:.1f}s")
         elif job.started_at:
-            elapsed = f" ({time.time() - job.started_at:.1f}s running)"
-        print(f"  {job.job_id}  {job.status.value:10s}  {job.job_type:12s}  {os.path.basename(job.input_path)}{elapsed}")
+            details.append(f"{time.time() - job.started_at:.1f}s running")
+        if job.generation is not None:
+            details.append(f"gen {job.generation}")
+        detail_text = f" ({', '.join(details)})" if details else ""
+        route = job.route_identity or job.job_type
+        cooperation = ""
+        if job.yields_to_waiters and job.cooperation_error() is None:
+            cooperation = f" [YIELDS <={_format_seconds(job.expected_handoff_seconds)}s]"
+        elif job.cooperation_error():
+            cooperation = " [INVALID COOPERATION METADATA]"
+        print(
+            f"  {job.job_id}  {job.status.value:10s}  {route}"
+            f"{cooperation}  {os.path.basename(job.input_path)}{detail_text}"
+        )
+
+
+def _format_seconds(value):
+    if value is None:
+        return "unknown"
+    value = float(value)
+    return str(int(value)) if value.is_integer() else f"{value:g}"
 
 
 def cmd_status(args):
@@ -335,6 +388,10 @@ def main():
     p_submit.add_argument("output_dir", nargs="?", default="", help="Output directory (default: durable path in queue dir)")
     p_submit.add_argument("-p", "--params", nargs="*", help="Key=value params (e.g. seed=42)")
     p_submit.add_argument("--cwd", help="Override working directory (e.g. for branch/worktree)")
+    p_submit.add_argument("--route-identity", help="Stable human/machine route identity for this job")
+    p_submit.add_argument("--yields-to-waiters", action="store_true", help="Promise cooperative yield when another job waits")
+    p_submit.add_argument("--expected-handoff-seconds", type=float, help="Expected upper bound from waiter arrival to GPU handoff")
+    p_submit.add_argument("--generation", type=int, help="Self-resubmitting cooperative lineage generation (starts at 1)")
     p_submit.set_defaults(func=cmd_submit)
 
     # list

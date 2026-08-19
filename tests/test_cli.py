@@ -4,9 +4,13 @@ import json
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
+
+from gpu_queue.models import JobRequest, JobState, JobStatus
+from gpu_queue.queue import GPUQueue
 
 
 def run_cli(*args, queue_dir=None):
@@ -48,6 +52,161 @@ class TestCLISubmit:
         assert req["params"]["seed"] == "123"
         assert req["params"]["resolution"] == "512"
 
+    def test_submit_persists_complete_cooperation_contract(self, queue_dir):
+        rc, out, err = run_cli(
+            "submit", "trellis2mlx", "/tmp/test.png", "/tmp/out",
+            "--route-identity", "sjb/grid48-curriculum-r1",
+            "--yields-to-waiters",
+            "--expected-handoff-seconds", "60",
+            "--generation", "3",
+            queue_dir=queue_dir,
+        )
+
+        assert rc == 0, err
+        job_dir = next((queue_dir / "pending").iterdir())
+        request = json.loads((job_dir / "request.json").read_text())
+        state = json.loads((job_dir / "status.json").read_text())
+        assert request["route_identity"] == "sjb/grid48-curriculum-r1"
+        assert request["yields_to_waiters"] is True
+        assert request["expected_handoff_seconds"] == 60.0
+        assert request["generation"] == 3
+        assert state["route_identity"] == request["route_identity"]
+        assert state["yields_to_waiters"] is True
+        assert "Route: sjb/grid48-curriculum-r1" in out
+        assert "Cooperation: yields to waiters within <=60s (generation 3)" in out
+
+    @pytest.mark.parametrize(
+        "args",
+        [
+            ("--yields-to-waiters",),
+            ("--expected-handoff-seconds", "60"),
+            ("--generation", "2"),
+            ("--yields-to-waiters", "--route-identity", "sjb/grid48"),
+        ],
+    )
+    def test_submit_rejects_partial_cooperation_contract(self, queue_dir, args):
+        rc, _, err = run_cli(
+            "submit", "trellis2mlx", "/tmp/test.png", "/tmp/out", *args,
+            queue_dir=queue_dir,
+        )
+
+        assert rc != 0
+        assert "cooperation metadata" in err.lower()
+        assert not list((queue_dir / "pending").glob("*")) if (queue_dir / "pending").exists() else True
+
+    def test_submit_notices_current_cooperative_job_and_writes_receipt(self, queue_dir):
+        queue = GPUQueue(queue_dir)
+        running = JobRequest(
+            job_type="command",
+            input_path="/tmp/grid48.json",
+            route_identity="sjb/grid48-curriculum-r1",
+            yields_to_waiters=True,
+            expected_handoff_seconds=60.0,
+            generation=3,
+        )
+        pending_dir = queue.submit(running)
+        running_dir = queue.queue_dir / "running" / running.job_id
+        pending_dir.rename(running_dir)
+        state = JobState.from_json((running_dir / "status.json").read_text())
+        state.status = JobStatus.RUNNING
+        state.started_at = time.time() - 2670.0
+        (running_dir / "status.json").write_text(state.to_json())
+
+        rc, out, err = run_cli(
+            "submit", "trellis2mlx", "/tmp/waiter.png", "/tmp/waiter-out",
+            queue_dir=queue_dir,
+        )
+
+        assert rc == 0, err
+        assert "Current running job sjb/grid48-curriculum-r1 is yield-aware" in out
+        assert "expect the GPU within <=60s" in out
+        submitted = [path for path in (queue_dir / "pending").iterdir() if path.name != running.job_id]
+        assert len(submitted) == 1
+        receipt = json.loads((submitted[0] / "submission_receipt.json").read_text())
+        assert receipt["schema"] == "gpu-greenroom.submission-receipt.v1"
+        assert receipt["submitted_job"]["yields_to_waiters"] is False
+        assert receipt["running_job"]["job_id"] == running.job_id
+        assert receipt["running_job"]["generation"] == 3
+        assert receipt["notice"] == "current running job is yield-aware; expect the GPU within <=60s"
+
+    def test_submit_warns_when_running_job_cannot_be_verified(self, queue_dir):
+        running_dir = queue_dir / "running" / "unreadable-running"
+        running_dir.mkdir(parents=True)
+        (running_dir / "status.json").write_text("not json")
+
+        rc, out, err = run_cli(
+            "submit", "trellis2mlx", "/tmp/waiter.png", "/tmp/waiter-out",
+            queue_dir=queue_dir,
+        )
+
+        assert rc == 0
+        assert "yield-aware" not in out
+        assert "could not be verified" in err
+        submitted = next((queue_dir / "pending").iterdir())
+        receipt = json.loads((submitted / "submission_receipt.json").read_text())
+        assert receipt["running_observation"] == "unverified"
+        assert "could not read running job" in receipt["running_observation_error"]
+        assert receipt["notice"] is None
+
+    def test_submit_warns_instead_of_promising_from_partial_running_metadata(self, queue_dir):
+        running_dir = queue_dir / "running" / "partial-cooperation"
+        running_dir.mkdir(parents=True)
+        state = JobState(
+            job_id="partial-cooperation",
+            status=JobStatus.RUNNING,
+            job_type="command",
+            input_path="/tmp/grid48.json",
+            output_dir="/tmp/grid48-out",
+            route_identity="sjb/grid48-curriculum-r1",
+            yields_to_waiters=True,
+            expected_handoff_seconds=60,
+        )
+        (running_dir / "status.json").write_text(state.to_json())
+
+        rc, out, err = run_cli(
+            "submit", "trellis2mlx", "/tmp/waiter.png", "/tmp/waiter-out",
+            queue_dir=queue_dir,
+        )
+
+        assert rc == 0
+        assert "yield-aware" not in out
+        assert "invalid cooperation metadata" in err
+        assert "generation" in err
+        submitted = next((queue_dir / "pending").iterdir())
+        receipt = json.loads((submitted / "submission_receipt.json").read_text())
+        assert receipt["running_observation"] == "observed"
+        assert receipt["running_job"]["cooperation_valid"] is False
+        assert receipt["notice"] is None
+
+    def test_submit_warns_instead_of_promising_from_stale_running_status(self, queue_dir):
+        running_dir = queue_dir / "running" / "stale-running"
+        running_dir.mkdir(parents=True)
+        state = JobState(
+            job_id="stale-running",
+            status=JobStatus.DONE,
+            job_type="command",
+            input_path="/tmp/grid48.json",
+            output_dir="/tmp/grid48-out",
+            route_identity="sjb/grid48-curriculum-r1",
+            yields_to_waiters=True,
+            expected_handoff_seconds=60,
+            generation=3,
+        )
+        (running_dir / "status.json").write_text(state.to_json())
+
+        rc, out, err = run_cli(
+            "submit", "trellis2mlx", "/tmp/waiter.png", "/tmp/waiter-out",
+            queue_dir=queue_dir,
+        )
+
+        assert rc == 0
+        assert "yield-aware" not in out
+        assert "stale status done" in err
+        submitted = next((queue_dir / "pending").iterdir())
+        receipt = json.loads((submitted / "submission_receipt.json").read_text())
+        assert receipt["running_observation"] == "unverified"
+        assert receipt["notice"] is None
+
 
 class TestCLIList:
     def test_list_empty(self, queue_dir):
@@ -61,6 +220,52 @@ class TestCLIList:
         assert rc == 0
         assert "pending" in out
         assert "trellis2mlx" in out
+
+    def test_list_renders_route_yield_promise_and_generation(self, queue_dir):
+        queue = GPUQueue(queue_dir)
+        request = JobRequest(
+            job_type="command",
+            input_path="/tmp/grid48.json",
+            route_identity="sjb/grid48-curriculum-r1",
+            yields_to_waiters=True,
+            expected_handoff_seconds=60.0,
+            generation=3,
+        )
+        pending_dir = queue.submit(request)
+        running_dir = queue.queue_dir / "running" / request.job_id
+        pending_dir.rename(running_dir)
+        state = JobState.from_json((running_dir / "status.json").read_text())
+        state.status = JobStatus.RUNNING
+        state.started_at = time.time() - 2670.0
+        (running_dir / "status.json").write_text(state.to_json())
+
+        rc, out, err = run_cli("list", queue_dir=queue_dir)
+
+        assert rc == 0, err
+        assert "running" in out
+        assert "sjb/grid48-curriculum-r1" in out
+        assert "[YIELDS <=60s]" in out
+        assert "gen 3" in out
+
+    def test_list_marks_malformed_persisted_cooperation_instead_of_crashing(self, queue_dir):
+        queue = GPUQueue(queue_dir)
+        request = JobRequest(job_type="command", input_path="/tmp/grid48.json")
+        pending_dir = queue.submit(request)
+        status_path = pending_dir / "status.json"
+        state = json.loads(status_path.read_text())
+        state.update({
+            "route_identity": "sjb/grid48-curriculum-r1",
+            "yields_to_waiters": True,
+            "expected_handoff_seconds": "sixty",
+            "generation": "third",
+        })
+        status_path.write_text(json.dumps(state))
+
+        rc, out, err = run_cli("list", queue_dir=queue_dir)
+
+        assert rc == 0, err
+        assert "[INVALID COOPERATION METADATA]" in out
+        assert "[YIELDS" not in out
 
 
 class TestCLIStatus:
