@@ -658,12 +658,9 @@ class GPUQueue:
     def cancel(self, job_id: str) -> bool:
         """Cancel a pending job. Returns True if cancelled, False if not found/not pending.
 
-        Acquires flock to prevent race with run_one().
+        Serializes the pending-state transition without waiting for GPU execution.
         """
-        lock_fd = open(self.lock_path, "w")
-        try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
-
+        with self._coordination_lock():
             pending_dir = self.queue_dir / "pending" / job_id
             if not pending_dir.exists():
                 return False
@@ -676,9 +673,6 @@ class GPUQueue:
             dest = self.queue_dir / "cancelled" / job_id
             shutil.move(str(pending_dir), str(dest))
             return True
-        finally:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            lock_fd.close()
 
     def list_jobs(self, status: JobStatus | None = None) -> list[JobState]:
         """List jobs, optionally filtered by status."""
@@ -837,20 +831,21 @@ class GPUQueue:
             if self._external_execution_blocked():
                 return False
 
-            job_dir = self._next_pending()
-            if job_dir is None:
-                return False
+            with self._coordination_lock():
+                job_dir = self._next_pending()
+                if job_dir is None:
+                    return False
 
-            request = JobRequest.from_json((job_dir / "request.json").read_text())
+                request = JobRequest.from_json((job_dir / "request.json").read_text())
 
-            # Move to running
-            job_dir = self._move_job(job_dir, "running")
+                # Claim the pending job before cancellation can observe it.
+                job_dir = self._move_job(job_dir, "running")
 
-            # Update status
-            state = JobState.from_json((job_dir / "status.json").read_text())
-            state.status = JobStatus.RUNNING
-            state.started_at = time.time()
-            state.pid = os.getpid()
+                state = JobState.from_json((job_dir / "status.json").read_text())
+                state.status = JobStatus.RUNNING
+                state.started_at = time.time()
+                state.pid = os.getpid()
+                (job_dir / "status.json").write_text(state.to_json())
 
             # Resolve job type config — supports bare list or rich dict
             raw_config = job_types.get(request.job_type)

@@ -267,6 +267,23 @@ class TestSerialization:
 # --- Cancel ---
 
 class TestCancel:
+    def test_cancel_pending_does_not_acquire_execution_lock(self, queue, monkeypatch):
+        """A running GPU job must not prevent cancellation of a pending job."""
+        req = make_request()
+        queue.submit(req)
+        real_flock = fcntl.flock
+
+        def reject_execution_lock(lock_fd, operation):
+            lock_path = Path(lock_fd.name)
+            if lock_path == queue.lock_path and operation & fcntl.LOCK_EX:
+                raise AssertionError("pending cancellation acquired gpu.lock")
+            return real_flock(lock_fd, operation)
+
+        monkeypatch.setattr(fcntl, "flock", reject_execution_lock)
+
+        assert queue.cancel(req.job_id) is True
+        assert queue.get_job(req.job_id).status == JobStatus.CANCELLED
+
     def test_cancel_pending_job(self, queue):
         req = make_request()
         queue.submit(req)
