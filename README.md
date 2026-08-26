@@ -91,6 +91,12 @@ source-plate preparation, and route-comparison practice live in the
 an image-conditioning or image-to-3D assay; in particular, do not let Greenroom
 route success stand in for model-quality evidence.
 
+The current `trellis2mlx` default includes the legacy `--simplify-first` route.
+It is suitable for preview continuity, not as a correctness or quality baseline.
+For adjudication and retrospective triage, include the source-derived
+`--reference-cleanup` arm described in the field guide and preserve raw-checkpoint
+custody whenever available.
+
 Implementation-specific setup remains in each generator repository's README:
 
 - `~/dev/mlx-ideogram4/README.md` for FLUX/MFLUX;

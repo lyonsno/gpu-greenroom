@@ -115,6 +115,32 @@ Prefer geometry-only generation or a headless render of the unsimplified result
 for diagnosis before starting an expensive simplification path. Record the raw
 vertex and face counts before attributing a hang to inference.
 
+### TRELLIS2MLX cleanup-order assays
+
+Do not treat the current Greenroom `trellis2mlx` default, which requests
+`--simplify-first`, as a correctness authority. It is a legacy preview route.
+On the Feature Animation 81412 witness at `trellis2mlx` commit `e1d987d`, the
+ordinary simplify-first path amplified fine orientation and topology disorder
+in an accepted raw mesh into severe missing and inverted regions. Replaying the
+byte-identical raw checkpoint through `--reference-cleanup` instead produced
+coherent geometry through UV generation, texturing, and PBR export.
+
+The reference-derived route performs a coarse simplification to roughly three
+times the target face count, cleanup, final simplification, and final cleanup
+and orientation. Use a matched `--reference-cleanup` arm when quality is being
+adjudicated or an existing TRELLIS2MLX result is being triaged. Preserve and
+record the raw checkpoint digest, final artifact digest, requested and effective
+cleanup route, target face count, texture size, and one-sided renders. Compare
+front, profile, and rear views; inspect geometry and texture smearing as separate
+failure surfaces.
+
+When a preserved raw checkpoint is unavailable, a same-input, same-seed rerun is
+still useful, but label it as a trajectory repeat. A different raw mesh cannot
+establish finalizer causality. This witness does not establish global closure:
+localized one-sided defects, texture smearing, and upstream raw-basin divergence
+remain under investigation. Do not change production defaults or claim a
+general fix from this result alone.
+
 ## Updating this guide
 
 Add a rule when it has replayable evidence and changes how another user should
