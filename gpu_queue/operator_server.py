@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -12,7 +11,6 @@ import signal
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from .models import JobStatus
 from .queue import GPUQueue
 
 
@@ -26,35 +24,69 @@ PAGE = r"""<!doctype html>
 </style>
 </head>
 <body><header><h1>GPU Greenroom</h1><div class="state"><span id="dot" class="dot"></span><span id="queueState">loading</span></div><div class="spacer"></div><button id="pause" title="Pause queue" class="icon">Ⅱ</button><button id="resume" title="Resume queue" class="icon">▶</button><button id="refresh" title="Refresh" class="icon">↻</button></header>
-<main><div id="lease" class="meta" hidden></div><div class="toolbar" id="filters"></div><table><thead><tr><th class="id">Job</th><th class="status">State</th><th class="routeCol">Route</th><th class="age">Elapsed</th><th class="actions">Actions</th></tr></thead><tbody id="jobs"></tbody></table><div id="empty" class="empty" hidden>No jobs in this view.</div></main><div id="error" class="error"></div>
+<main><div id="pauseMeta" class="meta" hidden></div><div id="lease" class="meta" hidden></div><div class="toolbar" id="filters"></div><table><thead><tr><th class="id">Job</th><th class="status">State</th><th class="routeCol">Route</th><th class="age">Elapsed</th><th class="actions">Actions</th></tr></thead><tbody id="jobs"></tbody></table><div id="empty" class="empty" hidden>No jobs in this view.</div></main><div id="error" class="error"></div>
 <script>
 const hash=new URLSearchParams(location.hash.slice(1));if(hash.get('token')){sessionStorage.setItem('greenroom-token',hash.get('token'));history.replaceState(null,'',location.pathname)}const token=sessionStorage.getItem('greenroom-token')||'';let filter='active',last=null;const statuses=['active','all','pending','running','done','failed','cancelled'];
 function auth(){return {'Authorization':'Bearer '+token,'Content-Type':'application/json'}}function err(e){const n=document.querySelector('#error');n.textContent=e;n.style.display='block';setTimeout(()=>n.style.display='none',6000)}function elapsed(j){const end=j.finished_at||Date.now()/1000,start=j.started_at||j.submitted_at;if(!start)return '—';const s=Math.max(0,end-start);if(s<60)return Math.round(s)+'s';if(s<3600)return Math.floor(s/60)+'m '+Math.round(s%60)+'s';return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'}function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-function render(s){last=s;document.querySelector('#queueState').textContent=s.paused?'paused':'admitting';document.querySelector('#dot').className='dot'+(s.paused?' paused':'');document.querySelector('#pause').disabled=s.paused;document.querySelector('#resume').disabled=!s.paused;const lease=document.querySelector('#lease');lease.hidden=!s.lease;lease.textContent=s.lease?`External owner: ${s.lease.owner} · ${s.lease.effective_route} · ${s.lease.lifecycle_state}`:'';document.querySelector('#filters').innerHTML=statuses.map(x=>`<button class="filter ${filter===x?'active':''}" data-filter="${x}">${x}</button>`).join('');document.querySelectorAll('[data-filter]').forEach(b=>b.onclick=()=>{filter=b.dataset.filter;load()});const rows=s.jobs;document.querySelector('#empty').hidden=rows.length>0;document.querySelector('#jobs').innerHTML=rows.map(j=>{let a='';if(j.status==='pending')a=`<button class="danger text" title="Cancel pending job" onclick="act('cancel','${j.job_id}')"><span>×</span> Cancel</button>`;if(j.status==='running')a=`<button class="danger text" title="Stop running job" onclick="act('terminate','${j.job_id}')"><span>■</span> Stop</button> <button class="danger icon" title="Force stop running job" onclick="act('kill','${j.job_id}')">!</button>`;const route=j.requested_route||j.effective_route||j.job_type;return `<tr><td class="id">${esc(j.job_id)}<div class="meta">${esc(j.job_type)}</div></td><td class="status"><span class="pill ${esc(j.status)}">${esc(j.status)}</span></td><td><div class="route">${esc(route)}</div><div class="meta">${esc(j.repo_root||j.output_dir||'')}</div></td><td class="ageCell">${elapsed(j)}</td><td class="actions">${a}</td></tr>`}).join('')}
-async function load(){try{const r=await fetch('/api/state?view='+encodeURIComponent(filter),{headers:auth()});if(!r.ok)throw new Error(await r.text());render(await r.json())}catch(e){err(e.message)}}async function post(path,body={}){const r=await fetch(path,{method:'POST',headers:auth(),body:JSON.stringify(body)});if(!r.ok)throw new Error(await r.text());await load()}async function act(kind,id){try{if(kind==='cancel')await post('/api/cancel',{job_id:id,requested_by:'operator-console',reason:'operator cancelled pending job'});else await post('/api/terminate',{job_id:id,requested_by:'operator-console',reason:kind==='kill'?'operator force-stopped running job':'operator stopped running job',force:kind==='kill'})}catch(e){err(e.message)}}document.querySelector('#pause').onclick=()=>post('/api/pause',{requested_by:'operator-console'}).catch(e=>err(e.message));document.querySelector('#resume').onclick=()=>post('/api/resume',{requested_by:'operator-console'}).catch(e=>err(e.message));document.querySelector('#refresh').onclick=load;load();setInterval(load,2000);
+function render(s){last=s;document.querySelector('#queueState').textContent=s.paused?'paused':'admitting';document.querySelector('#dot').className='dot'+(s.paused?' paused':'');document.querySelector('#pause').disabled=s.paused;document.querySelector('#resume').disabled=!s.paused;const pm=document.querySelector('#pauseMeta'),p=s.pause_state;pm.hidden=!p;pm.textContent=p?`Pause owner: ${p.owner} · epoch ${p.epoch} · ${p.contention_class} · effective ${new Date(p.effective_at*1000).toLocaleString()}`:'';const lease=document.querySelector('#lease');lease.hidden=!s.lease;lease.textContent=s.lease?`External owner: ${s.lease.owner} · ${s.lease.effective_route} · ${s.lease.lifecycle_state}`:'';document.querySelector('#filters').innerHTML=statuses.map(x=>`<button class="filter ${filter===x?'active':''}" data-filter="${x}">${x}</button>`).join('');document.querySelectorAll('[data-filter]').forEach(b=>b.onclick=()=>{filter=b.dataset.filter;load()});const rows=s.jobs;document.querySelector('#empty').hidden=rows.length>0;document.querySelector('#jobs').innerHTML=rows.map(j=>{let a='';if(j.consistent&&j.status==='pending')a=`<button class="danger text" title="Cancel pending job" onclick="act('cancel','${j.job_id}')"><span>×</span> Cancel</button>`;if(j.consistent&&j.status==='running')a=`<button class="danger text" title="Stop running job" onclick="act('terminate','${j.job_id}')"><span>■</span> Stop</button> <button class="danger icon" title="Force stop running job" onclick="act('kill','${j.job_id}')">!</button>`;const route=j.requested_route||j.effective_route||j.job_type;return `<tr><td class="id">${esc(j.job_id)}<div class="meta">${esc(j.job_type)}</div></td><td class="status"><span class="pill ${esc(j.status)}">${esc(j.status)}</span></td><td><div class="route">${esc(route)}</div><div class="meta">${esc(j.repo_root||j.output_dir||j.record_error||'')}</div></td><td class="ageCell">${elapsed(j)}</td><td class="actions">${a}</td></tr>`}).join('')}
+async function load(){try{const r=await fetch('/api/state?view='+encodeURIComponent(filter),{headers:auth()});if(!r.ok)throw new Error(await r.text());render(await r.json())}catch(e){err(e.message)}}async function post(path,body={}){const r=await fetch(path,{method:'POST',headers:auth(),body:JSON.stringify(body)});if(!r.ok)throw new Error(await r.text());await load()}async function act(kind,id){try{if(kind==='cancel')await post('/api/cancel',{job_id:id,requested_by:'operator-console',reason:'operator cancelled pending job'});else await post('/api/terminate',{job_id:id,requested_by:'operator-console',reason:kind==='kill'?'operator force-stopped running job':'operator stopped running job',force:kind==='kill'})}catch(e){err(e.message)}}document.querySelector('#pause').onclick=()=>post('/api/pause',{requested_by:'operator-console'}).catch(e=>err(e.message));document.querySelector('#resume').onclick=()=>post('/api/resume',{requested_by:'operator-console',epoch:last?.pause_state?.epoch}).catch(e=>err(e.message));document.querySelector('#refresh').onclick=load;load();setInterval(()=>{if(filter==='active')load()},2000);
 </script></body></html>"""
 
 
 def queue_snapshot(queue: GPUQueue, view: str = "all") -> dict:
+    statuses = ("pending", "running", "done", "failed", "cancelled")
     if view == "active":
-        states = queue.list_jobs(JobStatus.PENDING) + queue.list_jobs(JobStatus.RUNNING)
+        selected = ("pending", "running")
     elif view == "all":
-        states = queue.list_jobs()
+        selected = statuses
+    elif view in statuses:
+        selected = (view,)
     else:
-        states = queue.list_jobs(JobStatus(view))
+        raise ValueError(f"invalid view: {view}")
+
     jobs = []
-    for state in states:
-        row = asdict(state)
-        row["status"] = state.status.value
-        request_path = queue.queue_dir / state.status.value / state.job_id / "request.json"
-        if request_path.is_file():
+    for containment_status in selected:
+        status_dir = queue.queue_dir / containment_status
+        for job_dir in sorted(status_dir.iterdir()):
+            status_path = job_dir / "status.json"
+            if not status_path.is_file():
+                continue
             try:
-                request = json.loads(request_path.read_text())
-            except (OSError, json.JSONDecodeError):
-                request = {}
-            row["requested_route"] = request.get("route_identity")
-            row["repo_root"] = request.get("repo_root")
-        jobs.append(row)
+                row = json.loads(status_path.read_text())
+                if not isinstance(row, dict):
+                    raise ValueError("status record is not an object")
+            except (OSError, ValueError, json.JSONDecodeError):
+                try:
+                    row = json.loads(status_path.read_text())
+                    if not isinstance(row, dict):
+                        raise ValueError("status record is not an object")
+                except (OSError, ValueError, json.JSONDecodeError) as second_error:
+                    jobs.append({
+                        "job_id": job_dir.name,
+                        "job_type": "unknown",
+                        "status": "inconsistent",
+                        "declared_status": None,
+                        "containment_status": containment_status,
+                        "consistent": False,
+                        "record_error": f"unreadable status: {second_error}",
+                    })
+                    continue
+            declared_status = row.get("status")
+            consistent = declared_status == containment_status
+            row["job_id"] = row.get("job_id") or job_dir.name
+            row["declared_status"] = declared_status
+            row["containment_status"] = containment_status
+            row["consistent"] = consistent
+            row["status"] = containment_status if consistent else "inconsistent"
+            request_path = job_dir / "request.json"
+            if request_path.is_file():
+                try:
+                    request = json.loads(request_path.read_text())
+                except (OSError, json.JSONDecodeError):
+                    request = {}
+                row["requested_route"] = request.get("route_identity")
+                row["repo_root"] = request.get("repo_root")
+            jobs.append(row)
     jobs.sort(key=lambda item: (item.get("submitted_at") or 0), reverse=True)
     lease = queue.lease_status()
     lease_payload = None

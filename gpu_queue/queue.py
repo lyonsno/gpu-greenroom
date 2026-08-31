@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import fcntl
 import json
 import os
@@ -10,6 +11,7 @@ import shlex
 import shutil
 import signal
 import subprocess
+import sys
 import time
 import uuid
 from contextlib import contextmanager
@@ -24,6 +26,33 @@ DEFAULT_WORKER_CAPABILITIES = frozenset({STRUCTURED_COMMAND_CAPABILITY})
 PAUSE_STATE_SCHEMA = "gpu-greenroom.pause-state.v1"
 PAUSE_ACK_SCHEMA = "gpu-greenroom.pause-acknowledgement.v1"
 TERMINATION_RECEIPT_SCHEMA = "gpu-greenroom.running-job-termination.v1"
+
+
+class _DarwinProcBsdInfo(ctypes.Structure):
+    _fields_ = [
+        ("pbi_flags", ctypes.c_uint32),
+        ("pbi_status", ctypes.c_uint32),
+        ("pbi_xstatus", ctypes.c_uint32),
+        ("pbi_pid", ctypes.c_uint32),
+        ("pbi_ppid", ctypes.c_uint32),
+        ("pbi_uid", ctypes.c_uint32),
+        ("pbi_gid", ctypes.c_uint32),
+        ("pbi_ruid", ctypes.c_uint32),
+        ("pbi_rgid", ctypes.c_uint32),
+        ("pbi_svuid", ctypes.c_uint32),
+        ("pbi_svgid", ctypes.c_uint32),
+        ("rfu_1", ctypes.c_uint32),
+        ("pbi_comm", ctypes.c_char * 16),
+        ("pbi_name", ctypes.c_char * 32),
+        ("pbi_nfiles", ctypes.c_uint32),
+        ("pbi_pgid", ctypes.c_uint32),
+        ("pbi_pjobc", ctypes.c_uint32),
+        ("e_tdev", ctypes.c_uint32),
+        ("e_tpgid", ctypes.c_uint32),
+        ("pbi_nice", ctypes.c_int32),
+        ("pbi_start_tvsec", ctypes.c_uint64),
+        ("pbi_start_tvusec", ctypes.c_uint64),
+    ]
 
 
 class PauseStateError(RuntimeError):
@@ -103,6 +132,8 @@ class GPUQueue:
 
     def __init__(self, queue_dir: str | Path):
         self.queue_dir = Path(queue_dir)
+        self._worker_shutdown_requested = False
+        self._owned_child: subprocess.Popen | None = None
         for sub in ("pending", "running", "done", "failed", "cancelled", "outputs"):
             (self.queue_dir / sub).mkdir(parents=True, exist_ok=True)
         for sub in (
@@ -220,15 +251,83 @@ class GPUQueue:
 
     @staticmethod
     def _process_start_identity(pid: int) -> str:
-        observed = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "lstart="],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if observed.returncode != 0:
+        if sys.platform == "darwin":
+            info = _DarwinProcBsdInfo()
+            libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+            copied = libproc.proc_pidinfo(
+                pid,
+                3,  # PROC_PIDTBSDINFO
+                0,
+                ctypes.byref(info),
+                ctypes.sizeof(info),
+            )
+            if copied != ctypes.sizeof(info):
+                return ""
+            return (
+                f"darwin-proc-bsdinfo-v1:{pid}:"
+                f"{info.pbi_start_tvsec}:{info.pbi_start_tvusec}"
+            )
+        stat_path = Path(f"/proc/{pid}/stat")
+        try:
+            fields = stat_path.read_text().split()
+        except OSError:
             return ""
-        return observed.stdout.strip()
+        if len(fields) < 22:
+            return ""
+        return f"linux-proc-stat-v1:{pid}:{fields[21]}"
+
+    @staticmethod
+    def _process_group_alive(process_group: int | None) -> bool | None:
+        if process_group is None:
+            return None
+        try:
+            os.killpg(process_group, 0)
+            return True
+        except PermissionError:
+            return True
+        except ProcessLookupError:
+            return False
+
+    @staticmethod
+    def _quiesce_owned_child(proc: subprocess.Popen | None) -> None:
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            process_group = os.getpgid(proc.pid)
+        except ProcessLookupError:
+            proc.wait()
+            return
+        try:
+            os.killpg(process_group, signal.SIGTERM)
+        except ProcessLookupError:
+            proc.wait()
+            return
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process_group, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait()
+
+    def request_worker_shutdown(self) -> None:
+        """Stop admission and ask the currently owned child group to quiesce."""
+        self._worker_shutdown_requested = True
+        proc = self._owned_child
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        # Interrupt proc.wait(); run_one owns the bounded TERM/KILL cleanup and
+        # durable failure transition before it releases the execution lock.
+        raise KeyboardInterrupt
+
+    @property
+    def worker_shutdown_requested(self) -> bool:
+        return self._worker_shutdown_requested
 
     def terminate_running(
         self,
@@ -959,12 +1058,9 @@ class GPUQueue:
     def cancel(self, job_id: str) -> bool:
         """Cancel a pending job. Returns True if cancelled, False if not found/not pending.
 
-        Acquires flock to prevent race with run_one().
+        Uses the short transition lock shared with run_one().
         """
-        lock_fd = open(self.lock_path, "w")
-        try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
-
+        with self._coordination_lock():
             pending_dir = self.queue_dir / "pending" / job_id
             if not pending_dir.exists():
                 return False
@@ -972,14 +1068,11 @@ class GPUQueue:
             state = JobState.from_json((pending_dir / "status.json").read_text())
             state.status = JobStatus.CANCELLED
             state.finished_at = time.time()
-            (pending_dir / "status.json").write_text(state.to_json())
+            self._write_text_atomic(pending_dir / "status.json", state.to_json())
 
             dest = self.queue_dir / "cancelled" / job_id
             shutil.move(str(pending_dir), str(dest))
             return True
-        finally:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            lock_fd.close()
 
     def list_jobs(self, status: JobStatus | None = None) -> list[JobState]:
         """List jobs, optionally filtered by status."""
@@ -1068,7 +1161,7 @@ class GPUQueue:
 
         Returns True if a job was run, False if queue was empty.
         """
-        if self.is_paused():
+        if self._worker_shutdown_requested or self.is_paused():
             return False
         if self._external_execution_blocked():
             return False
@@ -1081,7 +1174,11 @@ class GPUQueue:
             with self._coordination_lock():
                 if self.is_paused():
                     return False
+                if self._worker_shutdown_requested:
+                    return False
                 if self._external_execution_blocked_locked():
+                    return False
+                if any((self.queue_dir / "running").iterdir()):
                     return False
 
                 job_dir = self._next_pending()
@@ -1107,7 +1204,7 @@ class GPUQueue:
                 state.started_at = time.time()
                 state.pid = os.getpid()
                 state.worker_pid = os.getpid()
-                (job_dir / "status.json").write_text(state.to_json())
+                self._write_text_atomic(job_dir / "status.json", state.to_json())
 
             # Structured command jobs carry exact argv and bypass the global
             # job-type registry and all template substitution.
@@ -1212,6 +1309,7 @@ class GPUQueue:
             stdout_path.touch()
             stderr_path.touch()
             proc = None
+            shutdown_exception = None
 
             try:
                 os.makedirs(request.output_dir, exist_ok=True)
@@ -1224,6 +1322,9 @@ class GPUQueue:
                         env=run_env,
                         start_new_session=True,
                     )
+                    self._owned_child = proc
+                    if self._worker_shutdown_requested:
+                        raise KeyboardInterrupt
                     state.pid = proc.pid
                     state.child_pid = proc.pid
                     state.child_process_group = os.getpgid(proc.pid)
@@ -1232,6 +1333,8 @@ class GPUQueue:
                         raise RuntimeError("could not record child process start identity")
                     self._write_text_atomic(job_dir / "status.json", state.to_json())
                     state.exit_code = proc.wait(timeout=job_timeout)
+                    if self._worker_shutdown_requested:
+                        raise KeyboardInterrupt
                 if state.exit_code == 0:
                     state.status = JobStatus.DONE
                     dest_status = "done"
@@ -1241,34 +1344,32 @@ class GPUQueue:
                     state.error_message = f"Process exited with code {state.exit_code}"
                     dest_status = "failed"
             except subprocess.TimeoutExpired:
-                if proc is not None and proc.poll() is None:
-                    os.killpg(proc.pid, signal.SIGTERM)
-                    try:
-                        proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        os.killpg(proc.pid, signal.SIGKILL)
-                        proc.wait()
+                self._quiesce_owned_child(proc)
                 state.status = JobStatus.FAILED
                 state.failure_phase = "timeout"
                 state.error_message = f"Job exceeded {job_timeout}s timeout"
                 state.exit_code = -1
                 dest_status = "failed"
+            except KeyboardInterrupt as exc:
+                self._quiesce_owned_child(proc)
+                state.status = JobStatus.FAILED
+                state.failure_phase = "worker_shutdown"
+                state.error_message = "Worker stopped; owned child process group quiesced"
+                state.exit_code = -1
+                dest_status = "failed"
+                shutdown_exception = exc
             except Exception as e:
-                if proc is not None and proc.poll() is None:
-                    os.killpg(proc.pid, signal.SIGTERM)
-                    try:
-                        proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        os.killpg(proc.pid, signal.SIGKILL)
-                        proc.wait()
+                self._quiesce_owned_child(proc)
                 state.status = JobStatus.FAILED
                 state.failure_phase = "launch"
                 state.error_message = str(e)
                 state.exit_code = -1
                 dest_status = "failed"
 
+            self._owned_child = None
+
             state.finished_at = time.time()
-            (job_dir / "status.json").write_text(state.to_json())
+            self._write_text_atomic(job_dir / "status.json", state.to_json())
 
             # Write receipt with full route identity
             final_job_dir = self.queue_dir / dest_status / state.job_id
@@ -1303,13 +1404,15 @@ class GPUQueue:
                 "stderr_path": str(final_job_dir / "stderr.log"),
                 "worker": effective_claimant,
             }
-            (job_dir / "receipt.json").write_text(json.dumps(receipt, indent=2))
+            self._write_json_atomic(job_dir / "receipt.json", receipt)
 
             # Write metadata sidecar into output_dir for asset browsers
             if state.status == JobStatus.DONE:
                 self._write_metadata_sidecar(request, state)
 
             self._move_job(job_dir, dest_status)
+            if shutdown_exception is not None:
+                raise shutdown_exception
             return True
 
         finally:
@@ -1335,35 +1438,77 @@ class GPUQueue:
                 status_file = job_dir / "status.json"
                 if not status_file.exists():
                     continue
-                state = JobState.from_json(status_file.read_text())
-                if state.pid is not None:
-                    try:
-                        os.kill(state.pid, 0)  # check if process is alive
-                    except PermissionError:
-                        # PID exists but belongs to another user — treat as alive, skip
-                        continue
-                    except ProcessLookupError:
-                        # PID does not exist — stale job
-                        state.status = JobStatus.FAILED
-                        state.finished_at = time.time()
-                        state.failure_phase = "stale_recovery"
-                        state.error_message = f"Process {state.pid} no longer alive; recovered by stale detection"
-                        state.exit_code = -1
-                        (status_file).write_text(state.to_json())
+                try:
+                    state = JobState.from_json(status_file.read_text())
+                except (OSError, ValueError, json.JSONDecodeError):
+                    continue
+                exact_identity = all((
+                    state.child_pid,
+                    state.child_process_group,
+                    state.child_start_identity,
+                ))
+                if not exact_identity:
+                    warning = "ownership_unknown:missing_exact_child_identity"
+                    if warning not in state.warnings:
+                        state.warnings.append(warning)
+                        self._write_text_atomic(status_file, state.to_json())
+                    continue
 
-                        receipt = {
-                            "job_id": state.job_id,
-                            "job_type": state.job_type,
-                            "status": "failed",
-                            "failure_phase": "stale_recovery",
-                            "error_message": state.error_message,
-                            "started_at": state.started_at,
-                            "finished_at": state.finished_at,
-                        }
-                        (job_dir / "receipt.json").write_text(json.dumps(receipt, indent=2))
+                observed_identity = self._process_start_identity(state.child_pid)
+                group_alive = self._process_group_alive(state.child_process_group)
+                if observed_identity:
+                    if observed_identity != state.child_start_identity:
+                        warning = "ownership_unknown:child_identity_changed"
+                    else:
+                        try:
+                            observed_group = os.getpgid(state.child_pid)
+                        except ProcessLookupError:
+                            observed_group = None
+                        if observed_group != state.child_process_group:
+                            warning = "ownership_unknown:child_process_group_changed"
+                        else:
+                            warning = (
+                                "ownership_unknown:worker_dead_child_live"
+                                if self._pid_alive(state.worker_pid) is False
+                                else ""
+                            )
+                    if warning and warning not in state.warnings:
+                        state.warnings.append(warning)
+                        self._write_text_atomic(status_file, state.to_json())
+                    continue
+                if group_alive:
+                    warning = "ownership_unknown:child_missing_group_live"
+                    if warning not in state.warnings:
+                        state.warnings.append(warning)
+                        self._write_text_atomic(status_file, state.to_json())
+                    continue
 
-                        self._move_job(job_dir, "failed")
-                        recovered.append(state.job_id)
+                state.status = JobStatus.FAILED
+                state.finished_at = time.time()
+                state.failure_phase = "stale_recovery"
+                state.error_message = (
+                    f"Exact child {state.child_pid} and process group "
+                    f"{state.child_process_group} are no longer alive"
+                )
+                state.exit_code = -1
+                self._write_text_atomic(status_file, state.to_json())
+
+                receipt = {
+                    "job_id": state.job_id,
+                    "job_type": state.job_type,
+                    "status": "failed",
+                    "failure_phase": "stale_recovery",
+                    "error_message": state.error_message,
+                    "child_pid": state.child_pid,
+                    "child_process_group": state.child_process_group,
+                    "child_start_identity": state.child_start_identity,
+                    "started_at": state.started_at,
+                    "finished_at": state.finished_at,
+                }
+                self._write_json_atomic(job_dir / "receipt.json", receipt)
+
+                self._move_job(job_dir, "failed")
+                recovered.append(state.job_id)
             return recovered
         finally:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)

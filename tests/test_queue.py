@@ -13,6 +13,8 @@ import fcntl
 import json
 import os
 import signal
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -302,8 +304,95 @@ class TestCancel:
         # No output files should exist
         assert len(list(Path(out_dir).iterdir())) == 0
 
+    def test_pending_cancel_does_not_wait_for_running_job(self, queue, tmp_path):
+        started = tmp_path / "started"
+        running = make_request(job_type="hold", output_dir=str(tmp_path / "running-out"))
+        pending = make_request(job_type="hold", output_dir=str(tmp_path / "pending-out"))
+        queue.submit(running)
+        queue.submit(pending)
+        runner = threading.Thread(
+            target=queue.run_one,
+            args=({
+                "hold": [
+                    "sh",
+                    "-c",
+                    f"touch {started}; trap 'exit 143' TERM; while true; do sleep 1; done",
+                ]
+            },),
+        )
+        runner.start()
+        deadline = time.time() + 5
+        while time.time() < deadline and not started.exists():
+            time.sleep(0.01)
+        assert started.exists()
+
+        began = time.monotonic()
+        assert queue.cancel(pending.job_id) is True
+        assert time.monotonic() - began < 0.5
+        assert queue.get_job(pending.job_id).status == JobStatus.CANCELLED
+
+        queue.terminate_running(
+            running.job_id,
+            requested_by="test-operator",
+            reason="test cleanup",
+        )
+        runner.join(timeout=5)
+        assert not runner.is_alive()
+
 
 class TestRunningJobControl:
+    def test_worker_sigterm_quiesces_child_before_releasing_execution_lock(
+        self, queue, tmp_path
+    ):
+        started = tmp_path / "started"
+        child_pid_path = tmp_path / "child.pid"
+        request = JobRequest(
+            job_type="command",
+            input_path="",
+            output_dir=str(tmp_path / "out"),
+            command_argv=[
+                "sh",
+                "-c",
+                f"echo $$ > {child_pid_path}; touch {started}; trap 'exit 143' TERM; while true; do sleep 1; done",
+            ],
+        )
+        queue.submit(request)
+        worker = subprocess.Popen([
+            sys.executable,
+            "-m",
+            "gpu_queue.cli",
+            "--queue-dir",
+            str(queue.queue_dir),
+            "worker",
+            "--poll",
+            "0.05",
+        ])
+        try:
+            deadline = time.time() + 8
+            while time.time() < deadline and not started.exists():
+                time.sleep(0.02)
+            assert started.exists()
+            child_pid = int(child_pid_path.read_text())
+
+            worker.send_signal(signal.SIGTERM)
+            assert worker.wait(timeout=8) == 0
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                try:
+                    os.kill(child_pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.02)
+            with pytest.raises(ProcessLookupError):
+                os.kill(child_pid, 0)
+
+            state = queue.get_job(request.job_id)
+            assert state.status == JobStatus.FAILED
+            assert state.failure_phase == "worker_shutdown"
+        finally:
+            if worker.poll() is None:
+                worker.kill()
+                worker.wait()
     def test_running_job_records_child_identity_and_operator_stop(self, queue, tmp_path):
         started = tmp_path / "started"
         request = make_request(job_type="hold", output_dir=str(tmp_path / "out"))
@@ -413,6 +502,9 @@ class TestStaleRecovery:
         state.status = JobStatus.RUNNING
         state.started_at = time.time() - 100
         state.pid = 99999999  # PID that almost certainly doesn't exist
+        state.child_pid = 99999999
+        state.child_process_group = 99999999
+        state.child_start_identity = "darwin-proc-bsdinfo-v1:99999999:1:1"
         (running_dir / "status.json").write_text(state.to_json())
 
         recovered = queue.recover_stale()
@@ -429,8 +521,8 @@ class TestStaleRecovery:
         receipt = json.loads(receipt_path.read_text())
         assert receipt["failure_phase"] == "stale_recovery"
 
-    def test_no_false_stale_on_live_process(self, queue):
-        """Don't recover our own process as stale."""
+    def test_legacy_running_identity_remains_dispatch_blocking(self, queue):
+        """A legacy live PID is not enough authority to recover or dispatch."""
         req = make_request()
         queue.submit(req)
 
@@ -447,6 +539,21 @@ class TestStaleRecovery:
 
         recovered = queue.recover_stale()
         assert len(recovered) == 0
+        assert (queue.queue_dir / "running" / req.job_id).is_dir()
+
+        pending = make_request()
+        queue.submit(pending)
+        assert queue.run_one({"echo": ["echo", "ok"]}) is False
+        assert queue.get_job(pending.job_id).status == JobStatus.PENDING
+
+    def test_unresolved_running_directory_blocks_dispatch(self, queue):
+        running = queue.queue_dir / "running" / "unreadable-owner"
+        running.mkdir()
+        pending = make_request()
+        queue.submit(pending)
+
+        assert queue.run_one({"echo": ["echo", "ok"]}) is False
+        assert queue.get_job(pending.job_id).status == JobStatus.PENDING
 
 
 # --- List ---

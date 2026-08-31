@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import shutil
 import sys
 import time
@@ -303,9 +304,14 @@ def cmd_worker(args):
     if recovered:
         print(f"  Recovered {len(recovered)} stale job(s): {', '.join(recovered)}")
 
+    def stop_worker(_signum, _frame):
+        queue.request_worker_shutdown()
+
+    previous_sigint = signal.signal(signal.SIGINT, stop_worker)
+    previous_sigterm = signal.signal(signal.SIGTERM, stop_worker)
     was_paused = False
     try:
-        while True:
+        while not queue.worker_shutdown_requested:
             if queue.is_paused():
                 if not was_paused:
                     print("Queue paused. Waiting for resume...")
@@ -322,7 +328,11 @@ def cmd_worker(args):
                 continue
             time.sleep(args.poll)
     except KeyboardInterrupt:
+        pass
+    finally:
         print("\nWorker stopped.")
+        signal.signal(signal.SIGINT, previous_sigint)
+        signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 def cmd_pause(args):

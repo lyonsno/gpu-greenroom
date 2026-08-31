@@ -4,7 +4,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from gpu_queue.models import ExternalLease, JobRequest, JobStatus
-from gpu_queue.operator_server import make_handler, queue_snapshot
+from gpu_queue.operator_server import PAGE, make_handler, queue_snapshot
 from gpu_queue.queue import GPUQueue
 from http.server import ThreadingHTTPServer
 
@@ -54,19 +54,34 @@ def test_operator_snapshot_serializes_external_lease(tmp_path):
 
 def test_operator_active_snapshot_does_not_scan_history(tmp_path, monkeypatch):
     queue = GPUQueue(tmp_path / "queue")
-    seen = []
-    original = queue.list_jobs
-
-    def recording_list(status=None):
-        seen.append(status)
-        return original(status)
-
-    monkeypatch.setattr(queue, "list_jobs", recording_list)
+    historical = queue.queue_dir / "done" / "historical"
+    historical.mkdir()
+    (historical / "status.json").write_text("not-json")
 
     snapshot = queue_snapshot(queue, "active")
 
     assert snapshot["view"] == "active"
-    assert seen == [JobStatus.PENDING, JobStatus.RUNNING]
+    assert snapshot["jobs"] == []
+
+
+def test_operator_snapshot_preserves_containment_over_stale_declared_status(tmp_path):
+    queue = GPUQueue(tmp_path / "queue")
+    request = JobRequest(job_type="echo", input_path="/tmp/in")
+    queue.submit(request)
+    pending = queue.queue_dir / "pending" / request.job_id
+    cancelled = queue.queue_dir / "cancelled" / request.job_id
+    pending.rename(cancelled)
+
+    snapshot = queue_snapshot(queue, "cancelled")
+
+    assert snapshot["jobs"][0]["status"] == "inconsistent"
+    assert snapshot["jobs"][0]["declared_status"] == "pending"
+    assert snapshot["jobs"][0]["containment_status"] == "cancelled"
+    assert snapshot["jobs"][0]["consistent"] is False
+
+
+def test_operator_history_views_do_not_poll_automatically():
+    assert "if(filter==='active')load()" in PAGE
 
 
 def test_operator_api_requires_token_and_cancels_pending(tmp_path):
@@ -94,6 +109,39 @@ def test_operator_api_requires_token_and_cancels_pending(tmp_path):
         ))
         assert json.loads(response.read())["status"] == "cancelled"
         assert queue.get_job(request.job_id).status.value == "cancelled"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_operator_resume_rejects_stale_observed_pause_epoch(tmp_path):
+    queue = GPUQueue(tmp_path / "queue")
+    first = queue.pause(owner="first")
+    queue.resume(owner="first", epoch=first["epoch"])
+    second = queue.pause(owner="second")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(queue, "secret"))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        body = json.dumps({
+            "requested_by": "stale-browser",
+            "epoch": first["epoch"],
+        }).encode()
+        try:
+            urlopen(Request(
+                base + "/api/resume",
+                data=body,
+                method="POST",
+                headers={"Authorization": "Bearer secret", "Content-Type": "application/json"},
+            ))
+        except HTTPError as exc:
+            assert exc.code == 409
+        else:
+            raise AssertionError("stale browser resumed a newer pause epoch")
+        assert queue.is_paused()
+        assert queue.pause_state()["epoch"] == second["epoch"]
     finally:
         server.shutdown()
         server.server_close()
