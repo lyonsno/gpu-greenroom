@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 
 import gpu_queue.queue as queue_module
-from gpu_queue.models import BumpStatus, LeaseStatus
+from gpu_queue.models import BumpStatus, JobRequest, JobState, JobStatus, LeaseStatus
 from gpu_queue.queue import GPUQueue
 
 
@@ -88,6 +88,37 @@ def test_claim_lease_requires_flock_available(tmp_path):
 
     assert result is None
     assert queue.lease_status() is None
+
+
+def test_claim_lease_refuses_unresolved_running_ownership_after_flock_release(tmp_path):
+    queue = GPUQueue(tmp_path / "queue")
+    request = JobRequest(job_type="command", input_path="", command_argv=["true"])
+    queue.submit(request)
+    pending = queue.queue_dir / "pending" / request.job_id
+    running = queue.queue_dir / "running" / request.job_id
+    pending.rename(running)
+    state = JobState.from_json((running / "status.json").read_text())
+    state.status = JobStatus.RUNNING
+    state.failure_phase = "worker_shutdown_quiescence_unresolved"
+    state.warnings.append("ownership_unknown:process_group_live")
+    queue._write_text_atomic(running / "status.json", state.to_json())
+    queue._write_json_atomic(running / "receipt.json", {
+        "status": "ownership_unknown",
+        "failure_phase": state.failure_phase,
+    })
+
+    lock_fd = queue._try_execution_lock()
+    assert lock_fd is not None
+    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    lock_fd.close()
+
+    assert queue.claim_lease(
+        **_lease_kwargs(),
+        raise_on_blocked=False,
+    ) is None
+    assert queue.current_lease_path.exists() is False
+    assert list(queue.lease_receipts_dir.iterdir()) == []
+    assert (running / "receipt.json").is_file()
 
 
 def test_renew_updates_timestamps_without_replacing_identity(tmp_path):

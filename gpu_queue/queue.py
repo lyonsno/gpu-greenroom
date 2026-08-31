@@ -666,6 +666,12 @@ class GPUQueue:
             return None
         try:
             with self._coordination_lock():
+                if any((self.queue_dir / "running").iterdir()):
+                    if raise_on_blocked:
+                        raise RuntimeError(
+                            "unresolved running workload blocks external lease claim"
+                        )
+                    return None
                 current = self._refresh_lease_observation_locked()
                 replacing_handoff = False
                 if current is not None and current.lifecycle_state != LeaseStatus.RELEASED:
