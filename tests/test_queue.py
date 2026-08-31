@@ -341,11 +341,14 @@ class TestCancel:
 
 
 class TestRunningJobControl:
+    @pytest.mark.parametrize("stop_signal", [signal.SIGINT, signal.SIGTERM])
     def test_worker_sigterm_quiesces_child_before_releasing_execution_lock(
-        self, queue, tmp_path
+        self, queue, tmp_path, stop_signal
     ):
         started = tmp_path / "started"
         child_pid_path = tmp_path / "child.pid"
+        descendant_pid_path = tmp_path / "descendant.pid"
+        second_started = tmp_path / "second-started"
         request = JobRequest(
             job_type="command",
             input_path="",
@@ -353,10 +356,22 @@ class TestRunningJobControl:
             command_argv=[
                 "sh",
                 "-c",
-                f"echo $$ > {child_pid_path}; touch {started}; trap 'exit 143' TERM; while true; do sleep 1; done",
+                (
+                    f"echo $$ > {child_pid_path}; "
+                    "sh -c \"trap '' TERM INT; while true; do sleep 1; done\" & "
+                    f"echo $! > {descendant_pid_path}; touch {started}; "
+                    "trap 'exit 0' TERM INT; while true; do sleep 1; done"
+                ),
             ],
         )
         queue.submit(request)
+        second = JobRequest(
+            job_type="command",
+            input_path="",
+            output_dir=str(tmp_path / "second-out"),
+            command_argv=["sh", "-c", f"touch {second_started}"],
+        )
+        queue.submit(second)
         worker = subprocess.Popen([
             sys.executable,
             "-m",
@@ -373,22 +388,31 @@ class TestRunningJobControl:
                 time.sleep(0.02)
             assert started.exists()
             child_pid = int(child_pid_path.read_text())
+            descendant_pid = int(descendant_pid_path.read_text())
+            process_group = os.getpgid(child_pid)
 
-            worker.send_signal(signal.SIGTERM)
-            assert worker.wait(timeout=8) == 0
+            worker.send_signal(stop_signal)
+            time.sleep(0.2)
+            assert queue.run_one({}) is False
+            assert not second_started.exists()
+
+            assert worker.wait(timeout=12) == 0
             deadline = time.time() + 5
             while time.time() < deadline:
-                try:
-                    os.kill(child_pid, 0)
-                except ProcessLookupError:
+                if queue._process_group_alive(process_group) is False:
                     break
                 time.sleep(0.02)
             with pytest.raises(ProcessLookupError):
                 os.kill(child_pid, 0)
+            with pytest.raises(ProcessLookupError):
+                os.kill(descendant_pid, 0)
+            assert queue._process_group_alive(process_group) is False
 
             state = queue.get_job(request.job_id)
             assert state.status == JobStatus.FAILED
             assert state.failure_phase == "worker_shutdown"
+            assert queue.run_one({}) is True
+            assert second_started.exists()
         finally:
             if worker.poll() is None:
                 worker.kill()

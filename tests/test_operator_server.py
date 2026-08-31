@@ -84,6 +84,13 @@ def test_operator_history_views_do_not_poll_automatically():
     assert "if(filter==='active')load()" in PAGE
 
 
+def test_operator_page_renders_both_inconsistent_status_identities():
+    assert "j.containment_status" in PAGE
+    assert "j.declared_status" in PAGE
+    assert "j.consistent&&j.status==='pending'" in PAGE
+    assert "j.consistent&&j.status==='running'" in PAGE
+
+
 def test_operator_api_requires_token_and_cancels_pending(tmp_path):
     queue = GPUQueue(tmp_path / "queue")
     request = JobRequest(job_type="echo", input_path="/tmp/in")

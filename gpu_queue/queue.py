@@ -134,6 +134,7 @@ class GPUQueue:
         self.queue_dir = Path(queue_dir)
         self._worker_shutdown_requested = False
         self._owned_child: subprocess.Popen | None = None
+        self._owned_process_group: int | None = None
         for sub in ("pending", "running", "done", "failed", "cancelled", "outputs"):
             (self.queue_dir / sub).mkdir(parents=True, exist_ok=True)
         for sub in (
@@ -288,28 +289,68 @@ class GPUQueue:
         except ProcessLookupError:
             return False
 
-    @staticmethod
-    def _quiesce_owned_child(proc: subprocess.Popen | None) -> None:
-        if proc is None or proc.poll() is not None:
-            return
-        try:
-            process_group = os.getpgid(proc.pid)
-        except ProcessLookupError:
-            proc.wait()
-            return
+    @classmethod
+    def _quiesce_owned_child(
+        cls,
+        proc: subprocess.Popen | None,
+        process_group: int | None = None,
+    ) -> bool:
+        if process_group is None and proc is not None:
+            try:
+                process_group = os.getpgid(proc.pid)
+            except ProcessLookupError:
+                process_group = None
+        if process_group is None:
+            if proc is not None and proc.poll() is None:
+                proc.wait()
+            return True
+        if cls._process_group_alive(process_group) is False:
+            if proc is not None and proc.poll() is None:
+                proc.wait()
+            return True
         try:
             os.killpg(process_group, signal.SIGTERM)
         except ProcessLookupError:
-            proc.wait()
-            return
+            if proc is not None and proc.poll() is None:
+                proc.wait()
+            return True
+
+        term_deadline = time.monotonic() + 5
+        while time.monotonic() < term_deadline:
+            if proc is not None:
+                proc.poll()
+            if cls._process_group_alive(process_group) is False:
+                if proc is not None and proc.poll() is None:
+                    proc.wait()
+                return True
+            time.sleep(0.05)
+
         try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
+            os.killpg(process_group, signal.SIGKILL)
+        except (PermissionError, ProcessLookupError):
+            if proc is not None:
+                proc.poll()
+            if cls._process_group_alive(process_group):
+                return False
+            if proc is not None and proc.poll() is None:
+                proc.wait()
+            return True
+        kill_deadline = time.monotonic() + 5
+        while time.monotonic() < kill_deadline:
+            if proc is not None:
+                proc.poll()
+            if cls._process_group_alive(process_group) is False:
+                if proc is not None and proc.poll() is None:
+                    proc.wait()
+                return True
+            time.sleep(0.05)
+
+        if proc is not None and proc.poll() is None:
             try:
-                os.killpg(process_group, signal.SIGKILL)
-            except ProcessLookupError:
+                proc.wait(timeout=0.1)
+            except subprocess.TimeoutExpired:
                 pass
-            proc.wait()
+        return cls._process_group_alive(process_group) is False
 
     def request_worker_shutdown(self) -> None:
         """Stop admission and ask the currently owned child group to quiesce."""
@@ -318,7 +359,8 @@ class GPUQueue:
         if proc is None or proc.poll() is not None:
             return
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            process_group = self._owned_process_group or os.getpgid(proc.pid)
+            os.killpg(process_group, signal.SIGTERM)
         except ProcessLookupError:
             return
         # Interrupt proc.wait(); run_one owns the bounded TERM/KILL cleanup and
@@ -1310,6 +1352,7 @@ class GPUQueue:
             stderr_path.touch()
             proc = None
             shutdown_exception = None
+            ownership_unresolved = False
 
             try:
                 os.makedirs(request.output_dir, exist_ok=True)
@@ -1323,11 +1366,12 @@ class GPUQueue:
                         start_new_session=True,
                     )
                     self._owned_child = proc
+                    self._owned_process_group = os.getpgid(proc.pid)
                     if self._worker_shutdown_requested:
                         raise KeyboardInterrupt
                     state.pid = proc.pid
                     state.child_pid = proc.pid
-                    state.child_process_group = os.getpgid(proc.pid)
+                    state.child_process_group = self._owned_process_group
                     state.child_start_identity = self._process_start_identity(proc.pid)
                     if not state.child_start_identity:
                         raise RuntimeError("could not record child process start identity")
@@ -1335,7 +1379,16 @@ class GPUQueue:
                     state.exit_code = proc.wait(timeout=job_timeout)
                     if self._worker_shutdown_requested:
                         raise KeyboardInterrupt
-                if state.exit_code == 0:
+                if not self._quiesce_owned_child(proc, state.child_process_group):
+                    ownership_unresolved = True
+                    state.status = JobStatus.RUNNING
+                    state.failure_phase = "completion_quiescence_unresolved"
+                    state.error_message = (
+                        "Command leader exited but process-group quiescence is unresolved"
+                    )
+                    state.warnings.append("ownership_unknown:process_group_live")
+                    dest_status = None
+                elif state.exit_code == 0:
                     state.status = JobStatus.DONE
                     dest_status = "done"
                 else:
@@ -1344,39 +1397,71 @@ class GPUQueue:
                     state.error_message = f"Process exited with code {state.exit_code}"
                     dest_status = "failed"
             except subprocess.TimeoutExpired:
-                self._quiesce_owned_child(proc)
-                state.status = JobStatus.FAILED
-                state.failure_phase = "timeout"
-                state.error_message = f"Job exceeded {job_timeout}s timeout"
-                state.exit_code = -1
-                dest_status = "failed"
+                if self._quiesce_owned_child(proc, state.child_process_group):
+                    state.status = JobStatus.FAILED
+                    state.failure_phase = "timeout"
+                    state.error_message = f"Job exceeded {job_timeout}s timeout"
+                    state.exit_code = -1
+                    dest_status = "failed"
+                else:
+                    ownership_unresolved = True
+                    state.status = JobStatus.RUNNING
+                    state.failure_phase = "timeout_quiescence_unresolved"
+                    state.error_message = "Timed-out process group could not be quiesced"
+                    state.warnings.append("ownership_unknown:process_group_live")
+                    dest_status = None
             except KeyboardInterrupt as exc:
-                self._quiesce_owned_child(proc)
-                state.status = JobStatus.FAILED
-                state.failure_phase = "worker_shutdown"
-                state.error_message = "Worker stopped; owned child process group quiesced"
-                state.exit_code = -1
-                dest_status = "failed"
+                if self._quiesce_owned_child(proc, state.child_process_group):
+                    state.status = JobStatus.FAILED
+                    state.failure_phase = "worker_shutdown"
+                    state.error_message = "Worker stopped; owned child process group quiesced"
+                    state.exit_code = -1
+                    dest_status = "failed"
+                else:
+                    ownership_unresolved = True
+                    state.status = JobStatus.RUNNING
+                    state.failure_phase = "worker_shutdown_quiescence_unresolved"
+                    state.error_message = (
+                        "Worker stopped but process-group quiescence is unresolved"
+                    )
+                    state.warnings.append("ownership_unknown:process_group_live")
+                    dest_status = None
                 shutdown_exception = exc
             except Exception as e:
-                self._quiesce_owned_child(proc)
-                state.status = JobStatus.FAILED
-                state.failure_phase = "launch"
-                state.error_message = str(e)
-                state.exit_code = -1
-                dest_status = "failed"
+                if self._quiesce_owned_child(proc, state.child_process_group):
+                    state.status = JobStatus.FAILED
+                    state.failure_phase = "launch"
+                    state.error_message = str(e)
+                    state.exit_code = -1
+                    dest_status = "failed"
+                else:
+                    ownership_unresolved = True
+                    state.status = JobStatus.RUNNING
+                    state.failure_phase = "launch_quiescence_unresolved"
+                    state.error_message = (
+                        f"{e}; process-group quiescence is unresolved"
+                    )
+                    state.warnings.append("ownership_unknown:process_group_live")
+                    dest_status = None
 
             self._owned_child = None
+            self._owned_process_group = None
 
-            state.finished_at = time.time()
+            state.finished_at = None if ownership_unresolved else time.time()
             self._write_text_atomic(job_dir / "status.json", state.to_json())
 
             # Write receipt with full route identity
-            final_job_dir = self.queue_dir / dest_status / state.job_id
+            final_job_dir = (
+                job_dir
+                if ownership_unresolved
+                else self.queue_dir / dest_status / state.job_id
+            )
             receipt = {
                 "job_id": state.job_id,
                 "job_type": state.job_type,
-                "status": state.status.value,
+                "status": (
+                    "ownership_unknown" if ownership_unresolved else state.status.value
+                ),
                 "input_path": state.input_path,
                 "output_dir": state.output_dir,
                 "repo_root": request.repo_root,
@@ -1410,7 +1495,8 @@ class GPUQueue:
             if state.status == JobStatus.DONE:
                 self._write_metadata_sidecar(request, state)
 
-            self._move_job(job_dir, dest_status)
+            if not ownership_unresolved:
+                self._move_job(job_dir, dest_status)
             if shutdown_exception is not None:
                 raise shutdown_exception
             return True
