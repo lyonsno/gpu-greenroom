@@ -263,6 +263,12 @@ def cmd_cancel(args):
         sys.exit(1)
 
 
+def cmd_operator(args):
+    from .operator_server import serve
+
+    serve(args.queue_dir, port=args.port)
+
+
 def _load_job_types(queue_dir):
     """Load job types from defaults + config file. Called per-job so new types are picked up live."""
     job_types = dict(DEFAULT_JOB_TYPES)
@@ -624,6 +630,11 @@ def main():
     p_cancel = sub.add_parser("cancel", help="Cancel a pending job")
     p_cancel.add_argument("job_id")
     p_cancel.set_defaults(func=cmd_cancel)
+
+    # operator console
+    p_operator = sub.add_parser("operator", help="Run the authenticated localhost operator console")
+    p_operator.add_argument("--port", type=int, default=8765)
+    p_operator.set_defaults(func=cmd_operator)
 
     # worker
     p_worker = sub.add_parser("worker", help="Run the worker loop")

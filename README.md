@@ -47,6 +47,9 @@ gpu-greenroom status <job-id>
 # Cancel a pending job
 gpu-greenroom cancel <job-id>
 
+# Open the authenticated local operator console
+gpu-greenroom operator --port 8765
+
 # Start the worker (runs jobs sequentially, polls every 2s)
 gpu-greenroom worker
 

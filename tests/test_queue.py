@@ -12,7 +12,9 @@ Evidence harness contract (from Kynormous council pressure):
 import fcntl
 import json
 import os
+import signal
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -299,6 +301,98 @@ class TestCancel:
         queue.cancel(req.job_id)
         # No output files should exist
         assert len(list(Path(out_dir).iterdir())) == 0
+
+
+class TestRunningJobControl:
+    def test_running_job_records_child_identity_and_operator_stop(self, queue, tmp_path):
+        started = tmp_path / "started"
+        request = make_request(job_type="hold", output_dir=str(tmp_path / "out"))
+        queue.submit(request)
+
+        runner = threading.Thread(
+            target=queue.run_one,
+            args=({
+                "hold": [
+                    "sh",
+                    "-c",
+                    f"touch {started}; trap 'exit 143' TERM; while true; do sleep 1; done",
+                ]
+            },),
+        )
+        runner.start()
+        deadline = time.time() + 5
+        state = None
+        while time.time() < deadline:
+            state = queue.get_job(request.job_id)
+            if state and state.child_pid and started.exists():
+                break
+            time.sleep(0.01)
+
+        assert state is not None
+        assert state.worker_pid == os.getpid()
+        assert state.child_pid not in (None, os.getpid())
+        assert state.pid == state.child_pid
+        assert state.child_process_group == state.child_pid
+        assert state.child_start_identity
+
+        receipt = queue.terminate_running(
+            request.job_id,
+            requested_by="test-operator",
+            reason="bounded test stop",
+            signal_number=signal.SIGTERM,
+        )
+        runner.join(timeout=5)
+
+        assert not runner.is_alive()
+        assert receipt["status"] == "signal_delivered"
+        assert receipt["child_pid"] == state.child_pid
+        assert receipt["child_start_identity"] == state.child_start_identity
+        receipt_path = Path(receipt["receipt_path"])
+        assert receipt_path.is_file()
+        assert json.loads(receipt_path.read_text())["reason"] == "bounded test stop"
+        assert queue.get_job(request.job_id).status == JobStatus.FAILED
+
+    def test_operator_stop_refuses_worker_only_legacy_identity(self, queue):
+        request = make_request()
+        queue.submit(request)
+        pending = queue.queue_dir / "pending" / request.job_id
+        running = queue.queue_dir / "running" / request.job_id
+        import shutil
+        shutil.move(str(pending), str(running))
+        state = JobState.from_json((running / "status.json").read_text())
+        state.status = JobStatus.RUNNING
+        state.pid = os.getpid()
+        (running / "status.json").write_text(state.to_json())
+
+        with pytest.raises(RuntimeError, match="child identity"):
+            queue.terminate_running(
+                request.job_id,
+                requested_by="test-operator",
+                reason="must not signal worker",
+            )
+
+    def test_child_identity_capture_failure_does_not_leave_process_running(
+        self, queue, tmp_path, monkeypatch
+    ):
+        child_pid_path = tmp_path / "child.pid"
+        request = make_request(job_type="hold", output_dir=str(tmp_path / "out"))
+        queue.submit(request)
+        monkeypatch.setattr(queue, "_process_start_identity", lambda _pid: "")
+
+        assert queue.run_one({
+            "hold": [
+                "sh",
+                "-c",
+                f"echo $$ > {child_pid_path}; while true; do sleep 1; done",
+            ]
+        }) is True
+
+        state = queue.get_job(request.job_id)
+        assert state.status == JobStatus.FAILED
+        assert state.failure_phase == "launch"
+        assert state.child_pid is not None
+        with pytest.raises(ProcessLookupError):
+            os.kill(state.child_pid, 0)
 
 
 # --- Stale lock recovery ---

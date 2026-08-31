@@ -8,6 +8,7 @@ import os
 import select
 import shlex
 import shutil
+import signal
 import subprocess
 import time
 import uuid
@@ -22,6 +23,7 @@ STRUCTURED_COMMAND_CAPABILITY = "structured-command.v1"
 DEFAULT_WORKER_CAPABILITIES = frozenset({STRUCTURED_COMMAND_CAPABILITY})
 PAUSE_STATE_SCHEMA = "gpu-greenroom.pause-state.v1"
 PAUSE_ACK_SCHEMA = "gpu-greenroom.pause-acknowledgement.v1"
+TERMINATION_RECEIPT_SCHEMA = "gpu-greenroom.running-job-termination.v1"
 
 
 class PauseStateError(RuntimeError):
@@ -103,7 +105,14 @@ class GPUQueue:
         self.queue_dir = Path(queue_dir)
         for sub in ("pending", "running", "done", "failed", "cancelled", "outputs"):
             (self.queue_dir / sub).mkdir(parents=True, exist_ok=True)
-        for sub in ("leases", "leases/receipts", "bumps", "bumps/receipts", "events"):
+        for sub in (
+            "leases",
+            "leases/receipts",
+            "bumps",
+            "bumps/receipts",
+            "events",
+            "control-receipts",
+        ):
             (self.queue_dir / sub).mkdir(parents=True, exist_ok=True)
 
     @property
@@ -137,6 +146,10 @@ class GPUQueue:
     @property
     def events_dir(self) -> Path:
         return self.queue_dir / "events"
+
+    @property
+    def control_receipts_dir(self) -> Path:
+        return self.queue_dir / "control-receipts"
 
     @contextmanager
     def _coordination_lock(self):
@@ -204,6 +217,100 @@ class GPUQueue:
             return True
         except ProcessLookupError:
             return False
+
+    @staticmethod
+    def _process_start_identity(pid: int) -> str:
+        observed = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "lstart="],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if observed.returncode != 0:
+            return ""
+        return observed.stdout.strip()
+
+    def terminate_running(
+        self,
+        job_id: str,
+        *,
+        requested_by: str,
+        reason: str,
+        signal_number: int = signal.SIGTERM,
+    ) -> dict:
+        """Pause dispatch and signal one exactly identified running child group."""
+        if signal_number not in (signal.SIGTERM, signal.SIGKILL):
+            raise ValueError("running job control accepts only SIGTERM or SIGKILL")
+        if not requested_by.strip() or not reason.strip():
+            raise ValueError("requested_by and reason are required")
+
+        pause_ack = self.pause(
+            owner=requested_by,
+            contention_class="operator-running-job-termination",
+        )
+        with self._coordination_lock():
+            job_dir = self.queue_dir / "running" / job_id
+            status_path = job_dir / "status.json"
+            if not status_path.is_file():
+                raise RuntimeError(f"running job {job_id} not found")
+            state = JobState.from_json(status_path.read_text())
+            if state.status != JobStatus.RUNNING:
+                raise RuntimeError(f"job {job_id} is not running")
+            if not all((
+                state.child_pid,
+                state.child_process_group,
+                state.child_start_identity,
+            )):
+                raise RuntimeError(
+                    f"running job {job_id} has no exact child identity; refusing to signal worker"
+                )
+
+            observed_start = self._process_start_identity(state.child_pid)
+            if observed_start != state.child_start_identity:
+                raise RuntimeError(
+                    f"running job {job_id} child identity changed or vanished"
+                )
+            try:
+                observed_group = os.getpgid(state.child_pid)
+            except ProcessLookupError as exc:
+                raise RuntimeError(
+                    f"running job {job_id} child vanished before signal"
+                ) from exc
+            if observed_group != state.child_process_group:
+                raise RuntimeError(
+                    f"running job {job_id} process group changed; refusing signal"
+                )
+
+            receipt_path = self.control_receipts_dir / (
+                f"{time.time_ns()}-{job_id}-signal-{signal_number}.json"
+            )
+            receipt = {
+                "schema": TERMINATION_RECEIPT_SCHEMA,
+                "status": "signal_pending",
+                "job_id": job_id,
+                "requested_by": requested_by,
+                "reason": reason,
+                "signal": signal_number,
+                "child_pid": state.child_pid,
+                "child_process_group": state.child_process_group,
+                "child_start_identity": state.child_start_identity,
+                "effective_route": state.effective_route,
+                "pause_epoch": pause_ack.get("epoch"),
+                "requested_at": time.time(),
+                "receipt_path": str(receipt_path),
+            }
+            self._write_json_atomic(receipt_path, receipt)
+            try:
+                os.killpg(state.child_process_group, signal_number)
+            except OSError as exc:
+                receipt["status"] = "signal_failed"
+                receipt["error"] = str(exc)
+                self._write_json_atomic(receipt_path, receipt)
+                raise
+            receipt["status"] = "signal_delivered"
+            receipt["delivered_at"] = time.time()
+            self._write_json_atomic(receipt_path, receipt)
+            return receipt
 
     def _mark_lease_unknown_locked(self, lease: ExternalLease, reason: str) -> ExternalLease:
         if lease.lifecycle_state == LeaseStatus.OWNERSHIP_UNKNOWN:
@@ -999,6 +1106,7 @@ class GPUQueue:
                 state.status = JobStatus.RUNNING
                 state.started_at = time.time()
                 state.pid = os.getpid()
+                state.worker_pid = os.getpid()
                 (job_dir / "status.json").write_text(state.to_json())
 
             # Structured command jobs carry exact argv and bypass the global
@@ -1103,34 +1211,56 @@ class GPUQueue:
             stderr_path = job_dir / "stderr.log"
             stdout_path.touch()
             stderr_path.touch()
+            proc = None
 
             try:
                 os.makedirs(request.output_dir, exist_ok=True)
                 with open(stdout_path, "w") as out_f, open(stderr_path, "w") as err_f:
-                    proc = subprocess.run(
+                    proc = subprocess.Popen(
                         cmd,
                         stdout=out_f,
                         stderr=err_f,
                         cwd=job_cwd,
                         env=run_env,
-                        timeout=job_timeout,
+                        start_new_session=True,
                     )
-                state.exit_code = proc.returncode
-                if proc.returncode == 0:
+                    state.pid = proc.pid
+                    state.child_pid = proc.pid
+                    state.child_process_group = os.getpgid(proc.pid)
+                    state.child_start_identity = self._process_start_identity(proc.pid)
+                    if not state.child_start_identity:
+                        raise RuntimeError("could not record child process start identity")
+                    self._write_text_atomic(job_dir / "status.json", state.to_json())
+                    state.exit_code = proc.wait(timeout=job_timeout)
+                if state.exit_code == 0:
                     state.status = JobStatus.DONE
                     dest_status = "done"
                 else:
                     state.status = JobStatus.FAILED
                     state.failure_phase = "execution"
-                    state.error_message = f"Process exited with code {proc.returncode}"
+                    state.error_message = f"Process exited with code {state.exit_code}"
                     dest_status = "failed"
             except subprocess.TimeoutExpired:
+                if proc is not None and proc.poll() is None:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                        proc.wait()
                 state.status = JobStatus.FAILED
                 state.failure_phase = "timeout"
                 state.error_message = f"Job exceeded {job_timeout}s timeout"
                 state.exit_code = -1
                 dest_status = "failed"
             except Exception as e:
+                if proc is not None and proc.poll() is None:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                        proc.wait()
                 state.status = JobStatus.FAILED
                 state.failure_phase = "launch"
                 state.error_message = str(e)
@@ -1157,6 +1287,10 @@ class GPUQueue:
                 "environment_inheritance": "worker-plus-overlay",
                 "effective_defaults": job_defaults,
                 "effective_timeout": job_timeout,
+                "worker_pid": state.worker_pid,
+                "child_pid": state.child_pid,
+                "child_process_group": state.child_process_group,
+                "child_start_identity": state.child_start_identity,
                 "ignored_params": ignored_params if ignored_params else None,
                 "started_at": state.started_at,
                 "finished_at": state.finished_at,
