@@ -86,10 +86,12 @@ def test_operator_history_views_do_not_poll_automatically():
 
 def test_read_only_snapshot_does_not_refresh_lease_authority(tmp_path, monkeypatch):
     queue = GPUQueue(tmp_path / "queue")
+    queue.coordination_lock_path.write_text("preserve")
     monkeypatch.setattr(queue, "lease_status", lambda: (_ for _ in ()).throw(AssertionError("mutating lease read")))
     snapshot = queue_snapshot(queue, "active", read_only=True)
     assert snapshot["read_only"] is True
     assert snapshot["observed_at"] > 0
+    assert queue.coordination_lock_path.read_text() == "preserve"
 
 
 def test_read_only_api_rejects_mutation(tmp_path):

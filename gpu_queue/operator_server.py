@@ -34,7 +34,8 @@ async function load(){try{const r=await fetch('/api/state?view='+encodeURICompon
 </script></body></html>"""
 
 
-def queue_snapshot(queue: GPUQueue, view: str = "all", *, read_only: bool = False) -> dict:
+def queue_snapshot(queue: GPUQueue | Path, view: str = "all", *, read_only: bool = False) -> dict:
+    queue_dir = queue if isinstance(queue, Path) else queue.queue_dir
     statuses = ("pending", "running", "done", "failed", "cancelled")
     if view == "active":
         selected = ("pending", "running")
@@ -47,7 +48,7 @@ def queue_snapshot(queue: GPUQueue, view: str = "all", *, read_only: bool = Fals
 
     jobs = []
     for containment_status in selected:
-        status_dir = queue.queue_dir / containment_status
+        status_dir = queue_dir / containment_status
         for job_dir in sorted(status_dir.iterdir()):
             status_path = job_dir / "status.json"
             if not status_path.is_file():
@@ -90,21 +91,30 @@ def queue_snapshot(queue: GPUQueue, view: str = "all", *, read_only: bool = Fals
             jobs.append(row)
     jobs.sort(key=lambda item: (item.get("submitted_at") or 0), reverse=True)
     lease_payload = None
+    pause_path = queue_dir / "paused"
     if read_only:
-        if queue.current_lease_path.exists():
-            lease_payload = json.loads(queue.current_lease_path.read_text())
+        lease_path = queue_dir / "leases" / "current.json"
+        if lease_path.exists():
+            lease_payload = json.loads(lease_path.read_text())
+        try:
+            text = pause_path.read_text()
+        except FileNotFoundError:
+            paused, pause = False, None
+        else:
+            paused, pause = True, json.loads(text) if text.strip() else None
     else:
         lease = queue.lease_status()
         if lease is not None:
             lease_payload = json.loads(lease.to_json())
+        paused, pause = queue.is_paused(), queue.pause_state()
     return {
         "schema": "gpu-greenroom.operator-snapshot.v1",
         "view": view,
         "read_only": read_only,
         "observed_at": time.time(),
-        "queue_dir": str(queue.queue_dir.resolve()),
-        "paused": queue.is_paused(),
-        "pause_state": queue.pause_state(),
+        "queue_dir": str(queue_dir.resolve()),
+        "paused": paused,
+        "pause_state": pause,
         "lease": lease_payload,
         "jobs": jobs,
     }
@@ -208,7 +218,7 @@ def make_handler(queue: GPUQueue, token: str, *, read_only: bool = False):
 
 def serve(queue_dir: str | Path, *, port: int = 8765, token: str | None = None, read_only: bool = False):
     token = token or secrets.token_urlsafe(32)
-    queue = GPUQueue(queue_dir)
+    queue = Path(queue_dir) if read_only else GPUQueue(queue_dir)
     server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(queue, token, read_only=read_only))
     effective_port = server.server_address[1]
     print(f"http://127.0.0.1:{effective_port}/#token={token}", flush=True)
