@@ -84,6 +84,30 @@ def test_operator_history_views_do_not_poll_automatically():
     assert "if(filter==='active')load()" in PAGE
 
 
+def test_read_only_snapshot_does_not_refresh_lease_authority(tmp_path, monkeypatch):
+    queue = GPUQueue(tmp_path / "queue")
+    monkeypatch.setattr(queue, "lease_status", lambda: (_ for _ in ()).throw(AssertionError("mutating lease read")))
+    snapshot = queue_snapshot(queue, "active", read_only=True)
+    assert snapshot["read_only"] is True
+    assert snapshot["observed_at"] > 0
+
+
+def test_read_only_api_rejects_mutation(tmp_path):
+    queue = GPUQueue(tmp_path / "queue")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(queue, "secret", read_only=True))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with __import__('pytest').raises(HTTPError) as error:
+            urlopen(Request(f"http://127.0.0.1:{server.server_address[1]}/api/pause", data=b"{}", headers={"Authorization": "Bearer secret"}))
+        assert error.value.code == 403
+        assert not queue.is_paused()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
 def test_operator_page_renders_both_inconsistent_status_identities():
     assert "j.containment_status" in PAGE
     assert "j.declared_status" in PAGE

@@ -8,6 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import secrets
 import signal
+import time
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -33,7 +34,7 @@ async function load(){try{const r=await fetch('/api/state?view='+encodeURICompon
 </script></body></html>"""
 
 
-def queue_snapshot(queue: GPUQueue, view: str = "all") -> dict:
+def queue_snapshot(queue: GPUQueue, view: str = "all", *, read_only: bool = False) -> dict:
     statuses = ("pending", "running", "done", "failed", "cancelled")
     if view == "active":
         selected = ("pending", "running")
@@ -88,13 +89,19 @@ def queue_snapshot(queue: GPUQueue, view: str = "all") -> dict:
                 row["repo_root"] = request.get("repo_root")
             jobs.append(row)
     jobs.sort(key=lambda item: (item.get("submitted_at") or 0), reverse=True)
-    lease = queue.lease_status()
     lease_payload = None
-    if lease is not None:
-        lease_payload = json.loads(lease.to_json())
+    if read_only:
+        if queue.current_lease_path.exists():
+            lease_payload = json.loads(queue.current_lease_path.read_text())
+    else:
+        lease = queue.lease_status()
+        if lease is not None:
+            lease_payload = json.loads(lease.to_json())
     return {
         "schema": "gpu-greenroom.operator-snapshot.v1",
         "view": view,
+        "read_only": read_only,
+        "observed_at": time.time(),
         "queue_dir": str(queue.queue_dir.resolve()),
         "paused": queue.is_paused(),
         "pause_state": queue.pause_state(),
@@ -103,7 +110,7 @@ def queue_snapshot(queue: GPUQueue, view: str = "all") -> dict:
     }
 
 
-def make_handler(queue: GPUQueue, token: str):
+def make_handler(queue: GPUQueue, token: str, *, read_only: bool = False):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, _format, *_args):
             return
@@ -132,7 +139,13 @@ def make_handler(queue: GPUQueue, token: str):
         def do_GET(self):
             path = urlparse(self.path).path
             if path == "/":
-                body = PAGE.encode()
+                page = PAGE
+                if read_only:
+                    page = page.replace('<h1>GPU Greenroom</h1>', '<h1>GPU Greenroom · Read only</h1>')
+                    page = page.replace('<style>', '<style>#pause,#resume,.actions{display:none!important}')
+                    page = page.replace("s.paused?'paused':'admitting'", "s.paused?'paused':'not paused'")
+                    page = page.replace('External owner:', 'Recorded external owner:')
+                body = page.encode()
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
@@ -147,7 +160,7 @@ def make_handler(queue: GPUQueue, token: str):
                 query = parse_qs(urlparse(self.path).query)
                 view = query.get("view", ["active"])[0]
                 try:
-                    snapshot = queue_snapshot(queue, view)
+                    snapshot = queue_snapshot(queue, view, read_only=read_only)
                 except ValueError:
                     self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_view"})
                     return
@@ -158,6 +171,9 @@ def make_handler(queue: GPUQueue, token: str):
         def do_POST(self):
             if not self._authorized():
                 self._json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
+                return
+            if read_only:
+                self._json(HTTPStatus.FORBIDDEN, {"error": "read_only_monitor"})
                 return
             path = urlparse(self.path).path
             try:
@@ -190,10 +206,10 @@ def make_handler(queue: GPUQueue, token: str):
     return Handler
 
 
-def serve(queue_dir: str | Path, *, port: int = 8765, token: str | None = None):
+def serve(queue_dir: str | Path, *, port: int = 8765, token: str | None = None, read_only: bool = False):
     token = token or secrets.token_urlsafe(32)
     queue = GPUQueue(queue_dir)
-    server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(queue, token))
+    server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(queue, token, read_only=read_only))
     effective_port = server.server_address[1]
     print(f"http://127.0.0.1:{effective_port}/#token={token}", flush=True)
     server.serve_forever()
@@ -203,8 +219,9 @@ def main():
     parser = argparse.ArgumentParser(description="GPU Greenroom operator console")
     parser.add_argument("--queue-dir", default="~/.local/state/gpu-greenroom")
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--read-only", action="store_true")
     args = parser.parse_args()
-    serve(Path(args.queue_dir).expanduser(), port=args.port)
+    serve(Path(args.queue_dir).expanduser(), port=args.port, read_only=args.read_only)
 
 
 if __name__ == "__main__":
