@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import html
 import json
+import math
 import secrets
 import signal
 import time
@@ -13,6 +15,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from .queue import GPUQueue
+from .admission_control import transition
 
 
 PAGE = r"""<!doctype html>
@@ -29,8 +32,36 @@ PAGE = r"""<!doctype html>
 <script>
 const hash=new URLSearchParams(location.hash.slice(1));if(hash.get('token')){sessionStorage.setItem('greenroom-token',hash.get('token'));history.replaceState(null,'',location.pathname)}const token=sessionStorage.getItem('greenroom-token')||'';let filter='active',last=null;const statuses=['active','all','pending','running','done','failed','cancelled'];
 function auth(){return {'Authorization':'Bearer '+token,'Content-Type':'application/json'}}function err(e){const n=document.querySelector('#error');n.textContent=e;n.style.display='block';setTimeout(()=>n.style.display='none',6000)}function elapsed(j){const end=j.finished_at||Date.now()/1000,start=j.started_at||j.submitted_at;if(!start)return '—';const s=Math.max(0,end-start);if(s<60)return Math.round(s)+'s';if(s<3600)return Math.floor(s/60)+'m '+Math.round(s%60)+'s';return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'}function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-function render(s){last=s;document.querySelector('#queueState').textContent=s.paused?'paused':'admitting';document.querySelector('#dot').className='dot'+(s.paused?' paused':'');document.querySelector('#pause').disabled=s.paused;document.querySelector('#resume').disabled=!s.paused;const pm=document.querySelector('#pauseMeta'),p=s.pause_state;pm.hidden=!p;pm.textContent=p?`Pause owner: ${p.owner} · epoch ${p.epoch} · ${p.contention_class} · effective ${new Date(p.effective_at*1000).toLocaleString()}`:'';const lease=document.querySelector('#lease');lease.hidden=!s.lease;lease.textContent=s.lease?`External owner: ${s.lease.owner} · ${s.lease.effective_route} · ${s.lease.lifecycle_state}`:'';document.querySelector('#filters').innerHTML=statuses.map(x=>`<button class="filter ${filter===x?'active':''}" data-filter="${x}">${x}</button>`).join('');document.querySelectorAll('[data-filter]').forEach(b=>b.onclick=()=>{filter=b.dataset.filter;load()});const rows=s.jobs;document.querySelector('#empty').hidden=rows.length>0;document.querySelector('#jobs').innerHTML=rows.map(j=>{let a='';if(j.consistent&&j.status==='pending')a=`<button class="danger text" title="Cancel pending job" onclick="act('cancel','${j.job_id}')"><span>×</span> Cancel</button>`;if(j.consistent&&j.status==='running')a=`<button class="danger text" title="Stop running job" onclick="act('terminate','${j.job_id}')"><span>■</span> Stop</button> <button class="danger icon" title="Force stop running job" onclick="act('kill','${j.job_id}')">!</button>`;const route=j.requested_route||j.effective_route||j.job_type,conflict=j.consistent?'':`<div class="meta">containment: ${esc(j.containment_status)} · declared: ${esc(j.declared_status)}</div>`;return `<tr><td class="id">${esc(j.job_id)}<div class="meta">${esc(j.job_type)}</div></td><td class="status"><span class="pill ${esc(j.status)}">${esc(j.status)}</span>${conflict}</td><td><div class="route">${esc(route)}</div><div class="meta">${esc(j.repo_root||j.output_dir||j.record_error||'')}</div></td><td class="ageCell">${elapsed(j)}</td><td class="actions">${a}</td></tr>`}).join('')}
-async function load(){try{const r=await fetch('/api/state?view='+encodeURIComponent(filter),{headers:auth()});if(!r.ok)throw new Error(await r.text());render(await r.json())}catch(e){err(e.message)}}async function post(path,body={}){const r=await fetch(path,{method:'POST',headers:auth(),body:JSON.stringify(body)});if(!r.ok)throw new Error(await r.text());await load()}async function act(kind,id){try{if(kind==='cancel')await post('/api/cancel',{job_id:id,requested_by:'operator-console',reason:'operator cancelled pending job'});else await post('/api/terminate',{job_id:id,requested_by:'operator-console',reason:kind==='kill'?'operator force-stopped running job':'operator stopped running job',force:kind==='kill'})}catch(e){err(e.message)}}document.querySelector('#pause').onclick=()=>post('/api/pause',{requested_by:'operator-console'}).catch(e=>err(e.message));document.querySelector('#resume').onclick=()=>post('/api/resume',{requested_by:'operator-console',epoch:last?.pause_state?.epoch}).catch(e=>err(e.message));document.querySelector('#refresh').onclick=load;load();setInterval(()=>{if(filter==='active')load()},2000);
+let busy=false;
+function duration(seconds){if(seconds==null)return 'not recorded';const s=Math.floor(seconds);return s>=3600?`${Math.floor(s/3600)}h ${Math.floor(s%3600/60)}m`:s>=60?`${Math.floor(s/60)}m ${s%60}s`:`${s}s`}
+function render(s){
+  last=s;
+  const state=s.admission_state==='paused_running'?'Paused; work still running':s.paused?'Paused; no queued job running':'Queue starts enabled';
+  document.querySelector('#queueState').textContent=state;
+  document.querySelector('#dot').className='dot'+(s.paused?' paused':'');
+  document.querySelector('#pause').disabled=busy||s.paused;
+  document.querySelector('#resume').disabled=busy||!s.paused||(s.admission_control&&!s.pause_state?.epoch);
+  const pm=document.querySelector('#pauseMeta'),p=s.pause_state;
+  pm.hidden=false;pm.textContent=`Observed: ${new Date(s.observed_at*1000).toLocaleString()}`+(p?` · Pause owner: ${p.owner||'not recorded'} · epoch ${p.epoch||'not recorded'}`:'');
+  if(s.paused&&!p?.epoch)pm.textContent+=' · Legacy pause: epoch not recorded.'+(s.admission_control?' Verify pause ownership and recover through the native queue CLI; browser resume cannot bind this marker.':'');
+  const lease=document.querySelector('#lease');lease.hidden=!s.lease;
+  lease.textContent=s.lease?`Recorded external owner: ${s.lease.owner} · ${s.lease.effective_route} · ${s.lease.lifecycle_state}`:'';
+  document.querySelector('#filters').innerHTML=statuses.map(x=>`<button class="filter ${filter===x?'active':''}" data-filter="${x}">${x}</button>`).join('');
+  document.querySelectorAll('[data-filter]').forEach(b=>b.onclick=()=>{filter=b.dataset.filter;load()});
+  const rows=s.jobs;document.querySelector('#empty').hidden=rows.length>0;
+  document.querySelector('#jobs').innerHTML=rows.map(j=>{
+    let a='';
+    if(j.consistent&&j.status==='pending')a=`<button class="danger text" title="Cancel pending job" onclick="act('cancel','${j.job_id}')"><span>×</span> Cancel</button>`;
+    if(j.consistent&&j.status==='running')a=`<button class="danger text" title="Stop running job" onclick="act('terminate','${j.job_id}')"><span>■</span> Stop</button> <button class="danger icon" title="Force stop running job" onclick="act('kill','${j.job_id}')">!</button>`;
+    const route=j.requested_route||j.effective_route||j.job_type;
+    const conflict=j.consistent?'':`<div class="meta">containment: ${esc(j.containment_status)} · declared: ${esc(j.declared_status)}</div>`;
+    return `<tr><td class="id">${esc(j.job_id)}<div class="meta">${esc(j.job_type)}</div></td><td class="status"><span class="pill ${esc(j.status)}">${esc(j.status)}</span>${conflict}</td><td><div class="route">${esc(route)}</div><div class="meta">${esc(document.body.dataset.identityLabel||'Agent')}: ${esc(j.agent_id||'not recorded')}</div><div class="meta">${esc(j.repo_root||j.output_dir||j.record_error||'')}</div></td><td class="ageCell"><div>Submitted: ${j.submitted_at?esc(new Date(j.submitted_at*1000).toLocaleString()):'not recorded'}</div><div>Queue wait: ${duration(j.queue_wait_seconds)}</div><div>Execution wall time: ${duration(j.execution_wall_seconds)}</div><div class="meta">GPU hold time: not recorded</div></td><td class="actions">${a}</td></tr>`;
+  }).join('');
+}
+async function load(){try{const r=await fetch('/api/state?view='+encodeURIComponent(filter),{headers:auth()});if(!r.ok)throw new Error(await r.text());render(await r.json())}catch(e){document.querySelector('#queueState').textContent='State unavailable';document.querySelector('#pause').disabled=true;document.querySelector('#resume').disabled=true;err(e.message)}}
+async function post(path,body={}){if(busy)return;busy=true;if(last)render(last);try{const r=await fetch(path,{method:'POST',headers:auth(),body:JSON.stringify({...body,request_id:crypto.randomUUID()})});if(!r.ok)throw new Error(await r.text())}finally{busy=false;await load()}}
+async function act(kind,id){try{if(kind==='cancel')await post('/api/cancel',{job_id:id,requested_by:'operator-console',reason:'operator cancelled pending job'});else await post('/api/terminate',{job_id:id,requested_by:'operator-console',reason:'operator stopped running job',force:kind==='kill'})}catch(e){err(e.message)}}
+document.querySelector('#pause').onclick=()=>post('/api/pause',{requested_by:'operator-console'}).catch(e=>err(e.message));document.querySelector('#resume').onclick=()=>post('/api/resume',{requested_by:'operator-console',epoch:last?.pause_state?.epoch}).catch(e=>err(e.message));document.querySelector('#refresh').onclick=load;load();setInterval(()=>{if(filter==='active')load()},2000);
 </script></body></html>"""
 
 
@@ -86,8 +117,20 @@ def queue_snapshot(queue: GPUQueue | Path, view: str = "all", *, read_only: bool
                     request = json.loads(request_path.read_text())
                 except (OSError, json.JSONDecodeError):
                     request = {}
+                if not isinstance(request, dict):
+                    request = {}
+                row["agent_id"] = request.get("agent_id")
                 row["requested_route"] = request.get("route_identity")
                 row["repo_root"] = request.get("repo_root")
+            now = time.time()
+            submitted, started, finished = (row.get(key) for key in ('submitted_at', 'started_at', 'finished_at'))
+            def difference(end, start):
+                if not all(isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) for value in (end, start)):
+                    return None
+                return end - start if end >= start else None
+            wait_end = started if started is not None else (now if declared_status == 'pending' else None)
+            row['queue_wait_seconds'] = difference(wait_end, submitted) if consistent else None
+            row['execution_wall_seconds'] = difference(finished or (now if declared_status == 'running' else None), started) if consistent else None
             jobs.append(row)
     jobs.sort(key=lambda item: (item.get("submitted_at") or 0), reverse=True)
     lease_payload = None
@@ -107,6 +150,11 @@ def queue_snapshot(queue: GPUQueue | Path, view: str = "all", *, read_only: bool
         if lease is not None:
             lease_payload = json.loads(lease.to_json())
         paused, pause = queue.is_paused(), queue.pause_state()
+    running_ids = sorted(path.name for path in (queue_dir / 'running').iterdir())
+    if paused:
+        admission_state = 'paused_running' if running_ids else 'paused'
+    else:
+        admission_state = 'not_paused'
     return {
         "schema": "gpu-greenroom.operator-snapshot.v1",
         "view": view,
@@ -114,13 +162,15 @@ def queue_snapshot(queue: GPUQueue | Path, view: str = "all", *, read_only: bool
         "observed_at": time.time(),
         "queue_dir": str(queue_dir.resolve()),
         "paused": paused,
+        "admission_state": admission_state,
+        "running_job_ids": running_ids,
         "pause_state": pause,
         "lease": lease_payload,
         "jobs": jobs,
     }
 
 
-def make_handler(queue: GPUQueue, token: str, *, read_only: bool = False):
+def make_handler(queue: GPUQueue | Path, token: str, *, read_only: bool = False, admission_control: bool = False, identity_label: str = 'Agent'):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, _format, *_args):
             return
@@ -150,7 +200,12 @@ def make_handler(queue: GPUQueue, token: str, *, read_only: bool = False):
             path = urlparse(self.path).path
             if path == "/":
                 page = PAGE
-                if read_only:
+                page = page.replace('<body>', f'<body data-identity-label="{html.escape(identity_label, quote=True)}">')
+                page = page.replace('<th class="age">Elapsed</th>', '<th class="age">Timing</th>')
+                page = page.replace('</style>', 'header{min-height:56px;height:auto;flex-wrap:wrap;padding-top:8px;padding-bottom:8px}.age,.ageCell{width:260px}.ageCell{font-size:12px}table{min-width:1000px}@media(max-width:760px){.age,.ageCell{display:table-cell}.state{flex:1;min-width:170px}}\n</style>')
+                if admission_control:
+                    page = page.replace('<style>', '<style>.actions{display:none!important}')
+                elif read_only:
                     page = page.replace('<h1>GPU Greenroom</h1>', '<h1>GPU Greenroom · Read only</h1>')
                     page = page.replace('<style>', '<style>#pause,#resume,.actions{display:none!important}')
                     page = page.replace("s.paused?'paused':'admitting'", "s.paused?'paused':'not paused'")
@@ -170,7 +225,8 @@ def make_handler(queue: GPUQueue, token: str, *, read_only: bool = False):
                 query = parse_qs(urlparse(self.path).query)
                 view = query.get("view", ["active"])[0]
                 try:
-                    snapshot = queue_snapshot(queue, view, read_only=read_only)
+                    snapshot = queue_snapshot(queue, view, read_only=read_only or admission_control)
+                    snapshot['admission_control'] = admission_control
                 except ValueError:
                     self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_view"})
                     return
@@ -181,6 +237,21 @@ def make_handler(queue: GPUQueue, token: str, *, read_only: bool = False):
         def do_POST(self):
             if not self._authorized():
                 self._json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
+                return
+            path = urlparse(self.path).path
+            if admission_control:
+                if path not in {'/api/pause', '/api/resume'}:
+                    self._json(HTTPStatus.FORBIDDEN, {'error': 'admission_controls_only'})
+                    return
+                try:
+                    body = self._body()
+                    root = queue if isinstance(queue, Path) else queue.queue_dir
+                    result = transition(GPUQueue(root), action=path.removeprefix('/api/'),
+                        request_id=body.get('request_id'), owner=body.get('requested_by'), epoch=body.get('epoch'))
+                except (ValueError, RuntimeError, OSError) as exc:
+                    self._json(HTTPStatus.CONFLICT, {'error': str(exc)})
+                    return
+                self._json(HTTPStatus.OK, result)
                 return
             if read_only:
                 self._json(HTTPStatus.FORBIDDEN, {"error": "read_only_monitor"})
@@ -216,10 +287,10 @@ def make_handler(queue: GPUQueue, token: str, *, read_only: bool = False):
     return Handler
 
 
-def serve(queue_dir: str | Path, *, port: int = 8765, token: str | None = None, read_only: bool = False):
+def serve(queue_dir: str | Path, *, port: int = 8765, token: str | None = None, read_only: bool = False, admission_control: bool = False, identity_label: str = 'Agent'):
     token = token or secrets.token_urlsafe(32)
-    queue = Path(queue_dir) if read_only else GPUQueue(queue_dir)
-    server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(queue, token, read_only=read_only))
+    queue = Path(queue_dir) if read_only or admission_control else GPUQueue(queue_dir)
+    server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(queue, token, read_only=read_only, admission_control=admission_control, identity_label=identity_label))
     effective_port = server.server_address[1]
     print(f"http://127.0.0.1:{effective_port}/#token={token}", flush=True)
     server.serve_forever()
@@ -229,9 +300,12 @@ def main():
     parser = argparse.ArgumentParser(description="GPU Greenroom operator console")
     parser.add_argument("--queue-dir", default="~/.local/state/gpu-greenroom")
     parser.add_argument("--port", type=int, default=8765)
-    parser.add_argument("--read-only", action="store_true")
+    parser.add_argument("--identity-label", default="Agent")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--read-only", action="store_true")
+    modes.add_argument("--admission-control", action="store_true")
     args = parser.parse_args()
-    serve(Path(args.queue_dir).expanduser(), port=args.port, read_only=args.read_only)
+    serve(Path(args.queue_dir).expanduser(), port=args.port, read_only=args.read_only, admission_control=args.admission_control, identity_label=args.identity_label)
 
 
 if __name__ == "__main__":
