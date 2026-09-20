@@ -180,6 +180,9 @@ def make_handler(queue: GPUQueue | Path, token: str, *, read_only: bool = False,
                 self.headers.get("Authorization", ""), f"Bearer {token}"
             )
 
+        def _canonical_authority(self) -> bool:
+            return self.headers.get("Host", "") == f"127.0.0.1:{self.server.server_port}"
+
         def _json(self, status: int, payload: dict):
             body = json.dumps(payload).encode()
             self.send_response(status)
@@ -197,6 +200,9 @@ def make_handler(queue: GPUQueue | Path, token: str, *, read_only: bool = False,
             return payload
 
         def do_GET(self):
+            if not self._canonical_authority():
+                self._json(HTTPStatus.MISDIRECTED_REQUEST, {"error": "invalid_host"})
+                return
             path = urlparse(self.path).path
             if path == "/":
                 page = PAGE
@@ -248,6 +254,9 @@ def make_handler(queue: GPUQueue | Path, token: str, *, read_only: bool = False,
             self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
         def do_POST(self):
+            if not self._canonical_authority():
+                self._json(HTTPStatus.MISDIRECTED_REQUEST, {"error": "invalid_host"})
+                return
             if not self._authorized():
                 self._json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
                 return

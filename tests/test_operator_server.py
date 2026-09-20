@@ -180,6 +180,38 @@ def test_local_operator_root_bootstraps_current_token_without_weakening_api(tmp_
         thread.join(timeout=2)
 
 
+def test_local_operator_rejects_noncanonical_host_before_disclosing_or_authorizing(tmp_path):
+    queue = GPUQueue(tmp_path / "queue")
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 0),
+        make_handler(queue, "process-secret", local_operator=True),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        hostile_root = Request(base + "/", headers={"Host": "attacker.example"})
+        with __import__('pytest').raises(HTTPError) as root_error:
+            urlopen(hostile_root)
+        assert root_error.value.code == 421
+        assert b"process-secret" not in root_error.value.read()
+
+        hostile_api = Request(
+            base + "/api/state",
+            headers={
+                "Authorization": "Bearer process-secret",
+                "Host": "attacker.example",
+            },
+        )
+        with __import__('pytest').raises(HTTPError) as api_error:
+            urlopen(hostile_api)
+        assert api_error.value.code == 421
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 def test_default_root_never_discloses_bearer_token(tmp_path):
     queue = GPUQueue(tmp_path / "queue")
     server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(queue, "private-token"))
