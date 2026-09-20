@@ -181,7 +181,15 @@ def make_handler(queue: GPUQueue | Path, token: str, *, read_only: bool = False,
             )
 
         def _canonical_authority(self) -> bool:
-            return self.headers.get("Host", "") == f"127.0.0.1:{self.server.server_port}"
+            hosts = self.headers.get_all("Host", [])
+            target = urlparse(self.path)
+            return (
+                hosts == [f"127.0.0.1:{self.server.server_port}"]
+                and self.path.startswith("/")
+                and not self.path.startswith("//")
+                and not target.scheme
+                and not target.netloc
+            )
 
         def _json(self, status: int, payload: dict):
             body = json.dumps(payload).encode()

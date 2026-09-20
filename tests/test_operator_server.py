@@ -1,4 +1,5 @@
 import json
+import http.client
 import re
 import threading
 from urllib.error import HTTPError
@@ -206,6 +207,71 @@ def test_local_operator_rejects_noncanonical_host_before_disclosing_or_authorizi
         with __import__('pytest').raises(HTTPError) as api_error:
             urlopen(hostile_api)
         assert api_error.value.code == 421
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_local_operator_rejects_ambiguous_or_non_origin_form_authorities(tmp_path):
+    queue = GPUQueue(tmp_path / "queue")
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 0),
+        make_handler(queue, "process-secret", local_operator=True),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    port = server.server_address[1]
+    canonical = f"127.0.0.1:{port}"
+
+    def request(method, target, headers, body=None):
+        connection = http.client.HTTPConnection("127.0.0.1", port)
+        connection.putrequest(method, target, skip_host=True)
+        for name, value in headers:
+            connection.putheader(name, value)
+        if body is not None:
+            connection.putheader("Content-Length", str(len(body)))
+        connection.endheaders(body)
+        response = connection.getresponse()
+        result = response.status, response.read()
+        connection.close()
+        return result
+
+    try:
+        status, body = request("GET", "/", [("Host", canonical), ("Host", "attacker.example")])
+        assert status == 421
+        assert b"process-secret" not in body
+
+        status, _ = request(
+            "POST",
+            "/api/pause",
+            [
+                ("Host", canonical),
+                ("Host", "attacker.example"),
+                ("Authorization", "Bearer process-secret"),
+                ("Content-Type", "application/json"),
+            ],
+            b"{}",
+        )
+        assert status == 421
+        assert not queue.is_paused()
+
+        status, body = request("GET", "http://attacker.example/", [("Host", canonical)])
+        assert status == 421
+        assert b"process-secret" not in body
+
+        status, _ = request(
+            "POST",
+            "http://attacker.example/api/pause",
+            [
+                ("Host", canonical),
+                ("Authorization", "Bearer process-secret"),
+                ("Content-Type", "application/json"),
+            ],
+            b"{}",
+        )
+        assert status == 421
+        assert not queue.is_paused()
     finally:
         server.shutdown()
         server.server_close()
