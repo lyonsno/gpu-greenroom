@@ -84,6 +84,14 @@ class TestCLICancel:
         assert rc == 1
 
 
+def test_operator_help_exposes_persistent_local_console_mode():
+    rc, out, _ = run_cli("operator", "--help")
+    assert rc == 0
+    assert "--local-operator" in out
+    assert "--admission-control" in out
+    assert "--identity-label" in out
+
+
 class TestCLIPauseResume:
     def test_pause_cli(self, queue_dir):
         rc, out, _ = run_cli("pause", queue_dir=queue_dir)

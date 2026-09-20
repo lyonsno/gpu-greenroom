@@ -267,7 +267,14 @@ def cmd_cancel(args):
 def cmd_operator(args):
     from .operator_server import serve
 
-    serve(args.queue_dir, port=args.port)
+    serve(
+        args.queue_dir,
+        port=args.port,
+        read_only=args.read_only,
+        admission_control=args.admission_control,
+        identity_label=args.identity_label,
+        local_operator=args.local_operator,
+    )
 
 
 def _load_job_types(queue_dir):
@@ -644,6 +651,11 @@ def main():
     # operator console
     p_operator = sub.add_parser("operator", help="Run the authenticated localhost operator console")
     p_operator.add_argument("--port", type=int, default=8765)
+    p_operator.add_argument("--identity-label", default="Agent")
+    p_operator.add_argument("--local-operator", action="store_true")
+    operator_modes = p_operator.add_mutually_exclusive_group()
+    operator_modes.add_argument("--read-only", action="store_true")
+    operator_modes.add_argument("--admission-control", action="store_true")
     p_operator.set_defaults(func=cmd_operator)
 
     # worker

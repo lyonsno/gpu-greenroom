@@ -1,10 +1,11 @@
 import json
+import re
 import threading
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from gpu_queue.models import ExternalLease, JobRequest, JobStatus
-from gpu_queue.operator_server import PAGE, make_handler, queue_snapshot
+from gpu_queue.operator_server import PAGE, make_handler, operator_url, queue_snapshot
 from gpu_queue.queue import GPUQueue
 from http.server import ThreadingHTTPServer
 
@@ -146,6 +147,81 @@ def test_operator_api_requires_token_and_cancels_pending(tmp_path):
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def test_local_operator_root_bootstraps_current_token_without_weakening_api(tmp_path):
+    queue = GPUQueue(tmp_path / "queue")
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 0),
+        make_handler(queue, "process-secret", local_operator=True),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        response = urlopen(base + "/")
+        page = response.read().decode()
+        assert 'globalThis.__GREENROOM_LOCAL_OPERATOR__=true' in page
+        assert 'globalThis.__GREENROOM_BOOTSTRAP_TOKEN__="process-secret"' in page
+        assert response.headers["Cache-Control"] == "no-store"
+        assert response.headers["Referrer-Policy"] == "no-referrer"
+        assert response.headers["X-Frame-Options"] == "DENY"
+        with __import__('pytest').raises(HTTPError) as error:
+            urlopen(base + "/api/state")
+        assert error.value.code == 401
+        state = urlopen(Request(
+            base + "/api/state",
+            headers={"Authorization": "Bearer process-secret"},
+        ))
+        assert json.load(state)["schema"] == "gpu-greenroom.operator-snapshot.v1"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_default_root_never_discloses_bearer_token(tmp_path):
+    queue = GPUQueue(tmp_path / "queue")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(queue, "private-token"))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        page = urlopen(f"http://127.0.0.1:{server.server_address[1]}/").read().decode()
+        assert "private-token" not in page
+        assert "__GREENROOM_LOCAL_OPERATOR__=true" not in page
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_local_operator_page_reseats_rotated_process_token(tmp_path):
+    queue = GPUQueue(tmp_path / "queue")
+
+    def rendered(token):
+        server = ThreadingHTTPServer(
+            ("127.0.0.1", 0), make_handler(queue, token, local_operator=True)
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            return urlopen(f"http://127.0.0.1:{server.server_address[1]}/").read().decode()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    before = rendered("before-restart")
+    after = rendered("after-restart")
+    assert 'globalThis.__GREENROOM_BOOTSTRAP_TOKEN__="before-restart"' in before
+    assert "before-restart" not in after
+    assert 'globalThis.__GREENROOM_BOOTSTRAP_TOKEN__="after-restart"' in after
+    assert "r.status===401&&globalThis.__GREENROOM_LOCAL_OPERATOR__" in after
+
+
+def test_local_operator_printed_url_is_stable_and_does_not_disclose_token():
+    assert operator_url(8766, "private-token", local_operator=True) == "http://127.0.0.1:8766/"
+    assert operator_url(8766, "private-token") == "http://127.0.0.1:8766/#token=private-token"
 
 
 def test_operator_resume_rejects_stale_observed_pause_epoch(tmp_path):

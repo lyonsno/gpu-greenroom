@@ -47,8 +47,14 @@ gpu-greenroom status <job-id>
 # Cancel a pending job
 gpu-greenroom cancel <job-id>
 
-# Open the authenticated local operator console
+# Open a one-shot authenticated local operator console; use the printed token URL
 gpu-greenroom operator --port 8765
+
+# Run the persistent loopback-only operator console at a stable URL.
+# Loading the page seats the current process credential, including after restart.
+gpu-greenroom operator --local-operator --admission-control \
+  --identity-label Agent --port 8766
+# Open any time: http://127.0.0.1:8766/
 
 # Start the worker (runs jobs sequentially, polls every 2s)
 gpu-greenroom worker
