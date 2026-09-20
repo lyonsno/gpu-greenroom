@@ -1,6 +1,7 @@
 import json
 import http.client
 import re
+import socket
 import threading
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -265,6 +266,56 @@ def test_local_operator_rejects_ambiguous_or_non_origin_form_authorities(tmp_pat
             "http://attacker.example/api/pause",
             [
                 ("Host", canonical),
+                ("Authorization", "Bearer process-secret"),
+                ("Content-Type", "application/json"),
+            ],
+            b"{}",
+        )
+        assert status == 421
+        assert not queue.is_paused()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_local_operator_rejects_raw_network_path_targets_before_dispatch(tmp_path):
+    queue = GPUQueue(tmp_path / "queue")
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 0),
+        make_handler(queue, "process-secret", local_operator=True),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    port = server.server_address[1]
+    canonical = f"127.0.0.1:{port}"
+
+    def raw_request(method, target, headers=(), body=b""):
+        lines = [f"{method} {target} HTTP/1.1", f"Host: {canonical}", "Connection: close"]
+        lines.extend(f"{name}: {value}" for name, value in headers)
+        if body:
+            lines.append(f"Content-Length: {len(body)}")
+        request = "\r\n".join(lines).encode() + b"\r\n\r\n" + body
+        with socket.create_connection(("127.0.0.1", port)) as connection:
+            connection.sendall(request)
+            response = b""
+            while chunk := connection.recv(4096):
+                response += chunk
+        return int(response.split(b" ", 2)[1]), response
+
+    try:
+        for target in ("//", "//?view=active"):
+            status, response = raw_request("GET", target)
+            assert status == 421
+            assert b"process-secret" not in response
+
+        status, _ = raw_request("GET", "//api/state", [("Authorization", "Bearer process-secret")])
+        assert status == 421
+
+        status, _ = raw_request(
+            "POST",
+            "//api/pause",
+            [
                 ("Authorization", "Bearer process-secret"),
                 ("Content-Type", "application/json"),
             ],

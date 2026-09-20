@@ -175,6 +175,15 @@ def make_handler(queue: GPUQueue | Path, token: str, *, read_only: bool = False,
         def log_message(self, _format, *_args):
             return
 
+        def parse_request(self) -> bool:
+            # BaseHTTPRequestHandler collapses a leading // in self.path. Preserve
+            # the request-target first so authority validation sees the wire form.
+            words = self.raw_requestline.rstrip(b"\r\n").split()
+            self._raw_request_target = (
+                words[1].decode("iso-8859-1") if 2 <= len(words) <= 3 else ""
+            )
+            return super().parse_request()
+
         def _authorized(self) -> bool:
             return secrets.compare_digest(
                 self.headers.get("Authorization", ""), f"Bearer {token}"
@@ -182,11 +191,12 @@ def make_handler(queue: GPUQueue | Path, token: str, *, read_only: bool = False,
 
         def _canonical_authority(self) -> bool:
             hosts = self.headers.get_all("Host", [])
-            target = urlparse(self.path)
+            raw_target = self._raw_request_target
+            target = urlparse(raw_target)
             return (
                 hosts == [f"127.0.0.1:{self.server.server_port}"]
-                and self.path.startswith("/")
-                and not self.path.startswith("//")
+                and raw_target.startswith("/")
+                and not raw_target.startswith("//")
                 and not target.scheme
                 and not target.netloc
             )
