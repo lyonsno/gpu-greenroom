@@ -27,6 +27,7 @@ gpu-greenroom submit trellis2mlx /path/to/image.png /path/to/output/ -p seed=99 
 
 # Submit an exact repository-local argv without editing job_types.json
 gpu-greenroom submit-command \
+  --agent-id "greenroom-floor-manager" \
   --repo-root /path/to/repo \
   --cwd /path/to/repo \
   --route-identity "assays/grid32-bounded" \
@@ -171,6 +172,7 @@ global job type. It accepts flags or a caller-owned
 ```json
 {
   "schema": "gpu-greenroom.command.v1",
+  "agent_id": "greenroom-floor-manager",
   "repo_root": "/path/to/repo",
   "cwd": "/path/to/repo",
   "env": {"BACKEND": "mlx"},
@@ -180,6 +182,12 @@ global job type. It accepts flags or a caller-owned
   "timeout": null
 }
 ```
+
+`agent_id` is the exact owning agent identity declared by the caller. It is
+optional for compatibility with historical requests, which the operator monitor
+continues to label as `not recorded`; do not infer it from a route or worktree.
+Flag-based command submission accepts the same value as `--agent-id`, and
+ordinary `submit` accepts `--agent-id` as well.
 
 `argv` is executed directly with `shell=False`; no part is reparsed as a shell
 string and no template substitution is applied. `timeout: null` means no

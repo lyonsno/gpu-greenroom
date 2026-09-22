@@ -33,6 +33,7 @@ def test_submit_command_manifest_preserves_exact_structured_identity(tmp_path):
     literal_arg = "literal; shell syntax stays data"
     manifest = {
         "schema": "gpu-greenroom.command.v1",
+        "agent_id": "greenroom-floor-manager",
         "repo_root": str(repo_root),
         "cwd": str(repo_root),
         "env": {"RESULT_NAME": "proof.json"},
@@ -64,8 +65,10 @@ def test_submit_command_manifest_preserves_exact_structured_identity(tmp_path):
     assert response["schema"] == "gpu-greenroom.command-submission.v1"
     assert response["status"] == "pending"
     assert response["effective_queue_dir"] == str(queue_dir.resolve())
+    assert response["agent_id"] == manifest["agent_id"]
     request_path = Path(response["request_path"])
     request = json.loads(request_path.read_text())
+    assert request["agent_id"] == manifest["agent_id"]
     assert request["command_argv"] == manifest["argv"]
     assert request["command_cwd"] == str(repo_root)
     assert request["command_env"] == {"RESULT_NAME": "proof.json"}
@@ -164,6 +167,27 @@ def test_invalid_manifest_writes_submission_failure_report(tmp_path):
     assert report_path.exists()
     assert json.loads(report_path.read_text()) == failure
     assert not any((queue_dir / "pending").iterdir())
+
+
+def test_command_manifest_rejects_blank_agent_id(tmp_path):
+    queue_dir = tmp_path / "queue"
+    manifest_path = tmp_path / "blank-agent.json"
+    manifest_path.write_text(json.dumps({
+        "schema": "gpu-greenroom.command.v1",
+        "agent_id": "",
+        "repo_root": str(tmp_path),
+        "cwd": str(tmp_path),
+        "route_identity": "fixture/blank-agent",
+        "argv": [sys.executable, "-c", "print('unreachable')"],
+    }))
+
+    rc, stdout, stderr = run_cli(
+        "submit-command", "--manifest", str(manifest_path), queue_dir=queue_dir
+    )
+
+    assert rc == 2
+    assert stdout == ""
+    assert "agent_id must be a non-empty string when supplied" in json.loads(stderr)["error_message"]
 
 
 def test_paused_queue_accepts_command_but_does_not_start_it(tmp_path):

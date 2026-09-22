@@ -48,6 +48,17 @@ class TestCLISubmit:
         assert req["params"]["seed"] == "123"
         assert req["params"]["resolution"] == "512"
 
+    def test_submit_persists_caller_declared_diaulos(self, queue_dir):
+        rc, _, err = run_cli(
+            "submit", "trellis2mlx", "/tmp/test.png", "/tmp/out",
+            "--agent-id", "greenroom-floor-manager", queue_dir=queue_dir,
+        )
+
+        assert rc == 0, err
+        job_dir = next((queue_dir / "pending").iterdir())
+        request = json.loads((job_dir / "request.json").read_text())
+        assert request["agent_id"] == "greenroom-floor-manager"
+
 
 class TestCLIList:
     def test_list_empty(self, queue_dir):

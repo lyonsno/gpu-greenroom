@@ -40,6 +40,8 @@ class JobRequest:
     input_path: str
     output_dir: str = ""
     params: dict[str, Any] = field(default_factory=dict)
+    # Exact caller-declared agent identity. Historical requests may omit it.
+    agent_id: str | None = None
     repo_root: str | None = None
     command_argv: list[str] | None = None
     command_cwd: str | None = None

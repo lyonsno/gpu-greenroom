@@ -87,6 +87,7 @@ def cmd_submit(args):
         input_path=args.input,
         output_dir=args.output_dir,
         params=params,
+        agent_id=args.agent_id,
     )
     job_dir = queue.submit(request)
     print(f"Submitted job {request.job_id}")
@@ -97,6 +98,8 @@ def cmd_submit(args):
         print(f"  (auto-assigned durable output dir)")
     if args.cwd:
         print(f"  Cwd: {args.cwd}")
+    if request.agent_id:
+        print(f"  Agent ID: {request.agent_id}")
     print(f"  Dir: {job_dir}")
 
 
@@ -123,6 +126,7 @@ def _command_payload(args):
             argv = argv[1:]
         payload = {
             "schema": "gpu-greenroom.command.v1",
+            "agent_id": args.agent_id,
             "repo_root": args.repo_root,
             "cwd": args.cwd,
             "env": _parse_env_assignments(args.env),
@@ -136,6 +140,9 @@ def _command_payload(args):
         raise ValueError("command manifest must be a JSON object")
     if payload.get("schema") != "gpu-greenroom.command.v1":
         raise ValueError("command manifest schema must be gpu-greenroom.command.v1")
+    agent_id = payload.get("agent_id")
+    if agent_id is not None and (not isinstance(agent_id, str) or not agent_id.strip()):
+        raise ValueError("command manifest agent_id must be a non-empty string when supplied")
     argv = payload.get("argv")
     if not isinstance(argv, list) or not argv or not all(isinstance(item, str) for item in argv):
         raise ValueError("command manifest argv must be a non-empty list of strings")
@@ -165,6 +172,7 @@ def _command_payload(args):
         "repo_root": str(repo_root),
         "cwd": str(cwd),
         "env": env,
+        "agent_id": agent_id,
         "output_dir": output_dir,
         "route_identity": payload["route_identity"],
         "argv": argv,
@@ -206,6 +214,7 @@ def cmd_submit_command(args):
         job_type="command",
         input_path="",
         output_dir=payload["output_dir"],
+        agent_id=payload["agent_id"],
         repo_root=payload["repo_root"],
         command_argv=payload["argv"],
         command_cwd=payload["cwd"],
@@ -222,6 +231,7 @@ def cmd_submit_command(args):
         "effective_queue_dir": str(queue.queue_dir.resolve()),
         "request_path": str((job_dir / "request.json").resolve()),
         "output_dir": request.output_dir,
+        "agent_id": request.agent_id,
         "route_identity": request.route_identity,
         "required_worker_capabilities": request.required_worker_capabilities,
     }
@@ -616,6 +626,10 @@ def main():
     p_submit.add_argument("output_dir", nargs="?", default="", help="Output directory (default: durable path in queue dir)")
     p_submit.add_argument("-p", "--params", nargs="*", help="Key=value params (e.g. seed=42)")
     p_submit.add_argument("--cwd", help="Override working directory (e.g. for branch/worktree)")
+    p_submit.add_argument(
+        "--agent-id",
+        help="Exact owning agent identity; omitted identity remains not recorded",
+    )
     p_submit.set_defaults(func=cmd_submit)
 
     # submit-command
@@ -624,6 +638,10 @@ def main():
         help="Submit an exact structured argv without editing job_types.json",
     )
     p_command.add_argument("--manifest", help="gpu-greenroom.command.v1 JSON manifest")
+    p_command.add_argument(
+        "--agent-id",
+        help="Exact owning agent identity for flag-based submission",
+    )
     p_command.add_argument("--repo-root")
     p_command.add_argument("--cwd")
     p_command.add_argument("--env", action="append", default=[], metavar="KEY=VALUE")
