@@ -212,6 +212,32 @@ def test_command_manifest_rejects_simultaneous_agent_id_flag(tmp_path):
     assert not any((queue_dir / "pending").iterdir())
 
 
+def test_command_manifest_records_blank_agent_id_flag_validation_failure(tmp_path):
+    queue_dir = tmp_path / "queue"
+    manifest_path = tmp_path / "command.json"
+    manifest_path.write_text(json.dumps({
+        "schema": "gpu-greenroom.command.v1",
+        "repo_root": str(tmp_path),
+        "cwd": str(tmp_path),
+        "route_identity": "fixture/blank-agent-id-flag",
+        "argv": [sys.executable, "-c", "print('unreachable')"],
+    }))
+
+    rc, stdout, stderr = run_cli(
+        "submit-command", "--manifest", str(manifest_path),
+        "--agent-id", "", queue_dir=queue_dir,
+    )
+
+    assert rc == 2
+    assert stdout == ""
+    failure = json.loads(stderr)
+    assert failure["schema"] == "gpu-greenroom.command-submission-failure.v1"
+    assert failure["failure_phase"] == "submission-validation"
+    assert "--agent-id cannot be used with --manifest" in failure["error_message"]
+    assert Path(failure["report_path"]).exists()
+    assert not any((queue_dir / "pending").iterdir())
+
+
 def test_paused_queue_accepts_command_but_does_not_start_it(tmp_path):
     queue = GPUQueue(tmp_path / "queue")
     repo_root = tmp_path / "repo"

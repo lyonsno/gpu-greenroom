@@ -656,7 +656,6 @@ def main():
     p_command.add_argument("--manifest", help="gpu-greenroom.command.v1 JSON manifest")
     p_command.add_argument(
         "--agent-id",
-        type=_agent_id_arg,
         help="Exact owning agent identity for flag-based submission",
     )
     p_command.add_argument("--repo-root")
