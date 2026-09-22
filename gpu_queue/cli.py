@@ -72,6 +72,21 @@ def get_queue(args) -> GPUQueue:
     return GPUQueue(args.queue_dir)
 
 
+def _optional_agent_id(value):
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("agent_id must be a non-empty string when supplied")
+    return value
+
+
+def _agent_id_arg(value):
+    try:
+        return _optional_agent_id(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+
+
 def cmd_submit(args):
     queue = get_queue(args)
     params = {}
@@ -87,7 +102,7 @@ def cmd_submit(args):
         input_path=args.input,
         output_dir=args.output_dir,
         params=params,
-        agent_id=args.agent_id,
+        agent_id=_optional_agent_id(args.agent_id),
     )
     job_dir = queue.submit(request)
     print(f"Submitted job {request.job_id}")
@@ -118,6 +133,8 @@ def _parse_env_assignments(assignments):
 def _command_payload(args):
     manifest_path = None
     if args.manifest:
+        if args.agent_id is not None:
+            raise ValueError("--agent-id cannot be used with --manifest; declare agent_id in the manifest")
         manifest_path = Path(args.manifest).expanduser().resolve()
         payload = json.loads(manifest_path.read_text())
     else:
@@ -140,9 +157,7 @@ def _command_payload(args):
         raise ValueError("command manifest must be a JSON object")
     if payload.get("schema") != "gpu-greenroom.command.v1":
         raise ValueError("command manifest schema must be gpu-greenroom.command.v1")
-    agent_id = payload.get("agent_id")
-    if agent_id is not None and (not isinstance(agent_id, str) or not agent_id.strip()):
-        raise ValueError("command manifest agent_id must be a non-empty string when supplied")
+    agent_id = _optional_agent_id(payload.get("agent_id"))
     argv = payload.get("argv")
     if not isinstance(argv, list) or not argv or not all(isinstance(item, str) for item in argv):
         raise ValueError("command manifest argv must be a non-empty list of strings")
@@ -628,6 +643,7 @@ def main():
     p_submit.add_argument("--cwd", help="Override working directory (e.g. for branch/worktree)")
     p_submit.add_argument(
         "--agent-id",
+        type=_agent_id_arg,
         help="Exact owning agent identity; omitted identity remains not recorded",
     )
     p_submit.set_defaults(func=cmd_submit)
@@ -640,6 +656,7 @@ def main():
     p_command.add_argument("--manifest", help="gpu-greenroom.command.v1 JSON manifest")
     p_command.add_argument(
         "--agent-id",
+        type=_agent_id_arg,
         help="Exact owning agent identity for flag-based submission",
     )
     p_command.add_argument("--repo-root")

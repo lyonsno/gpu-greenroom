@@ -59,6 +59,16 @@ class TestCLISubmit:
         request = json.loads((job_dir / "request.json").read_text())
         assert request["agent_id"] == "greenroom-floor-manager"
 
+    def test_submit_rejects_blank_caller_declared_agent_identity(self, queue_dir):
+        rc, _, err = run_cli(
+            "submit", "trellis2mlx", "/tmp/test.png", "/tmp/out",
+            "--agent-id", "", queue_dir=queue_dir,
+        )
+
+        assert rc == 2
+        assert "agent_id must be a non-empty string when supplied" in err
+        assert not (queue_dir / "pending").exists()
+
 
 class TestCLIList:
     def test_list_empty(self, queue_dir):

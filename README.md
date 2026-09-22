@@ -187,7 +187,9 @@ global job type. It accepts flags or a caller-owned
 optional for compatibility with historical requests, which the operator monitor
 continues to label as `not recorded`; do not infer it from a route or worktree.
 Flag-based command submission accepts the same value as `--agent-id`, and
-ordinary `submit` accepts `--agent-id` as well.
+ordinary `submit` accepts `--agent-id` as well. A command manifest and
+`--agent-id` cannot be combined: declare the identity in the chosen source so
+the queue never has to guess which value owns the request.
 
 `argv` is executed directly with `shell=False`; no part is reparsed as a shell
 string and no template substitution is applied. `timeout: null` means no
