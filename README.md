@@ -121,7 +121,7 @@ stateDiagram-v2
     pending --> running: worker acquires gpu.lock
     running --> done: exit 0, outputs hashed
     running --> failed: non-zero exit, timeout, preflight failure, worker shutdown, or worker died
-    running --> running: process group would not quiesce; receipt says ownership_unknown
+    running --> ownership_unknown: process group would not quiesce (stays in running/)
 ```
 
 A job's state is the directory it is in. `pending/`, `running/`, `done/`,
