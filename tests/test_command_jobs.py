@@ -136,6 +136,35 @@ def test_submit_command_uses_explicit_runtime_agent_id_when_manifest_omits_agent
     assert request["agent_id"] == "handy-handy-man"
 
 
+def test_submit_command_rejects_blank_runtime_agent_id_without_enqueueing(tmp_path):
+    queue_dir = tmp_path / "queue"
+    repo_root = tmp_path / "consumer-repo"
+    repo_root.mkdir()
+    manifest_path = tmp_path / "command.json"
+    manifest_path.write_text(json.dumps({
+        "schema": "gpu-greenroom.command.v1",
+        "repo_root": str(repo_root),
+        "cwd": str(repo_root),
+        "route_identity": "fixture/blank-runtime-agent-id",
+        "argv": [sys.executable, "-c", "print('unreachable')"],
+    }))
+    env = os.environ.copy()
+    env["GPU_GREENROOM_AGENT_ID"] = "  "
+
+    rc, stdout, stderr = run_cli(
+        "submit-command", "--manifest", str(manifest_path),
+        queue_dir=queue_dir, env=env,
+    )
+
+    assert rc == 2
+    assert stdout == ""
+    failure = json.loads(stderr)
+    assert failure["failure_phase"] == "submission-validation"
+    assert "agent_id must be a non-empty string" in failure["error_message"]
+    assert Path(failure["report_path"]).exists()
+    assert not list((queue_dir / "pending").iterdir())
+
+
 def test_command_launch_failure_is_durable_before_primary_output(tmp_path):
     queue = GPUQueue(tmp_path / "queue")
     repo_root = tmp_path / "consumer-repo"
