@@ -918,8 +918,12 @@ class TestDurableOutputDir:
         receipt = json.loads((queue.queue_dir / "done" / req.job_id / "receipt.json").read_text())
         assert "volatile_output" in (receipt.get("warnings") or [])
 
-    def test_durable_output_dir_no_warning(self, queue, tmp_path):
+    def test_durable_output_dir_no_warning(self, queue, tmp_path, monkeypatch):
         """Non-volatile paths produce no volatile_output warning."""
+        # pytest's tmp_path lives under /tmp on Linux, which the queue rightly
+        # treats as volatile; pin the volatile set so the test asserts the
+        # non-volatile branch on every platform.
+        monkeypatch.setattr(queue, "VOLATILE_PREFIXES", ("/definitely-volatile",))
         safe = str(tmp_path / "safe_output")
         req = JobRequest(job_type="echo", input_path="/tmp/test.png", output_dir=safe)
         queue.submit(req)

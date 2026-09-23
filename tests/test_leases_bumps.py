@@ -5,10 +5,13 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import select
 import subprocess
 import sys
 import threading
 import time
+
+import pytest
 from pathlib import Path
 
 import gpu_queue.queue as queue_module
@@ -353,6 +356,7 @@ def test_bump_wait_uses_event_file_and_returns_after_grant(tmp_path):
     assert observed.status == BumpStatus.GRANTED
 
 
+@pytest.mark.skipif(not hasattr(select, "kqueue"), reason="exercises the kqueue wait path; other platforms use the polling fallback")
 def test_bump_wait_rereads_after_watcher_registration_race(tmp_path, monkeypatch):
     queue = GPUQueue(tmp_path / "queue")
     queue.claim_lease(**_lease_kwargs())
