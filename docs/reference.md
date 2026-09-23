@@ -101,7 +101,11 @@ or `~/.local/state/gpu-greenroom`.
 ```
 
 A job's state is the directory it lives in. Transitions are `rename(2)`
-moves, so a crash mid-transition leaves the job in exactly one place.
+moves, so a crash mid-transition leaves the job in exactly one place. A job
+whose process group cannot be confirmed quiesced stays in `running/` with
+`finished_at: null`, a `*_quiescence_unresolved` failure phase, the warning
+`ownership_unknown:process_group_live`, and a receipt whose `status` is
+`ownership_unknown`; `recover` and operator action are the only exits.
 
 ## Job type configuration
 
@@ -121,6 +125,11 @@ rich config:
 
 Params the template does not consume are recorded in the receipt as
 `ignored_params` instead of being silently dropped.
+
+`source_attestation`, `runtime_identity_cmd`, and `artifact_manifest` apply
+only to job types declared here. Structured command jobs (`submit-command`)
+carry an exact argv and get none of the three; their receipts record those
+fields as `null`.
 
 Example:
 
@@ -148,7 +157,10 @@ See [`job_types.example.json`](../job_types.example.json) for more.
 
 ## Receipt schema
 
-Every job that reaches `done/` or `failed/` gets a `receipt.json`:
+Every job that started, or was stopped by timeout, shutdown, or an
+operator, gets a `receipt.json`. An unknown job type fails at `dispatch`
+with a status record and no receipt. `status` is `done`, `failed`, or
+`ownership_unknown` (the job is still in `running/`):
 
 ```json
 {
@@ -157,11 +169,19 @@ Every job that reaches `done/` or `failed/` gets a `receipt.json`:
   "status": "done",
   "input_path": "/inputs/skull.png",
   "output_dir": "/outputs/skull/sf3d",
+  "repo_root": null,
+  "requested_route": null,
   "effective_route": "/path/to/sf3d/.venv/bin/python -u run_greenroom.py --image /inputs/skull.png --output-dir /outputs/skull/sf3d --texture-resolution 1024 --dtype float16",
+  "effective_argv": ["/path/to/sf3d/.venv/bin/python", "-u", "run_greenroom.py", "--image", "/inputs/skull.png", "--output-dir", "/outputs/skull/sf3d", "--texture-resolution", "1024", "--dtype", "float16"],
   "effective_cwd": "/path/to/sf3d",
   "effective_env": {"PYTHONPATH": ".", "PYTORCH_ENABLE_MPS_FALLBACK": "1"},
+  "environment_inheritance": "worker-plus-overlay",
   "effective_defaults": {"texture_resolution": "1024", "dtype": "float16"},
   "effective_timeout": null,
+  "worker_pid": 89531,
+  "child_pid": 90112,
+  "child_process_group": 90112,
+  "child_start_identity": "Tue Sep 23 05:02:11 2026",
   "ignored_params": null,
   "started_at": 1787117889.52,
   "finished_at": 1787117921.06,
@@ -169,6 +189,10 @@ Every job that reaches `done/` or `failed/` gets a `receipt.json`:
   "failure_phase": null,
   "error_message": null,
   "warnings": null,
+  "request_path": "/queue/done/ab8647e17eb0/request.json",
+  "stdout_path": "/queue/done/ab8647e17eb0/stdout.log",
+  "stderr_path": "/queue/done/ab8647e17eb0/stderr.log",
+  "worker": {"pid": 89531, "capabilities": ["structured-command.v1"], "source": {"…": "…"}},
   "input_artifact": {"path": "/inputs/skull.png", "sha256": "…", "size_bytes": 412331},
   "source_attestation": {"mode": "git-clean-input", "root": "/inputs", "commit": "…", "clean_before": true, "clean_after": true, "…": "…"},
   "runtime_identity": {"command": ["…"], "exit_code": 0, "stdout": "Device(gpu, 0)\n", "stderr": "", "executable": {"path": "…", "sha256": "…", "size_bytes": 0}},
@@ -176,8 +200,11 @@ Every job that reaches `done/` or `failed/` gets a `receipt.json`:
 }
 ```
 
-`input_artifact`, `source_attestation`, `runtime_identity`, and
-`artifact_manifest` are `null` unless the job type asked for them.
+`repo_root` and `requested_route` are set for structured command jobs.
+`worker` records the claiming worker's PID, capabilities, and source
+checkout (path, commit, dirty state). `input_artifact`,
+`source_attestation`, `runtime_identity`, and `artifact_manifest` are
+`null` unless the job type asked for them.
 
 Successful jobs also get a `metadata.json` written into `output_dir`
 (name, job type, params, output file list, duration) so asset browsers can
@@ -187,16 +214,21 @@ display results without reading the queue.
 
 | Phase | Meaning |
 |---|---|
-| `dispatch` | Unknown job type |
+| `dispatch` | Unknown job type, or a structured command with an empty argv; status record only, no receipt |
 | `source_preflight` | Input attestation failed: missing input, dirty tree, or unsupported mode |
 | `runtime_identity` | The identity probe failed or exited non-zero |
 | `launch` | Subprocess failed to start |
 | `execution` | Subprocess exited non-zero |
-| `timeout` | Subprocess exceeded the configured timeout |
+| `timeout` | Subprocess exceeded the configured timeout and its process group was quiesced |
+| `worker_shutdown` | The worker was asked to stop; the owned process group was quiesced |
 | `source_postflight` | Input or its commit changed during execution |
 | `metadata` | Could not write `metadata.json` |
 | `artifact_manifest` | A manifest pattern matched nothing or a non-file |
 | `stale_recovery` | Worker died without cleanup; moved to `failed/` by `recover` |
+| `completion_quiescence_unresolved` | Leader exited but the process group could not be confirmed dead; job stays in `running/`, receipt status `ownership_unknown` |
+| `timeout_quiescence_unresolved` | Timed out and the process group could not be quiesced; same handling |
+| `worker_shutdown_quiescence_unresolved` | Worker stopped and the process group could not be quiesced; same handling |
+| `launch_quiescence_unresolved` | Launch failed and a process group is still live; same handling |
 
 ## Lease and bump states
 

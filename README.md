@@ -120,12 +120,17 @@ stateDiagram-v2
     pending --> cancelled: cancel
     pending --> running: worker acquires gpu.lock
     running --> done: exit 0, outputs hashed
-    running --> failed: non-zero exit, timeout, preflight failure, or worker died
+    running --> failed: non-zero exit, timeout, preflight failure, worker shutdown, or worker died
+    running --> running: process group would not quiesce; receipt says ownership_unknown
 ```
 
 A job's state is the directory it is in. `pending/`, `running/`, `done/`,
 `failed/`, `cancelled/` are the whole database, transitions are `rename(2)`,
-and `ls` is the admin console.
+and `ls` is the admin console. The one deliberate exception: a job whose
+process group cannot be confirmed dead after the leader exits, times out,
+or is stopped stays in `running/` with a receipt whose status is
+`ownership_unknown`. Nothing moves it until an operator recovers it, for the
+same reason a lease never expires into "free".
 
 ## Cooperative leases and bumps
 
@@ -172,15 +177,20 @@ bound to the bump ID, with its own identity. The holder's lease enters
 `handoff` and the worker stays out until the requester either takes over or
 the holder releases.
 
-**Receipts record what actually ran.** Every terminal job gets a
-`receipt.json` with the effective command line after substitution, the
-effective working directory, environment overlay, defaults, timeout, and
-any submitted params the template ignored. A job type can additionally ask
-for input attestation (hash the input, record its git commit and dirty
+**Receipts record what actually ran.** Every job that started, and every
+job stopped by a timeout, a shutdown, or an operator, gets a
+`receipt.json` with the exact argv after substitution, the effective
+working directory, environment overlay, defaults, timeout, the worker's own
+PID, source checkout and capabilities, the child PID, process group, and
+process start identity, and any submitted params the template ignored.
+The one job that gets no receipt is an unknown job type, which fails at
+`dispatch` with a status record only. A job type declared in
+`job_types.json` can additionally ask for input attestation (hash the input, record its git commit and dirty
 state, fail if it changed underneath the run), a runtime identity probe
 (run a command before the job and record which interpreter and device it
 saw), and an artifact manifest (hash every output that matched a glob, fail
-if none did). A subprocess that launched is not evidence of anything until
+if none did). Structured command jobs carry an exact argv and none of
+those three. A subprocess that launched is not evidence of anything until
 the receipt proves the route.
 
 **Estimates are diagnostic only.** A bump's estimated occupancy is recorded
@@ -188,9 +198,10 @@ with the field `estimated_occupancy_authority: "diagnostic_only"` next to
 it. Nothing schedules on it, and nothing can be made to.
 
 **Failures name their phase.** `dispatch`, `source_preflight`,
-`runtime_identity`, `launch`, `execution`, `timeout`, `source_postflight`,
-`metadata`, `artifact_manifest`, `stale_recovery`. "It failed" is never the
-whole receipt.
+`runtime_identity`, `launch`, `execution`, `timeout`, `worker_shutdown`,
+`source_postflight`, `metadata`, `artifact_manifest`, `stale_recovery`, and
+four `*_quiescence_unresolved` phases for the cases where the process group
+could not be confirmed dead. "It failed" is never the whole receipt.
 
 **Substitution is single-pass and injection-safe.** Templates are lists,
 not shell strings. A param value containing `{input_path}` stays literal.
