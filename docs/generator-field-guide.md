@@ -150,9 +150,9 @@ or supersede the rule; do not silently preserve the stronger wording.
 
 Keep implementation details in the owning generator README:
 
-- `~/dev/mlx-ideogram4/README.md` for FLUX/MFLUX;
-- `~/dev/trellis2mlx/README.md` for TRELLIS.2;
-- `~/dev/sf3d/README.md` for Stable Fast 3D.
+- [mlx-ideogram4](https://github.com/lyonsno/mlx-ideogram4) for FLUX/MFLUX;
+- [trellis2mlx](https://github.com/lyonsno/trellis2mlx) for TRELLIS.2;
+- the Stable Fast 3D runner repository for SF3D.
 
 Keep queueing, lease, bump, route-identity, and receipt behavior in Greenroom's
 root README. This document owns the cross-route operating layer between those
