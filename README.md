@@ -80,6 +80,38 @@ hot-reloaded every poll, so adding a generator never restarts the worker:
 gpu-greenroom submit sf3d skull.png -p dtype=float32
 ```
 
+## Exact commands, a console, and more than one queue
+
+An agent that already knows exactly what to run can skip the job type
+registry and submit an exact argv with its own working directory,
+environment overlay, owner, and route label:
+
+```bash
+gpu-greenroom submit-command \
+  --agent-id example-agent \
+  --repo-root /path/to/repo --cwd /path/to/repo \
+  --route-identity "assays/grid32-bounded" \
+  --env BACKEND=mlx \
+  --output-dir /durable/results/grid32 \
+  -- /path/to/repo/.venv/bin/python -u scripts/grid32.py
+```
+
+The argv runs with `shell=False` and no substitution. The receipt records
+the exact argv, the worker's own source checkout and commit, and the
+capabilities the worker claimed the job with. A worker too old to honor a
+capability the request needs leaves that job at the head of the queue
+untouched instead of skipping past it.
+
+`gpu-greenroom operator` serves a token-authenticated, loopback-only web
+console: queue state, each job's owner and route, queue wait versus
+execution time, pause and resume with owner and epoch receipts, and cancel
+or stop for the job in front of you. `gpu-greenroom doctor --json` checks
+executable discovery, imports, queue writes, and dispatch availability.
+`gpu-greenroom queues register|status|pause|resume` groups several queue
+directories into one contention class so a single pause holds every
+worker on an accelerator at its execution-start boundary, with an epoch so
+a stale controller cannot resume a newer pause.
+
 ## Job lifecycle
 
 ```mermaid
@@ -169,10 +201,9 @@ Params the template did not consume are reported, not dropped.
 It is not a cluster scheduler, and it does not enforce anything on
 processes that ignore it. A lease only works if the process that should
 claim one does. It does not measure GPU memory; it trusts the numbers a
-bump declares and labels them as such. It serializes to one GPU per queue
-directory; the multi-queue registry and browser console for operating
-several collision domains from one page are on a branch and land after the
-core here.
+bump declares and labels them as such. Each queue directory has its own
+worker and its own lock; the registry groups directories for aggregate
+pause but does not merge them.
 
 ## Reference
 
@@ -189,11 +220,13 @@ routes lives in the
 uv run --extra test python -m pytest tests/ -q
 ```
 
-112 tests: flock serialization, FIFO order, cancel and recovery races,
+174 tests: flock serialization, FIFO order, cancel and recovery races,
 param injection, receipt route identity, attestation and manifest failure
-phases, pause/resume, durable versus volatile output paths, lease claim
-and expiry, dead and live PID handling, duplicate and concurrent bumps,
-release/grant races, handoff identity binding, and wait wakeup races.
+phases, structured command admission and capability-aware claiming,
+pause/resume with epochs, aggregate queue control, the operator console,
+durable versus volatile output paths, lease claim and expiry, dead and
+live PID handling, duplicate and concurrent bumps, release/grant races,
+handoff identity binding, and wait wakeup races.
 
 ## License
 

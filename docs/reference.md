@@ -13,11 +13,27 @@ gpu-greenroom list [-s pending|running|done|failed|cancelled]
 gpu-greenroom status <job-id>
 gpu-greenroom cancel <job-id>          # pending jobs only
 
+# Exact-argv jobs (no job type, no substitution)
+gpu-greenroom submit-command --agent-id NAME --repo-root DIR --cwd DIR --route-identity LABEL \
+  [--env K=V ...] [--output-dir DIR] [--timeout SECONDS] -- <argv...>
+gpu-greenroom submit-command --manifest /path/to/gpu-greenroom.command.json
+
 # Worker
 gpu-greenroom worker [--poll SECONDS]  # runs jobs sequentially, reloads job_types.json every poll
-gpu-greenroom pause                    # finishes the current job, then waits
-gpu-greenroom resume
+gpu-greenroom pause --owner NAME --epoch ID     # finishes the current job, then waits
+gpu-greenroom resume --owner NAME --epoch ID    # epoch must match the observed pause
 gpu-greenroom recover                  # move running jobs whose worker PID is gone to failed/
+gpu-greenroom doctor --json            # executable discovery, imports, queue writes, dispatch availability
+
+# Operator console
+gpu-greenroom operator --port 8765                       # one-shot; prints a token URL
+gpu-greenroom operator --local-operator --admission-control --identity-label Agent --port 8766
+
+# Several queues as one contention class
+gpu-greenroom queues register NAME --queue-dir DIR --contention-class CLASS
+gpu-greenroom queues status
+gpu-greenroom queues pause  --contention-class CLASS --owner NAME --epoch ID
+gpu-greenroom queues resume --contention-class CLASS --owner NAME --epoch ID
 
 # Cooperative external leases
 gpu-greenroom lease claim \
@@ -202,6 +218,85 @@ Bump `status`:
 | `granted` | Handoff window is open; `bump wait` returns |
 | `declined` | Holder declined with a reason |
 | `closed` | Administratively closed |
+
+## Structured command jobs
+
+`submit-command` admits a repository-local accelerator command without
+adding a global job type. It accepts flags or a caller-owned
+`gpu-greenroom.command.v1` JSON manifest:
+
+```json
+{
+  "schema": "gpu-greenroom.command.v1",
+  "agent_id": "example-agent",
+  "repo_root": "/path/to/repo",
+  "cwd": "/path/to/repo",
+  "env": {"BACKEND": "mlx"},
+  "output_dir": "/durable/results/grid32",
+  "route_identity": "assays/grid32-bounded",
+  "argv": ["/path/to/repo/.venv/bin/python", "-u", "scripts/grid32.py"],
+  "timeout": null
+}
+```
+
+`agent_id` is the exact owning identity declared by the caller. It is
+optional for compatibility with historical requests, which the console
+labels `not recorded`; it is never inferred from a route, worktree, or
+environment. A manifest and `--agent-id` cannot be combined. `argv` runs
+with `shell=False`; nothing is reparsed and no template substitution is
+applied. `timeout: null` means no Greenroom-authored timeout. The
+environment is the worker environment plus the recorded overlay.
+
+Submission returns JSON with the job id, queue directory, request path,
+output directory, and requested route. Receipts preserve requested route,
+exact effective argv, repo root, cwd, environment overlay, timeout,
+stdout/stderr paths, exit code, failure phase, the claiming worker's PID,
+source checkout, commit and dirty state, and effective capabilities. A
+launch failure still leaves request, status, logs, and a receipt.
+Manifest validation failures are written under `submission-failures/` and
+returned as structured stderr.
+
+Structured requests require the `structured-command.v1` worker
+capability. A worker compares request requirements with its effective
+capabilities while holding `gpu.lock` and before moving the FIFO head to
+`running`. An incapable worker leaves the request untouched and does not
+skip to younger compatible work. Workers support every capability their
+code implements unless `GPU_GREENROOM_WORKER_CAPABILITIES` supplies a
+comma-separated deployment override.
+
+## Registered queues and execution-start pause
+
+The queue registry stores only one-time adapter identity: name, queue
+directory, contention class, and adapter kind. Its path comes from
+`--registry` or `GPU_GREENROOM_REGISTRY`, default
+`~/.local/state/gpu-greenroom/queues.json`.
+
+`queues status` reads pending, running, and paused state from each native
+queue; it copies nothing into the registry. `queues pause` preflights every
+selected queue and then creates each queue's native `paused` marker.
+Submission stays open, running jobs finish normally, and workers cannot
+move pending work to running until `queues resume` removes the markers.
+Control actions write receipts under `queue-control-receipts/`. The marker
+records owner, epoch, requested and effective times, queue identity, and
+contention class. Resume requires the exact epoch, so a stale controller
+cannot remove a newer pause.
+
+The per-queue lock remains the only execution mutex. Aggregate control
+authorizes no execution and adds no check to ordinary dispatch; the
+existing coordination lock linearizes marker creation against the final
+pending-to-running transition and releases before the workload runs.
+
+## Operator console
+
+`gpu-greenroom operator` serves a small web console on loopback. In
+one-shot mode it prints a URL carrying a bearer token. With
+`--local-operator` it runs at a stable URL and seats the current process
+credential when the page loads, so a launchd-supervised console survives
+restarts. `--admission-control` enables receipted pause and resume from the
+page; `--identity-label` sets the word used for the owner column. Every
+control action carries a request id and lands as a receipt under
+`operator-actions/`, and an action interrupted between marker mutation and
+completion is never replayed as successful.
 
 ## Reviewing a new job type
 
