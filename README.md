@@ -87,9 +87,8 @@ stateDiagram-v2
     [*] --> pending: submit
     pending --> cancelled: cancel
     pending --> running: worker acquires gpu.lock
-    running --> done: exit 0, manifest hashed
-    running --> failed: non-zero exit, timeout, or preflight failure
-    running --> failed: recover (worker PID gone)
+    running --> done: exit 0, outputs hashed
+    running --> failed: non-zero exit, timeout, preflight failure, or worker died
 ```
 
 A job's state is the directory it is in. `pending/`, `running/`, `done/`,
@@ -100,17 +99,17 @@ and `ls` is the admin console.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> active: lease claim (briefly takes gpu.lock to prove no worker job is running)
-    active --> active: renew
+    [*] --> active: lease claim
     active --> released: release
-    active --> handoff: bump granted with quiescence confirmed
+    active --> handoff: bump granted, quiescence confirmed
     active --> ownership_unknown: TTL expired or holder PID dead
-    handoff --> active: requester claims with --handoff-bump-id
+    handoff --> active: requester claims a lease bound to the bump
     ownership_unknown --> [*]: explicit recovery only
 ```
 
-The protocol is cooperative. Greenroom records who owns the GPU and when a
-safe handoff window exists. It never preempts, pauses, signals, kills,
+A claim briefly takes `gpu.lock` to prove no worker job is running, then
+holds the GPU by renewing within its TTL. The protocol is cooperative.
+Greenroom records who owns the GPU and when a safe handoff window exists. It never preempts, pauses, signals, kills,
 times out, or reorders the current holder. An agent that wants the GPU
 while a lease is active sends a bump describing its intended route,
 workload class, memory pressure, and whether it needs full quiescence, then
