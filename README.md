@@ -25,6 +25,9 @@ gpu-greenroom submit trellis2mlx /path/to/image.png /path/to/output/
 # Submit with custom params
 gpu-greenroom submit trellis2mlx /path/to/image.png /path/to/output/ -p seed=99 resolution=768
 
+# Record the explicit agent identity that submitted the job
+gpu-greenroom submit trellis2mlx /path/to/image.png --agent-id sammy-zuckerfuck
+
 # Submit an exact repository-local argv without editing job_types.json
 gpu-greenroom submit-command \
   --agent-id "greenroom-floor-manager" \
@@ -162,6 +165,11 @@ gpu-greenroom bump wait resident-cold-load --timeout 600
 ```
 
 Override the queue directory with `GPU_GREENROOM_DIR` or `--queue-dir`.
+
+For `submit` and `submit-command`, an explicit `--agent-id` (or manifest
+`agent_id`) is preserved as the job owner. When it is omitted, Greenroom uses
+only the explicit generic launcher variable `GPU_GREENROOM_AGENT_ID`. Without
+an explicit CLI/manifest or launcher identity, the owner remains unrecorded.
 
 ## Structured command jobs
 

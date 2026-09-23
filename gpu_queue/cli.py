@@ -87,6 +87,16 @@ def _agent_id_arg(value):
         raise argparse.ArgumentTypeError(str(error)) from error
 
 
+def _runtime_agent_id():
+    """Return an explicit generic identity supplied by the launcher, if any."""
+    return _optional_agent_id(os.environ.get("GPU_GREENROOM_AGENT_ID"))
+
+
+def _effective_agent_id(explicit):
+    declared = _optional_agent_id(explicit)
+    return declared if declared is not None else _runtime_agent_id()
+
+
 def cmd_submit(args):
     queue = get_queue(args)
     params = {}
@@ -102,7 +112,7 @@ def cmd_submit(args):
         input_path=args.input,
         output_dir=args.output_dir,
         params=params,
-        agent_id=_optional_agent_id(args.agent_id),
+        agent_id=_effective_agent_id(args.agent_id),
     )
     job_dir = queue.submit(request)
     print(f"Submitted job {request.job_id}")
@@ -157,7 +167,7 @@ def _command_payload(args):
         raise ValueError("command manifest must be a JSON object")
     if payload.get("schema") != "gpu-greenroom.command.v1":
         raise ValueError("command manifest schema must be gpu-greenroom.command.v1")
-    agent_id = _optional_agent_id(payload.get("agent_id"))
+    agent_id = _effective_agent_id(payload.get("agent_id"))
     argv = payload.get("argv")
     if not isinstance(argv, list) or not argv or not all(isinstance(item, str) for item in argv):
         raise ValueError("command manifest argv must be a non-empty list of strings")

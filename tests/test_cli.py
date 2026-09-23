@@ -1,6 +1,7 @@
 """Tests for the GPU Greenroom CLI."""
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -9,13 +10,16 @@ from pathlib import Path
 import pytest
 
 
-def run_cli(*args, queue_dir=None):
+def run_cli(*args, queue_dir=None, env=None):
     """Run the CLI as a subprocess and return (returncode, stdout, stderr)."""
     cmd = [sys.executable, "-m", "gpu_queue.cli"]
     if queue_dir:
         cmd.extend(["--queue-dir", str(queue_dir)])
     cmd.extend(args)
-    result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(Path(__file__).resolve().parent.parent))
+    result = subprocess.run(
+        cmd, capture_output=True, text=True,
+        cwd=str(Path(__file__).resolve().parent.parent), env=env,
+    )
     return result.returncode, result.stdout, result.stderr
 
 
@@ -58,6 +62,20 @@ class TestCLISubmit:
         job_dir = next((queue_dir / "pending").iterdir())
         request = json.loads((job_dir / "request.json").read_text())
         assert request["agent_id"] == "greenroom-floor-manager"
+
+    def test_submit_uses_explicit_runtime_agent_id_when_flag_is_omitted(self, queue_dir):
+        env = os.environ.copy()
+        env["GPU_GREENROOM_AGENT_ID"] = "sammy-zuckerfuck"
+
+        rc, _, err = run_cli(
+            "submit", "trellis2mlx", "/tmp/test.png", "/tmp/out",
+            queue_dir=queue_dir, env=env,
+        )
+
+        assert rc == 0, err
+        job_dir = next((queue_dir / "pending").iterdir())
+        request = json.loads((job_dir / "request.json").read_text())
+        assert request["agent_id"] == "sammy-zuckerfuck"
 
     def test_submit_rejects_blank_caller_declared_agent_identity(self, queue_dir):
         rc, _, err = run_cli(

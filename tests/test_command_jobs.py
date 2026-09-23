@@ -108,6 +108,34 @@ def test_submit_command_manifest_preserves_exact_structured_identity(tmp_path):
     assert receipt["worker"]["capabilities"] == ["structured-command.v1"]
 
 
+def test_submit_command_uses_explicit_runtime_agent_id_when_manifest_omits_agent_id(tmp_path):
+    queue_dir = tmp_path / "queue"
+    repo_root = tmp_path / "consumer-repo"
+    repo_root.mkdir()
+    manifest = {
+        "schema": "gpu-greenroom.command.v1",
+        "repo_root": str(repo_root),
+        "cwd": str(repo_root),
+        "route_identity": "fixture/broker-owned-runtime-agent-id",
+        "argv": [sys.executable, "-c", "print('fixture')"],
+    }
+    manifest_path = tmp_path / "command.json"
+    manifest_path.write_text(json.dumps(manifest))
+    env = os.environ.copy()
+    env["GPU_GREENROOM_AGENT_ID"] = "handy-handy-man"
+
+    rc, stdout, stderr = run_cli(
+        "submit-command", "--manifest", str(manifest_path),
+        queue_dir=queue_dir, env=env,
+    )
+
+    assert rc == 0, stderr
+    response = json.loads(stdout)
+    assert response["agent_id"] == "handy-handy-man"
+    request = json.loads(Path(response["request_path"]).read_text())
+    assert request["agent_id"] == "handy-handy-man"
+
+
 def test_command_launch_failure_is_durable_before_primary_output(tmp_path):
     queue = GPUQueue(tmp_path / "queue")
     repo_root = tmp_path / "consumer-repo"
