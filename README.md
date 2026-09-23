@@ -1,399 +1,200 @@
 # gpu-greenroom
 
-Filesystem-backed GPU job queue with flock serialization. One GPU job at a time, strict FIFO, crash-safe receipts.
+[![tests](https://github.com/lyonsno/gpu-greenroom/actions/workflows/test.yml/badge.svg)](https://github.com/lyonsno/gpu-greenroom/actions/workflows/test.yml)
 
-## Problem
+A filesystem-backed job queue and cooperative lease protocol that lets a
+crowd of autonomous agents share one Apple Silicon GPU without stepping on
+each other. One job at a time, strict FIFO, crash-safe receipts, and a
+handoff protocol for GPU work the queue did not launch. Zero dependencies
+beyond the Python standard library.
 
-Heavy spatial-AI generation jobs (TRELLIS2MLX, Pixal3D, SuperMat, MoGe) share a single Mac GPU. Running multiple jobs concurrently risks kernel panics, Metal scheduler deadlocks, and OOM crashes. gpu-greenroom serializes GPU-bound work so only one job runs at a time.
+It has been the scheduler for a single M4 Max running a fleet of coding
+agents since June 2026:
 
-## Install
+| Since 2026-06-10, one machine | |
+|---|---|
+| Jobs receipted | 5,795 |
+| Distinct job types | 335 |
+| Cumulative GPU time serialized | 336 hours |
+| Longest single job | 13.3 hours |
+
+Snapshot taken 2026-09-23 from the queue directory on the author's machine.
+The job types range from image-to-3D generation
+([TRELLIS.2](https://github.com/lyonsno/trellis2mlx),
+[Pixal3D](https://github.com/lyonsno/pixal3d-mlx),
+[SF3D](https://github.com/lyonsno/sf3d-webgpu)) and text-to-image
+([FLUX and Ideogram via MLX](https://github.com/lyonsno/mlx-ideogram4)) to
+monocular depth ([MoGe](https://github.com/lyonsno/moge-mlx)), MLX training
+loops, Blender renders, and headless WebGPU witnesses for
+[Kaminos](https://github.com/lyonsno/kaminos).
+
+## The problem
+
+Apple Silicon has one GPU and one pool of unified memory. Two 30 GB
+inference jobs at once is not a slowdown, it is a Metal scheduler deadlock,
+an out-of-memory kill, or a kernel panic. Meanwhile twenty coding agents,
+each in its own terminal, each want the GPU right now, and some of that
+work is interactive: a live WebGPU render in Chrome, a resident model
+serving a prototype. A batch queue alone cannot see those.
+
+`gpu-greenroom` answers both halves:
+
+- **Batch work** is submitted as a job. A single worker runs jobs one at a
+  time under an exclusive `flock`, oldest first.
+- **Interactive work** claims a **lease**. While a lease is active, the
+  worker stays out. Other agents can send a **bump**, asking the holder for
+  a handoff window; the holder answers grant, grant-after-checkpoint, or
+  decline, and every answer leaves a receipt.
+
+## Quick start
 
 ```bash
-cd ~/dev/gpu-greenroom
+git clone https://github.com/lyonsno/gpu-greenroom && cd gpu-greenroom
 uv pip install -e .
+
+gpu-greenroom worker &                         # one worker per GPU
+gpu-greenroom submit echo /path/to/input.png   # built-in smoke job type
+gpu-greenroom list
+gpu-greenroom status <job-id>
+cat ~/.local/state/gpu-greenroom/done/<job-id>/receipt.json
 ```
 
-## Usage
+Real job types are declared in `job_types.json` in the queue directory and
+hot-reloaded every poll, so adding a generator never restarts the worker:
+
+```json
+{
+  "sf3d": {
+    "cmd": ["/path/to/sf3d/.venv/bin/python", "-u", "run.py",
+            "--image", "{input_path}", "--output-dir", "{output_dir}",
+            "--dtype", "{dtype}"],
+    "cwd": "/path/to/sf3d",
+    "env": {"PYTORCH_ENABLE_MPS_FALLBACK": "1"},
+    "defaults": {"dtype": "float16"},
+    "artifact_manifest": ["*.glb"]
+  }
+}
+```
 
 ```bash
-# Submit a job (output goes to durable dir in queue)
-gpu-greenroom submit trellis2mlx /path/to/image.png
-
-# Submit with explicit output dir
-gpu-greenroom submit trellis2mlx /path/to/image.png /path/to/output/
-
-# Submit with custom params
-gpu-greenroom submit trellis2mlx /path/to/image.png /path/to/output/ -p seed=99 resolution=768
-
-# Submit an exact repository-local argv without editing job_types.json
-gpu-greenroom submit-command \
-  --agent-id "greenroom-floor-manager" \
-  --repo-root /path/to/repo \
-  --cwd /path/to/repo \
-  --route-identity "assays/grid32-bounded" \
-  --env BACKEND=mlx \
-  --output-dir /durable/results/grid32 \
-  -- /path/to/repo/.venv/bin/python -u scripts/grid32.py
-
-# Or submit the same contract from a caller-owned JSON manifest
-gpu-greenroom submit-command --manifest /path/to/gpu-command.json
-
-# List queue
-gpu-greenroom list
-gpu-greenroom list -s pending
-
-# Check job status
-gpu-greenroom status <job-id>
-
-# Cancel a pending job
-gpu-greenroom cancel <job-id>
-
-# Open a one-shot authenticated local operator console; use the printed token URL
-gpu-greenroom operator --port 8765
-
-# Run the persistent loopback-only operator console at a stable URL.
-# Loading the page seats the current process credential, including after restart.
-gpu-greenroom operator --local-operator --admission-control \
-  --identity-label Agent --port 8766
-# Open any time: http://127.0.0.1:8766/
-
-# Start the worker (runs jobs sequentially, polls every 2s)
-gpu-greenroom worker
-
-# Pause the queue (finishes current job, then waits)
-gpu-greenroom pause --owner local-operator --epoch maintenance-20260727
-
-# Resume a paused queue
-gpu-greenroom resume --owner local-operator --epoch maintenance-20260727
-
-# Check executable discovery, CLI import, queue writes, and dispatch availability
-gpu-greenroom doctor --json
-
-# Register participating queues once, then inspect or gate one collision domain
-gpu-greenroom queues register science \
-  --queue-dir ~/.local/state/gpu-greenroom \
-  --contention-class apple-unified-accelerator
-gpu-greenroom queues status
-gpu-greenroom queues pause \
-  --contention-class apple-unified-accelerator \
-  --owner operations \
-  --epoch maintenance-20260727
-gpu-greenroom queues resume \
-  --contention-class apple-unified-accelerator \
-  --owner operations \
-  --epoch maintenance-20260727
-
-# Recover stale jobs after crash
-gpu-greenroom recover
-
-# Claim/renew/status/release a cooperative external GPU lease
-gpu-greenroom lease claim \
-  --owner neural-fire \
-  --agent-id render-holder \
-  --repo-root ~/dev/kaminos \
-  --pid "$PID" \
-  --process-group "$PGID" \
-  --effective-route "chrome neural-fire --metal" \
-  --backend metal \
-  --device mps:0 \
-  --profile interactive-render \
-  --supports-checkpoints \
-  --ttl-seconds 300
-gpu-greenroom lease renew <lease-id> --interruptible
-gpu-greenroom lease status
-gpu-greenroom lease release <lease-id> --released-by neural-fire --reason "capture checkpoint complete"
-
-# Request, answer, and wait for a cooperative bump
-gpu-greenroom bump request \
-  --bump-id resident-cold-load \
-  --requester resident-loader \
-  --agent-id resident-loader \
-  --repo-root ~/dev/kaminos \
-  --intended-route "sam31 cold-load --mps" \
-  --workload-class cold-model-load \
-  --memory-pressure 3.32GB \
-  --estimated-occupancy 90s \
-  --full-quiescence-required \
-  --reason "prepare resident model before capture" \
-  --callback-address "file:///tmp/resident-greenroom-callback"
-gpu-greenroom bump list
-gpu-greenroom bump grant resident-cold-load --granted-by neural-fire --checkpoint capture-42 --quiescence-confirmed
-gpu-greenroom bump decline resident-cold-load --declined-by neural-fire --reason "training cannot checkpoint"
-gpu-greenroom bump wait resident-cold-load --timeout 600
+gpu-greenroom submit sf3d skull.png -p dtype=float32
 ```
 
-## Queue directory layout
+## Job lifecycle
 
-```
-~/.local/state/gpu-greenroom/
-  gpu.lock              # flock file for mutual exclusion
-  coordination.lock     # short-lived metadata transition lock, not execution authority
-  paused                # present when queue is paused (touch to pause, rm to resume)
-  job_types.json        # optional: custom job type configs (overrides defaults)
-  outputs/              # durable output directory for jobs submitted without explicit output_dir
-  leases/
-    current.json        # current external lease, released lease, handoff, or ownership_unknown
-    receipts/           # claim, renew, release, handoff, and unknown-state receipts
-  bumps/
-    <bump-id>.json      # inbound cooperative bump request state
-    receipts/           # request, grant, and decline receipts
-  events/               # filesystem-watch wake events for bump wait
-  pending/
-    <job-id>/
-      request.json      # what was submitted
-      status.json       # current state
-  running/              # at most one job
-    <job-id>/
-      request.json
-      status.json
-      stdout.log
-      stderr.log
-  done/
-    <job-id>/
-      request.json
-      status.json
-      stdout.log
-      stderr.log
-      receipt.json      # full route identity and outcome
-  failed/
-    <job-id>/...        # same as done, with failure_phase
-  cancelled/
-    <job-id>/...
+```mermaid
+stateDiagram-v2
+    [*] --> pending: submit
+    pending --> cancelled: cancel
+    pending --> running: worker acquires gpu.lock
+    running --> done: exit 0, outputs hashed
+    running --> failed: non-zero exit, timeout, preflight failure, or worker died
 ```
 
-Override the queue directory with `GPU_GREENROOM_DIR` or `--queue-dir`.
+A job's state is the directory it is in. `pending/`, `running/`, `done/`,
+`failed/`, `cancelled/` are the whole database, transitions are `rename(2)`,
+and `ls` is the admin console.
 
-## Structured command jobs
+## Cooperative leases and bumps
 
-`submit-command` admits a repository-local accelerator command without adding a
-global job type. It accepts flags or a caller-owned
-`gpu-greenroom.command.v1` JSON manifest:
-
-```json
-{
-  "schema": "gpu-greenroom.command.v1",
-  "agent_id": "greenroom-floor-manager",
-  "repo_root": "/path/to/repo",
-  "cwd": "/path/to/repo",
-  "env": {"BACKEND": "mlx"},
-  "output_dir": "/durable/results/grid32",
-  "route_identity": "assays/grid32-bounded",
-  "argv": ["/path/to/repo/.venv/bin/python", "-u", "scripts/grid32.py"],
-  "timeout": null
-}
+```mermaid
+stateDiagram-v2
+    [*] --> active: lease claim
+    active --> released: release
+    active --> handoff: bump granted, quiescence confirmed
+    active --> ownership_unknown: TTL expired or holder PID dead
+    handoff --> active: requester claims a lease bound to the bump
+    ownership_unknown --> [*]: explicit recovery only
 ```
 
-`agent_id` is the exact owning agent identity declared by the caller. It is
-optional for compatibility with historical requests, which the operator monitor
-continues to label as `not recorded`; do not infer it from a route or worktree.
-Flag-based command submission accepts the same value as `--agent-id`, and
-ordinary `submit` accepts `--agent-id` as well. A command manifest and
-`--agent-id` cannot be combined: declare the identity in the chosen source so
-the queue never has to guess which value owns the request.
+A claim briefly takes `gpu.lock` to prove no worker job is running, then
+holds the GPU by renewing within its TTL. The protocol is cooperative.
+Greenroom records who owns the GPU and when a safe handoff window exists. It never preempts, pauses, signals, kills,
+times out, or reorders the current holder. An agent that wants the GPU
+while a lease is active sends a bump describing its intended route,
+workload class, memory pressure, and whether it needs full quiescence, then
+waits on a filesystem event, not a polling loop. The holder decides.
 
-`argv` is executed directly with `shell=False`; no part is reparsed as a shell
-string and no template substitution is applied. `timeout: null` means no
-Greenroom-authored timeout. The environment is the worker environment plus the
-recorded manifest overlay.
+## Design decisions
 
-Submission returns JSON containing the job id, queue directory, request path,
-output directory, and requested route. Completion and failure receipts preserve
-requested route, exact effective argv, repo root, cwd, environment overlay,
-timeout, stdout/stderr paths, request path, output path, exit code, and failure
-phase. They also record the claimant's PID, source checkout, Git commit and
-dirty state, and effective worker capabilities. A launch failure still leaves
-request, status, empty-or-partial logs, and a receipt. Manifest validation failures are written under
-`submission-failures/` and returned as structured stderr.
+**The filesystem is the database.** No daemon, no socket, no broker, no
+SQLite. Every agent on the machine already has the one capability required
+to participate: it can read and write files. Debugging a stuck queue is
+`ls running/`. Backing it up is `cp -r`.
 
-Structured requests require the `structured-command.v1` worker capability. A
-corrected worker compares request requirements with its effective capabilities
-while holding `gpu.lock` and before moving the FIFO head to `running`. An
-incapable worker leaves request and status bytes unchanged and does not skip to
-younger compatible work; a capable worker can then acquire the same lock and
-claim that oldest job. Workers support all capabilities implemented by their
-code unless `GPU_GREENROOM_WORKER_CAPABILITIES` supplies a comma-separated
-deployment override.
+**One execution mutex.** `gpu.lock` is the only thing that means "the GPU
+is in use." A second lock, `coordination.lock`, serializes JSON state
+transitions and is explicitly not execution authority; holding it proves
+nothing about the GPU. Keeping those separate is what makes lease claims,
+cancels, and stale recovery race-free without ever blocking a running job.
 
-Workers started from versions predating capability-aware claiming cannot learn
-this contract from request metadata. Replace those processes at an observed
-idle boundary before admitting capability-gated jobs; do not run a second queue
-or execution-lock domain as a compatibility workaround.
+**Expiry means unknown, never free.** A lease whose TTL lapses or whose
+holder PID disappears without a release receipt transitions to
+`ownership_unknown`, and the worker stays blocked. Silence from a process
+that was using 40 GB of unified memory is not evidence that the memory is
+back. Someone has to say so.
 
-## Registered queues and execution-start pause
+**A grant is a wakeup, not authority.** A granted bump tells the requester a
+handoff window exists. The requester still has to claim its own lease,
+bound to the bump ID, with its own identity. The holder's lease enters
+`handoff` and the worker stays out until the requester either takes over or
+the holder releases.
 
-The queue registry stores only one-time adapter identity: name, queue
-directory, contention class, and adapter kind. Paths come from the caller via
-`--registry` or `GPU_GREENROOM_REGISTRY`; the default is
-`~/.local/state/gpu-greenroom/queues.json`.
+**Receipts record what actually ran.** Every terminal job gets a
+`receipt.json` with the effective command line after substitution, the
+effective working directory, environment overlay, defaults, timeout, and
+any submitted params the template ignored. A job type can additionally ask
+for input attestation (hash the input, record its git commit and dirty
+state, fail if it changed underneath the run), a runtime identity probe
+(run a command before the job and record which interpreter and device it
+saw), and an artifact manifest (hash every output that matched a glob, fail
+if none did). A subprocess that launched is not evidence of anything until
+the receipt proves the route.
 
-`queues status` reads pending, running, and paused state from each native queue.
-It does not copy job state into the registry. `queues pause` preflights every
-selected queue and then creates each queue's native `paused` marker. Submission
-and durable enqueue remain open, running jobs finish normally, and workers
-cannot move pending work to running until `queues resume` removes the native
-markers. Control actions write durable receipts under
-`queue-control-receipts/`. The marker contains its owner, epoch, requested time,
-effective acknowledgement time, queue identity, and contention class. Resume
-requires the exact epoch for aggregate control, so a stale controller cannot
-remove a newer pause. Aggregate receipts preserve the requested queue set,
-per-queue effective acknowledgements, partial failures, and the prior pause
-identity used during recovery.
+**Estimates are diagnostic only.** A bump's estimated occupancy is recorded
+with the field `estimated_occupancy_authority: "diagnostic_only"` next to
+it. Nothing schedules on it, and nothing can be made to.
 
-The existing queue lock remains the only execution mutex. Aggregate control
-does not authorize execution and adds no new check to ordinary submission or
-dispatch. The existing short-lived coordination lock linearizes native marker
-creation against the final pending-to-running transition and releases before
-workload execution.
+**Failures name their phase.** `dispatch`, `source_preflight`,
+`runtime_identity`, `launch`, `execution`, `timeout`, `source_postflight`,
+`metadata`, `artifact_manifest`, `stale_recovery`. "It failed" is never the
+whole receipt.
 
-## Cooperative external leases and bumps
+**Substitution is single-pass and injection-safe.** Templates are lists,
+not shell strings. A param value containing `{input_path}` stays literal.
+Params the template did not consume are reported, not dropped.
 
-Greenroom can coordinate with GPU work that was not launched by the Greenroom
-worker, such as an interactive Chrome/WebGPU render or resident model process.
-The protocol is cooperative: it records ownership and safe handoff windows; it
-does not preempt, pause, kill, signal, timeout, or reorder the current holder.
+## What it is not
 
-External workloads claim a renewable lease with explicit identity:
+It is not a cluster scheduler, and it does not enforce anything on
+processes that ignore it. A lease only works if the process that should
+claim one does. It does not measure GPU memory; it trusts the numbers a
+bump declares and labels them as such. It serializes to one GPU per queue
+directory; the multi-queue registry and browser console for operating
+several collision domains from one page are on a branch and land after the
+core here.
 
-- owner and agent ID;
-- repo root;
-- PID and process group when known;
-- effective route, backend, device, and profile;
-- checkpoint support and current interruptibility;
-- acquisition and renewal timestamps;
-- release or ownership-unknown receipts.
+## Reference
 
-Bump requests describe another lane's intended work:
-
-- requester and agent ID;
-- intended route;
-- workload class;
-- expected memory pressure;
-- estimated occupancy, recorded as diagnostic only;
-- whether full quiescence is required;
-- reason and callback address.
-
-The existing `gpu.lock` remains the only execution mutex for Greenroom worker
-jobs. `lease claim` briefly acquires `gpu.lock` to prove no worker owns the GPU
-at the claim boundary, then persists an external lease. While a lease is
-`active`, `handoff`, or `ownership_unknown`, worker dispatch returns without
-consuming FIFO jobs. `coordination.lock` only serializes JSON state transitions;
-it is not execution authority.
-
-A holder can answer a bump three ways:
-
-- Grant now with `bump grant --quiescence-confirmed`: the current lease enters
-  `handoff`, the requester wakes, and FIFO worker dispatch stays blocked.
-- Grant after checkpoint without `--quiescence-confirmed`: the bump enters
-  `grant_pending_checkpoint`; `lease release` at the checkpoint converts it to
-  `granted` and moves the lease into `handoff`.
-- Decline with a reason: ownership remains with the holder, and the requester
-  receives a durable decline receipt.
-
-The requester must still claim its own lease with `lease claim --handoff-bump-id
-<bump-id>` before running external work. A bump grant is not execution
-authority by itself; it is a wakeup that a cooperative handoff window exists.
-
-Lease TTL is a coordination-state freshness check only. Expiry transitions the
-lease to `ownership_unknown`, never ownership-free. A dead holder PID also
-transitions to `ownership_unknown` unless a release receipt already exists.
-Operators or agents must recover authority explicitly before assuming the GPU
-is safe for new work.
-
-`bump wait` uses filesystem events on platforms that expose them and emits no
-agent-side polling loop. It returns when the bump is granted, declined, or
-closed, and prints the resulting JSON state.
-
-## Job type config
-
-Job types can be configured via `job_types.json` in the queue directory, or via the defaults in `cli.py`.
-
-Each job type is a dict with:
-
-| Field | Required | Description |
-|-------|----------|-------------|
-| `cmd` | yes | Command template as list of strings. `{input_path}`, `{output_dir}`, and any param key are substituted. |
-| `cwd` | no | Working directory for the subprocess. |
-| `env` | no | Environment variables merged into `os.environ`. |
-| `defaults` | no | Default param values. User params override defaults. Reserved keys (`input_path`, `output_dir`) always win. |
-| `timeout` | no | Timeout in seconds. `null`/absent = no timeout. |
-
-See `job_types.example.json` for TRELLIS2MLX, SuperMat, MoGe, and Pixal3D templates.
-
-Bare command lists are also accepted for simple cases: `{"echo": ["echo", "{input_path}"]}`.
-
-## Route identity shield
-
-A Greenroom route is the local route that actually works on this machine, not
-just an upstream/default command that happens to launch. Before adding,
-reviewing, or approving a `job_types.json` route, preserve the effective runner,
-environment, device, backend, and fallback knobs that made the route safe.
-
-For each new or reviewed job type, record these four lines in the review,
-return packet, or closeout:
-
-- **Known-good local runner checked:** `yes/no/path`, including nearby wrappers
-  like `generate.py`, `batch_generate.sh`, repo READMEs, or prior receipts.
-- **Effective env/device/backend preserved:** exact env or args for device,
-  dtype, backend, fallback knobs, and any forbidden default that was avoided.
-- **First receipt/log proves backend/device:** stdout/status snippet showing the
-  effective route identity before treating a heavy run as accepted.
-- **Heavy run accepted before proof:** `no` by default; if `yes`, explain why
-  the missing identity proof cannot lie about route/backend.
-
-If a route launches with upstream/CUDA/default backend identity while a local
-Mac/MPS runner needs different settings, the route is still candidate-only. A
-started subprocess is not accepted Greenroom evidence until the receipt or log
-proves the local route identity.
-
-TRELLIS.2 on Apple Silicon is the current scar. Preserve and prove the local
-Mac route's `ATTN_BACKEND=sdpa` / `SPARSE_ATTN_BACKEND=sdpa` identity where
-that route applies. Accepting upstream `flash_attn` or a later MPS device
-mismatch as incidental is a route-identity failure, not a model failure.
-
-## Receipt schema
-
-Every completed or failed job gets a `receipt.json`:
-
-```json
-{
-  "job_id": "ab8647e17eb0",
-  "job_type": "trellis2mlx",
-  "status": "done",
-  "input_path": "/path/to/image.png",
-  "output_dir": "/path/to/output",
-  "effective_route": "python -u generate.py --image /path/to/image.png ...",
-  "effective_cwd": "/Users/noahlyons/dev/trellis2mlx",
-  "effective_env": {"PYTHONPATH": "."},
-  "effective_defaults": {"seed": "42", "resolution": "512", ...},
-  "effective_timeout": null,
-  "ignored_params": null,
-  "started_at": 1718000000.0,
-  "finished_at": 1718001200.0,
-  "exit_code": 0,
-  "failure_phase": null,
-  "error_message": null
-}
-```
-
-## Failure phases
-
-| Phase | Meaning |
-|-------|---------|
-| `dispatch` | Unknown job type |
-| `launch` | Subprocess failed to start |
-| `execution` | Subprocess exited with non-zero code |
-| `timeout` | Subprocess exceeded configured timeout |
-| `stale_recovery` | Process died without cleanup; recovered by `recover` |
-
-## Serialization
-
-Uses `flock(LOCK_EX | LOCK_NB)` on `gpu.lock`. Only one worker can run a job at a time. If the lock is held, `run_one()` returns immediately without queuing or blocking. Cancel also acquires the lock to prevent races. External leases and handoffs block worker dispatch before and after the worker acquires `gpu.lock`, so a granted handoff cannot be stolen by the next FIFO job.
+The full CLI (including every lease and bump flag), the on-disk layout, job
+type configuration fields, the receipt schema, failure phases, and the
+route-review checklist are in [`docs/reference.md`](docs/reference.md).
+Empirical guidance on preparing source images and comparing image-to-3D
+routes lives in the
+[generator field guide](docs/generator-field-guide.md).
 
 ## Tests
 
 ```bash
-uv run --extra test python -m pytest tests/ -v
-uv run python benchmarks/bench_control_plane.py --iterations 1000
+uv run --extra test python -m pytest tests/ -q
 ```
 
-Tests cover serialization, failure receipts, stale recovery, cancel safety, FIFO order, param injection prevention, rich config (cwd/env/defaults), receipt route identity, configurable timeout, pause/resume, durable output dirs, volatile path warnings, CLI, exact structured command admission, durable pre-output failures, aggregate native queue control, cooperative external leases, bump handoffs, ownership-unknown lease expiry, dead/live PID handling, duplicate bump requests, concurrent grants, release/grant races, handoff identity binding, wait wakeup races, and worker race prevention.
+112 tests: flock serialization, FIFO order, cancel and recovery races,
+param injection, receipt route identity, attestation and manifest failure
+phases, pause/resume, durable versus volatile output paths, lease claim
+and expiry, dead and live PID handling, duplicate and concurrent bumps,
+release/grant races, handoff identity binding, and wait wakeup races.
+
+## License
+
+MIT.

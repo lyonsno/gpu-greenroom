@@ -1,6 +1,7 @@
 """Tests for the GPU Greenroom CLI."""
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -157,7 +158,7 @@ class TestLoadJobTypes:
         config.write_text(json.dumps({"custom_type": {"cmd": ["echo", "hi"]}}))
         types = _load_job_types(str(queue_dir))
         assert "custom_type" in types
-        assert "trellis2mlx" in types  # default preserved
+        assert "echo" in types  # built-in default preserved
 
     def test_hot_reload_picks_up_changes(self, queue_dir):
         """Calling _load_job_types again after file change returns new types."""
@@ -180,7 +181,7 @@ class TestLoadJobTypes:
         config = queue_dir / "job_types.json"
         config.write_text("{broken json")
         types = _load_job_types(str(queue_dir))
-        assert "trellis2mlx" in types  # defaults survived
+        assert "echo" in types  # built-in defaults survived
 
 
 class TestCLIRecover:
@@ -188,3 +189,14 @@ class TestCLIRecover:
         rc, out, _ = run_cli("recover", queue_dir=queue_dir)
         assert rc == 0
         assert "No stale" in out
+
+
+class TestDefaultJobTypesArePortable:
+    def test_defaults_contain_no_machine_specific_paths(self):
+        """Built-in defaults must not bake one machine's checkout layout into the CLI."""
+        from gpu_queue.cli import DEFAULT_JOB_TYPES
+        encoded = json.dumps(DEFAULT_JOB_TYPES)
+        assert "/Users/" not in encoded
+        assert "/home/" not in encoded
+        assert os.path.expanduser("~") not in encoded
+        assert DEFAULT_JOB_TYPES, "at least one portable built-in job type must exist for smoke runs"

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import ctypes
 import fcntl
+import hashlib
 import json
 import os
+import re
 import select
 import shlex
 import shutil
@@ -62,6 +64,18 @@ class PauseStateError(RuntimeError):
         super().__init__(message)
         self.expected_epoch = expected_epoch
         self.observed_epoch = observed_epoch
+
+
+def _safe_substitute(template: str, mapping: dict) -> str:
+    """Replace placeholders in one pass so values containing braces stay literal."""
+
+    def replacer(match):
+        key = match.group(1)
+        if key in mapping:
+            return str(mapping[key])
+        return match.group(0)
+
+    return re.sub(r"\{(\w+)\}", replacer, template)
 
 
 def effective_worker_capabilities() -> frozenset[str]:
@@ -1200,6 +1214,61 @@ class GPUQueue:
         shutil.move(str(job_dir), str(dest))
         return dest
 
+    @staticmethod
+    def _file_artifact(path: Path, *, recorded_path: str | None = None) -> dict:
+        if not path.is_file():
+            raise FileNotFoundError(f"artifact is not a file: {path}")
+        digest = hashlib.sha256()
+        with path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return {
+            "path": recorded_path if recorded_path is not None else str(path),
+            "sha256": digest.hexdigest(),
+            "size_bytes": path.stat().st_size,
+        }
+
+    @staticmethod
+    def _git_source_snapshot(input_path: Path) -> dict:
+        if not input_path.is_file():
+            raise FileNotFoundError(f"attested input is not a file: {input_path}")
+
+        def git(*args: str) -> str:
+            result = subprocess.run(
+                ["git", "-C", str(input_path.parent), *args],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            return result.stdout.strip()
+
+        root = git("rev-parse", "--show-toplevel")
+        commit = git("rev-parse", "HEAD")
+        status = git("status", "--porcelain=v1", "--untracked-files=all")
+        return {
+            "root": root,
+            "commit": commit,
+            "clean": not bool(status),
+            "status": status.splitlines(),
+        }
+
+    @classmethod
+    def _terminal_artifact_manifest(cls, output_dir: Path, patterns: list[str]) -> list[dict]:
+        manifest = {}
+        for pattern in patterns:
+            pattern_path = Path(pattern)
+            if pattern_path.is_absolute() or ".." in pattern_path.parts:
+                raise ValueError(f"artifact manifest pattern must stay under output_dir: {pattern}")
+            matches = sorted(output_dir.glob(pattern))
+            if not matches:
+                raise FileNotFoundError(f"artifact manifest pattern matched no files: {pattern}")
+            for path in matches:
+                if not path.is_file():
+                    raise ValueError(f"artifact manifest matched a non-file: {path}")
+                relative = path.relative_to(output_dir).as_posix()
+                manifest[relative] = cls._file_artifact(path, recorded_path=relative)
+        return [manifest[path] for path in sorted(manifest)]
+
     def run_one(self, job_types: dict, *, claimant: dict | None = None) -> bool:
         """Pick and run the next pending job under flock.
 
@@ -1298,9 +1367,19 @@ class GPUQueue:
                 job_defaults = raw_config.get("defaults", {})
                 job_timeout = raw_config.get("timeout")  # None = no timeout
 
+            if is_command_job or isinstance(raw_config, list):
+                source_attestation_mode = None
+                runtime_identity_template = None
+                artifact_manifest_patterns = None
+            else:
+                source_attestation_mode = raw_config.get("source_attestation")
+                runtime_identity_template = raw_config.get("runtime_identity_cmd")
+                artifact_manifest_patterns = raw_config.get("artifact_manifest")
+
             if is_command_job:
                 cmd = list(cmd_template)
                 ignored_params = {}
+                substitutions = {}
             else:
                 # Per-job overrides: cwd and env from params (removed before template subs)
                 override_keys = {"cwd", "env"}
@@ -1330,19 +1409,7 @@ class GPUQueue:
                     if key not in used_keys and key not in reserved
                 }
 
-                # Replace placeholders in one pass so values containing braces
-                # remain literal rather than becoming a second expansion.
-                import re
-
-                def safe_substitute(template: str, mapping: dict) -> str:
-                    def replacer(match):
-                        key = match.group(1)
-                        if key in mapping:
-                            return str(mapping[key])
-                        return match.group(0)
-                    return re.sub(r'\{(\w+)\}', replacer, template)
-
-                cmd = [safe_substitute(part, substitutions) for part in cmd_template]
+                cmd = [_safe_substitute(part, substitutions) for part in cmd_template]
             state.effective_route = shlex.join(cmd)
             (job_dir / "status.json").write_text(state.to_json())
 
@@ -1350,6 +1417,70 @@ class GPUQueue:
             run_env = None
             if job_env:
                 run_env = {**os.environ, **job_env}
+
+            # Evidence-custody preflight: attest the input source and probe the
+            # runtime before anything touches output_dir.
+            input_artifact = None
+            source_attestation = None
+            runtime_identity = None
+            artifact_manifest = None
+            dest_status = "failed"
+
+            if source_attestation_mode not in (None, "git-clean-input"):
+                state.status = JobStatus.FAILED
+                state.failure_phase = "source_preflight"
+                state.error_message = f"Unsupported source attestation mode: {source_attestation_mode}"
+                state.exit_code = -1
+
+            if state.status == JobStatus.RUNNING and source_attestation_mode == "git-clean-input":
+                try:
+                    input_path = Path(request.input_path)
+                    input_artifact = self._file_artifact(input_path, recorded_path=request.input_path)
+                    snapshot = self._git_source_snapshot(input_path)
+                    source_attestation = {
+                        "mode": source_attestation_mode,
+                        "root": snapshot["root"],
+                        "commit": snapshot["commit"],
+                        "clean_before": snapshot["clean"],
+                        "status_before": snapshot["status"],
+                    }
+                    if not snapshot["clean"]:
+                        raise RuntimeError("attested input source is not clean")
+                except Exception as exc:
+                    state.status = JobStatus.FAILED
+                    state.failure_phase = "source_preflight"
+                    state.error_message = str(exc)
+                    state.exit_code = -1
+
+            if state.status == JobStatus.RUNNING and runtime_identity_template:
+                runtime_cmd = [_safe_substitute(part, substitutions) for part in runtime_identity_template]
+                try:
+                    probe = subprocess.run(
+                        runtime_cmd,
+                        capture_output=True,
+                        text=True,
+                        cwd=job_cwd,
+                        env=run_env,
+                    )
+                    runtime_identity = {
+                        "command": runtime_cmd,
+                        "exit_code": probe.returncode,
+                        "stdout": probe.stdout,
+                        "stderr": probe.stderr,
+                    }
+                    executable = Path(runtime_cmd[0])
+                    if not executable.is_file():
+                        resolved = shutil.which(runtime_cmd[0])
+                        executable = Path(resolved) if resolved else executable
+                    if executable.is_file():
+                        runtime_identity["executable"] = self._file_artifact(executable)
+                    if probe.returncode != 0:
+                        raise RuntimeError(f"runtime identity command exited with code {probe.returncode}")
+                except Exception as exc:
+                    state.status = JobStatus.FAILED
+                    state.failure_phase = "runtime_identity"
+                    state.error_message = str(exc)
+                    state.exit_code = runtime_identity["exit_code"] if runtime_identity else -1
 
             # Execute
             stdout_path = job_dir / "stdout.log"
@@ -1360,100 +1491,153 @@ class GPUQueue:
             shutdown_exception = None
             ownership_unresolved = False
 
-            try:
-                os.makedirs(request.output_dir, exist_ok=True)
-                with open(stdout_path, "w") as out_f, open(stderr_path, "w") as err_f:
-                    proc = subprocess.Popen(
-                        cmd,
-                        stdout=out_f,
-                        stderr=err_f,
-                        cwd=job_cwd,
-                        env=run_env,
-                        start_new_session=True,
-                    )
-                    self._owned_child = proc
-                    self._owned_process_group = os.getpgid(proc.pid)
-                    if self._worker_shutdown_requested:
-                        raise KeyboardInterrupt
-                    state.pid = proc.pid
-                    state.child_pid = proc.pid
-                    state.child_process_group = self._owned_process_group
-                    state.child_start_identity = self._process_start_identity(proc.pid)
-                    if not state.child_start_identity:
-                        raise RuntimeError("could not record child process start identity")
-                    self._write_text_atomic(job_dir / "status.json", state.to_json())
-                    state.exit_code = proc.wait(timeout=job_timeout)
-                    if self._worker_shutdown_requested:
-                        raise KeyboardInterrupt
-                if not self._quiesce_owned_child(proc, state.child_process_group):
-                    ownership_unresolved = True
-                    state.status = JobStatus.RUNNING
-                    state.failure_phase = "completion_quiescence_unresolved"
-                    state.error_message = (
-                        "Command leader exited but process-group quiescence is unresolved"
-                    )
-                    state.warnings.append("ownership_unknown:process_group_live")
-                    dest_status = None
-                elif state.exit_code == 0:
-                    state.status = JobStatus.DONE
-                    dest_status = "done"
-                else:
-                    state.status = JobStatus.FAILED
-                    state.failure_phase = "execution"
-                    state.error_message = f"Process exited with code {state.exit_code}"
-                    dest_status = "failed"
-            except subprocess.TimeoutExpired:
-                if self._quiesce_owned_child(proc, state.child_process_group):
-                    state.status = JobStatus.FAILED
-                    state.failure_phase = "timeout"
-                    state.error_message = f"Job exceeded {job_timeout}s timeout"
-                    state.exit_code = -1
-                    dest_status = "failed"
-                else:
-                    ownership_unresolved = True
-                    state.status = JobStatus.RUNNING
-                    state.failure_phase = "timeout_quiescence_unresolved"
-                    state.error_message = "Timed-out process group could not be quiesced"
-                    state.warnings.append("ownership_unknown:process_group_live")
-                    dest_status = None
-            except KeyboardInterrupt as exc:
-                if self._quiesce_owned_child(proc, state.child_process_group):
-                    state.status = JobStatus.FAILED
-                    state.failure_phase = "worker_shutdown"
-                    state.error_message = "Worker stopped; owned child process group quiesced"
-                    state.exit_code = -1
-                    dest_status = "failed"
-                else:
-                    ownership_unresolved = True
-                    state.status = JobStatus.RUNNING
-                    state.failure_phase = "worker_shutdown_quiescence_unresolved"
-                    state.error_message = (
-                        "Worker stopped but process-group quiescence is unresolved"
-                    )
-                    state.warnings.append("ownership_unknown:process_group_live")
-                    dest_status = None
-                shutdown_exception = exc
-            except Exception as e:
-                if self._quiesce_owned_child(proc, state.child_process_group):
-                    state.status = JobStatus.FAILED
-                    state.failure_phase = "launch"
-                    state.error_message = str(e)
-                    state.exit_code = -1
-                    dest_status = "failed"
-                else:
-                    ownership_unresolved = True
-                    state.status = JobStatus.RUNNING
-                    state.failure_phase = "launch_quiescence_unresolved"
-                    state.error_message = (
-                        f"{e}; process-group quiescence is unresolved"
-                    )
-                    state.warnings.append("ownership_unknown:process_group_live")
-                    dest_status = None
+            if state.status == JobStatus.RUNNING:
+                try:
+                    os.makedirs(request.output_dir, exist_ok=True)
+                    with open(stdout_path, "w") as out_f, open(stderr_path, "w") as err_f:
+                        proc = subprocess.Popen(
+                            cmd,
+                            stdout=out_f,
+                            stderr=err_f,
+                            cwd=job_cwd,
+                            env=run_env,
+                            start_new_session=True,
+                        )
+                        self._owned_child = proc
+                        self._owned_process_group = os.getpgid(proc.pid)
+                        if self._worker_shutdown_requested:
+                            raise KeyboardInterrupt
+                        state.pid = proc.pid
+                        state.child_pid = proc.pid
+                        state.child_process_group = self._owned_process_group
+                        state.child_start_identity = self._process_start_identity(proc.pid)
+                        if not state.child_start_identity:
+                            raise RuntimeError("could not record child process start identity")
+                        self._write_text_atomic(job_dir / "status.json", state.to_json())
+                        state.exit_code = proc.wait(timeout=job_timeout)
+                        if self._worker_shutdown_requested:
+                            raise KeyboardInterrupt
+                    if not self._quiesce_owned_child(proc, state.child_process_group):
+                        ownership_unresolved = True
+                        state.status = JobStatus.RUNNING
+                        state.failure_phase = "completion_quiescence_unresolved"
+                        state.error_message = (
+                            "Command leader exited but process-group quiescence is unresolved"
+                        )
+                        state.warnings.append("ownership_unknown:process_group_live")
+                        dest_status = None
+                    elif state.exit_code == 0:
+                        state.status = JobStatus.DONE
+                        dest_status = "done"
+                    else:
+                        state.status = JobStatus.FAILED
+                        state.failure_phase = "execution"
+                        state.error_message = f"Process exited with code {state.exit_code}"
+                        dest_status = "failed"
+                except subprocess.TimeoutExpired:
+                    if self._quiesce_owned_child(proc, state.child_process_group):
+                        state.status = JobStatus.FAILED
+                        state.failure_phase = "timeout"
+                        state.error_message = f"Job exceeded {job_timeout}s timeout"
+                        state.exit_code = -1
+                        dest_status = "failed"
+                    else:
+                        ownership_unresolved = True
+                        state.status = JobStatus.RUNNING
+                        state.failure_phase = "timeout_quiescence_unresolved"
+                        state.error_message = "Timed-out process group could not be quiesced"
+                        state.warnings.append("ownership_unknown:process_group_live")
+                        dest_status = None
+                except KeyboardInterrupt as exc:
+                    if self._quiesce_owned_child(proc, state.child_process_group):
+                        state.status = JobStatus.FAILED
+                        state.failure_phase = "worker_shutdown"
+                        state.error_message = "Worker stopped; owned child process group quiesced"
+                        state.exit_code = -1
+                        dest_status = "failed"
+                    else:
+                        ownership_unresolved = True
+                        state.status = JobStatus.RUNNING
+                        state.failure_phase = "worker_shutdown_quiescence_unresolved"
+                        state.error_message = (
+                            "Worker stopped but process-group quiescence is unresolved"
+                        )
+                        state.warnings.append("ownership_unknown:process_group_live")
+                        dest_status = None
+                    shutdown_exception = exc
+                except Exception as e:
+                    if self._quiesce_owned_child(proc, state.child_process_group):
+                        state.status = JobStatus.FAILED
+                        state.failure_phase = "launch"
+                        state.error_message = str(e)
+                        state.exit_code = -1
+                        dest_status = "failed"
+                    else:
+                        ownership_unresolved = True
+                        state.status = JobStatus.RUNNING
+                        state.failure_phase = "launch_quiescence_unresolved"
+                        state.error_message = (
+                            f"{e}; process-group quiescence is unresolved"
+                        )
+                        state.warnings.append("ownership_unknown:process_group_live")
+                        dest_status = None
 
             self._owned_child = None
             self._owned_process_group = None
 
+            if state.status == JobStatus.DONE and source_attestation_mode == "git-clean-input":
+                try:
+                    snapshot = self._git_source_snapshot(Path(request.input_path))
+                    source_attestation.update({
+                        "commit_after": snapshot["commit"],
+                        "clean_after": snapshot["clean"],
+                        "status_after": snapshot["status"],
+                    })
+                    if (
+                        not snapshot["clean"]
+                        or snapshot["root"] != source_attestation["root"]
+                        or snapshot["commit"] != source_attestation["commit"]
+                        or self._file_artifact(
+                            Path(request.input_path), recorded_path=request.input_path
+                        ) != input_artifact
+                    ):
+                        raise RuntimeError("attested input source changed during execution")
+                except Exception as exc:
+                    state.status = JobStatus.FAILED
+                    state.failure_phase = "source_postflight"
+                    state.error_message = str(exc)
+                    state.exit_code = -1
+                    dest_status = "failed"
+
             state.finished_at = None if ownership_unresolved else time.time()
+
+            # Metadata must exist before terminal artifacts are hashed.
+            if state.status == JobStatus.DONE:
+                try:
+                    self._write_metadata_sidecar(request, state)
+                except Exception as exc:
+                    state.status = JobStatus.FAILED
+                    state.failure_phase = "metadata"
+                    state.error_message = str(exc)
+                    state.exit_code = -1
+                    dest_status = "failed"
+
+            if state.status == JobStatus.DONE and artifact_manifest_patterns:
+                try:
+                    artifact_manifest = self._terminal_artifact_manifest(
+                        Path(request.output_dir), artifact_manifest_patterns
+                    )
+                except Exception as exc:
+                    state.status = JobStatus.FAILED
+                    state.failure_phase = "artifact_manifest"
+                    state.error_message = str(exc)
+                    state.exit_code = -1
+                    dest_status = "failed"
+
+            if source_attestation is not None and "clean_after" not in source_attestation:
+                source_attestation["clean_after"] = None
+                source_attestation["status_after"] = None
+
             self._write_text_atomic(job_dir / "status.json", state.to_json())
 
             # Write receipt with full route identity
@@ -1494,12 +1678,12 @@ class GPUQueue:
                 "stdout_path": str(final_job_dir / "stdout.log"),
                 "stderr_path": str(final_job_dir / "stderr.log"),
                 "worker": effective_claimant,
+                "input_artifact": input_artifact,
+                "source_attestation": source_attestation,
+                "runtime_identity": runtime_identity,
+                "artifact_manifest": artifact_manifest,
             }
             self._write_json_atomic(job_dir / "receipt.json", receipt)
-
-            # Write metadata sidecar into output_dir for asset browsers
-            if state.status == JobStatus.DONE:
-                self._write_metadata_sidecar(request, state)
 
             if not ownership_unresolved:
                 self._move_job(job_dir, dest_status)

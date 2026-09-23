@@ -28,44 +28,23 @@ DEFAULT_REGISTRY_PATH = os.environ.get(
     os.path.join(DEFAULT_QUEUE_DIR, "queues.json"),
 )
 
-# Default job type configurations
-# Rich config: cmd, cwd, env, defaults
-# Bare list also accepted for simple cases
-_TRELLIS_ROOT = os.path.expanduser("~/dev/trellis2mlx")
-_PERCEPTASIA_ROOT = os.path.expanduser("~/dev/perceptasia")
-
+# Built-in job types. Real job types live in job_types.json in the queue
+# directory and are hot-reloaded every poll; the built-ins exist so a fresh
+# install can smoke the queue without any external generator installed.
 DEFAULT_JOB_TYPES = {
-    "trellis2mlx": {
-        "cmd": [
-            os.path.join(_TRELLIS_ROOT, ".venv/bin/python"), "-u", "generate.py",
-            "--image", "{input_path}",
-            "--output", "{output_dir}/seed-{seed}.glb",
-            "--seed", "{seed}",
-            "--resolution", "{resolution}",
-            "--target-faces", "{target_faces}",
-            "--texture-size", "{texture_size}",
-            "--simplify-first",
-        ],
-        "cwd": _TRELLIS_ROOT,
-        "env": {"PYTHONPATH": "."},
-        "defaults": {
-            "seed": "42",
-            "resolution": "512",
-            "target_faces": "200000",
-            "texture_size": "1024",
-        },
-    },
-    "supermat": {
-        "cmd": [
-            os.path.join(_PERCEPTASIA_ROOT, ".venv/bin/python"), "-u", "run_supermat.py",
-            "--image", "{input_path}",
-            "--output-dir", "{output_dir}",
-        ],
-        "cwd": _PERCEPTASIA_ROOT,
-        "env": {"PYTHONPATH": "."},
+    "echo": {
+        "cmd": ["echo", "greenroom", "{input_path}", "{output_dir}"],
         "defaults": {},
     },
 }
+
+
+def _package_version() -> str:
+    try:
+        from importlib.metadata import version
+        return version("gpu-greenroom")
+    except Exception:
+        return "unknown"
 
 
 def get_queue(args) -> GPUQueue:
@@ -623,6 +602,7 @@ def main():
         prog="gpu-greenroom",
         description="Filesystem-backed GPU job queue with flock serialization",
     )
+    parser.add_argument("--version", action="version", version=f"gpu-greenroom {_package_version()}")
     parser.add_argument(
         "--queue-dir", default=DEFAULT_QUEUE_DIR,
         help=f"Queue directory (default: {DEFAULT_QUEUE_DIR})",
@@ -636,7 +616,7 @@ def main():
 
     # submit
     p_submit = sub.add_parser("submit", help="Submit a job")
-    p_submit.add_argument("job_type", help="Job type (e.g. trellis2mlx, supermat)")
+    p_submit.add_argument("job_type", help="Job type: a key in job_types.json, or the built-in 'echo' smoke type")
     p_submit.add_argument("input", help="Input file path")
     p_submit.add_argument("output_dir", nargs="?", default="", help="Output directory (default: durable path in queue dir)")
     p_submit.add_argument("-p", "--params", nargs="*", help="Key=value params (e.g. seed=42)")
