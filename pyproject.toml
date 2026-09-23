@@ -1,9 +1,31 @@
 [project]
 name = "gpu-greenroom"
 version = "0.1.0"
-description = "Filesystem-backed GPU job queue with flock serialization"
+description = "Filesystem-backed GPU job queue with flock serialization and cooperative leases for one shared accelerator"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Noah Lyons" }]
 requires-python = ">=3.11"
 dependencies = []
+keywords = ["gpu", "job-queue", "scheduler", "flock", "apple-silicon", "mlx", "metal", "agents"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: System :: Distributed Computing",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://github.com/lyonsno/gpu-greenroom"
+Issues = "https://github.com/lyonsno/gpu-greenroom/issues"
 
 [project.optional-dependencies]
 test = ["pytest>=8.0"]
@@ -12,5 +34,5 @@ test = ["pytest>=8.0"]
 gpu-greenroom = "gpu_queue.cli:main"
 
 [build-system]
-requires = ["setuptools>=68.0"]
+requires = ["setuptools>=77.0"]
 build-backend = "setuptools.build_meta"

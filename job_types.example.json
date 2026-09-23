@@ -1,7 +1,7 @@
 {
   "trellis2mlx": {
     "cmd": [
-      "/Users/noahlyons/dev/trellis2mlx/.venv/bin/python", "-u", "generate.py",
+      "/path/to/trellis2mlx/.venv/bin/python", "-u", "generate.py",
       "--image", "{input_path}",
       "--output", "{output_dir}/output.glb",
       "--seed", "{seed}",
@@ -10,7 +10,7 @@
       "--texture-size", "{texture_size}",
       "--simplify-first"
     ],
-    "cwd": "/Users/noahlyons/dev/trellis2mlx",
+    "cwd": "/path/to/trellis2mlx",
     "env": {"PYTHONPATH": "."},
     "defaults": {
       "seed": "42",
@@ -21,33 +21,33 @@
   },
   "supermat": {
     "cmd": [
-      "/Users/noahlyons/dev/perceptasia/.venv/bin/python", "-u", "run_supermat.py",
+      "/path/to/perceptasia/.venv/bin/python", "-u", "run_supermat.py",
       "--image", "{input_path}",
       "--output-dir", "{output_dir}"
     ],
-    "cwd": "/Users/noahlyons/dev/perceptasia",
+    "cwd": "/path/to/perceptasia",
     "env": {"PYTHONPATH": "."},
     "defaults": {}
   },
   "moge": {
     "cmd": [
-      "/Users/noahlyons/dev/perceptasia/.venv/bin/python", "-u", "run_moge.py",
+      "/path/to/perceptasia/.venv/bin/python", "-u", "run_moge.py",
       "--image", "{input_path}",
       "--output-dir", "{output_dir}"
     ],
-    "cwd": "/Users/noahlyons/dev/perceptasia",
+    "cwd": "/path/to/perceptasia",
     "env": {"PYTHONPATH": "."},
     "defaults": {}
   },
   "pixal3d": {
     "cmd": [
-      "/Users/noahlyons/dev/pixal3d-mlx/.venv/bin/python", "-u", "generate.py",
+      "/path/to/pixal3d-mlx/.venv/bin/python", "-u", "generate.py",
       "--image", "{input_path}",
       "--output", "{output_dir}/output.glb",
       "--seed", "{seed}",
       "--cascade", "{cascade}"
     ],
-    "cwd": "/Users/noahlyons/dev/pixal3d-mlx",
+    "cwd": "/path/to/pixal3d-mlx",
     "env": {"PYTHONPATH": "."},
     "defaults": {
       "seed": "42",
