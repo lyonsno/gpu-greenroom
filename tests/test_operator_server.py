@@ -20,6 +20,13 @@ def test_operator_page_includes_minimal_greenroom_smoke_response_panel():
     assert "/api/smoke-requests/" in PAGE
 
 
+def test_smoke_panel_marks_sender_unverified_and_retains_reply_drafts_across_polling():
+    assert "Reported by (unverified):" in PAGE
+    assert "smokeDrafts" in PAGE
+    assert "smokeSubmitting" in PAGE
+    assert "smokeDrafts.get(id)" in PAGE
+
+
 def test_read_only_operator_page_identifies_response_controls_as_unavailable(tmp_path):
     queue_dir = tmp_path / "queue"
     queue_dir.mkdir()
