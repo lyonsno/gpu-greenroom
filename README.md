@@ -105,7 +105,14 @@ untouched instead of skipping past it.
 `gpu-greenroom operator` serves a token-authenticated, loopback-only web
 console: queue state, each job's owner and route, queue wait versus
 execution time, pause and resume with owner and epoch receipts, and cancel
-or stop for the job in front of you. `gpu-greenroom doctor --json` checks
+or stop for the job in front of you.
+
+![The operator console over a demo queue: three structured command jobs waiting, one running with stop controls, and a released external lease](docs/assets/console.png)
+
+That frame is the console over a disposable demo queue built by
+[`docs/console_fixture.py`](docs/console_fixture.py): the jobs, worker,
+receipts, and lease are real Greenroom mechanics, only the workloads are
+fake. Run it yourself to get the same screen. `gpu-greenroom doctor --json` checks
 executable discovery, imports, queue writes, and dispatch availability.
 `gpu-greenroom queues register|status|pause|resume` groups several queue
 directories into one contention class so a single pause holds every
