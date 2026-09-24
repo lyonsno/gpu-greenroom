@@ -14,6 +14,48 @@ from gpu_queue.queue import GPUQueue
 from http.server import ThreadingHTTPServer
 
 
+def test_operator_page_includes_minimal_greenroom_smoke_response_panel():
+    assert '<section id="smokeRequests"' in PAGE
+    assert 'id="smokeRequestList"' in PAGE
+    assert "/api/smoke-requests/" in PAGE
+
+
+def test_read_only_operator_page_identifies_response_controls_as_unavailable(tmp_path):
+    queue_dir = tmp_path / "queue"
+    queue_dir.mkdir()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(queue_dir, "secret", read_only=True))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        page = urlopen(f"http://127.0.0.1:{server.server_address[1]}/").read().decode()
+        assert 'data-read-only="true"' in page
+        assert '<section id="smokeRequests"' in page
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_admission_control_snapshot_handles_a_new_empty_queue_directory(tmp_path):
+    queue_dir = tmp_path / "queue"
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(queue_dir, "secret", admission_control=True))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        request = Request(
+            f"http://127.0.0.1:{server.server_address[1]}/api/state?view=active",
+            headers={"Authorization": "Bearer secret"},
+        )
+        snapshot = json.load(urlopen(request))
+        assert snapshot["jobs"] == []
+        assert snapshot["running_job_ids"] == []
+        assert snapshot["admission_state"] == "not_paused"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
 def test_operator_snapshot_exposes_pause_and_route(tmp_path):
     queue = GPUQueue(tmp_path / "queue")
     request = JobRequest(
