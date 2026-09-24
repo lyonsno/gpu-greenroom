@@ -27,6 +27,13 @@ def test_smoke_panel_marks_sender_unverified_and_retains_reply_drafts_across_pol
     assert "smokeDrafts.get(id)" in PAGE
 
 
+def test_smoke_refresh_restores_reply_focus_and_ignores_superseded_reads():
+    assert "document.activeElement" in PAGE
+    assert "setSelectionRange" in PAGE
+    assert "smokeLoadGeneration" in PAGE
+    assert "generation!==smokeLoadGeneration" in PAGE
+
+
 def test_read_only_operator_page_identifies_response_controls_as_unavailable(tmp_path):
     queue_dir = tmp_path / "queue"
     queue_dir.mkdir()
