@@ -16,8 +16,9 @@ Policy (operator-approved 2026-09-24):
 - Collection is two-phase. ``gc --dry-run`` writes an epoch-bound candidate
   list with a per-row snapshot, an apply-not-before time, and one notice per
   owner. ``gc --apply --epoch`` deletes only that list, once, after the grace
-  window, holding any row whose entry changed, was pinned, or is referenced
-  by a pending or running job (as output, input, or argv) at execution time.
+  window, holding any row whose entry changed, was pinned, or is mentioned
+  anywhere in a pending or running job's records at execution time. An
+  unreadable pending or running record holds every candidate.
 - Every deletion writes a receipt, with the job's artifact-manifest digests
   when they exist, before the bytes go. A failed removal leaves a partial
   receipt and the run still writes its summary.
@@ -135,9 +136,9 @@ class RetentionPins:
     def is_pinned(self, name: str, now: float) -> bool:
         """A pin holds until its ``until`` passes; an ``until`` nobody can read holds forever."""
         entry = self.entries().get(name)
-        if not entry:
+        if entry is None:
             return False
-        until = _parse_until(entry.get("until"))
+        until = _parse_until(entry.get("until"))   # an empty object is a pin with no deadline
         if until is _UNPARSEABLE:
             return True   # fail closed: a malformed deadline never unpins
         return until is None or until > now
@@ -242,25 +243,58 @@ def _names_in_string(text: str, outputs: Path, outputs_prefix: str) -> set[str]:
     return names
 
 
-def _active_refs(queue_dir: Path) -> set[str]:
-    """Top-level entries any string in a pending or running job's records refers to.
+class ActiveRefs:
+    """What pending and running jobs mention.
 
-    Covers output_dir, input_path, command_cwd, params values, and argv,
-    with symlinked paths resolved to their real location.
+    ``mentions(name)`` is true when the entry name appears as a substring of
+    any string in any pending or running record (output_dir, input_path,
+    command_cwd, params, argv, anything), or when an absolute path in those
+    strings resolves into the entry. Over-protection is the intended
+    failure direction. ``unreadable`` is true when a pending or running
+    job's request.json is missing or unparsable, or its status.json is
+    present but unparsable; then nothing can be proven unreferenced.
     """
-    outputs = (queue_dir / "outputs").resolve()
-    outputs_prefix = str(outputs) + os.sep
-    names: set[str] = set()
-    for status in ("pending", "running"):
-        status_dir = queue_dir / status
-        if not status_dir.is_dir():
-            continue
-        for job_dir in status_dir.iterdir():
-            for record_name in ("request.json", "status.json"):
-                doc = _load_json(job_dir / record_name)
-                for text in _strings_in(doc):
-                    names |= _names_in_string(text, outputs, outputs_prefix)
-    return names
+
+    def __init__(self, names: set[str], texts: list[str], unreadable: bool):
+        self.names = names
+        self.blob = "\n".join(texts)
+        self.unreadable = unreadable
+
+    @classmethod
+    def load(cls, queue_dir: Path) -> "ActiveRefs":
+        outputs = (queue_dir / "outputs").resolve()
+        outputs_prefix = str(outputs) + os.sep
+        names: set[str] = set()
+        texts: list[str] = []
+        unreadable = False
+        for status in ("pending", "running"):
+            status_dir = queue_dir / status
+            if not status_dir.is_dir():
+                continue
+            for job_dir in status_dir.iterdir():
+                if not job_dir.is_dir():
+                    continue
+                request = _load_json(job_dir / "request.json")
+                if not isinstance(request, dict):
+                    unreadable = True
+                state = None
+                if (job_dir / "status.json").exists():
+                    state = _load_json(job_dir / "status.json")
+                    if not isinstance(state, dict):
+                        unreadable = True
+                for doc in (request, state):
+                    for text in _strings_in(doc):
+                        texts.append(text)
+                        names |= _names_in_string(text, outputs, outputs_prefix)
+        return cls(names, texts, unreadable)
+
+    def mentions(self, name: str) -> bool:
+        return name in self.names or (bool(name) and name in self.blob)
+
+
+def _active_refs(queue_dir: Path) -> set[str]:
+    """Compatibility view: entry names resolved from absolute paths only."""
+    return ActiveRefs.load(queue_dir).names
 
 
 def resolve_class(records: list[dict], job_types: dict) -> tuple[str, str | None]:
@@ -336,7 +370,7 @@ def scan(queue_dir, job_types: dict, *, now: float, ttl_days: dict | None = None
     outputs = queue_dir / "outputs"
     ttl = {**DEFAULT_TTL_DAYS, **(ttl_days or {})}
     records = _job_records(queue_dir)
-    active = _active_refs(queue_dir)
+    active = ActiveRefs.load(queue_dir)
     graduated = reported_unclassified(queue_dir, now=now)
     pins = RetentionPins(queue_dir)
     try:
@@ -365,12 +399,19 @@ def scan(queue_dir, job_types: dict, *, now: float, ttl_days: dict | None = None
             age_source = "mtime"
         owners = sorted({r["agent_id"] for r in recs if isinstance(r.get("agent_id"), str) and r["agent_id"].strip()})
         owner = owners[0] if len(owners) == 1 else (",".join(owners) if owners else None)
-        pinned = pins.is_pinned(entry.name, now) if pins_readable else None
-        is_active = entry.name in active
+        pinned = None
+        if pins_readable:
+            try:
+                pinned = pins.is_pinned(entry.name, now)
+            except PinsUnreadable:
+                pins_readable = False
+        is_active = active.mentions(entry.name)
         limit = ttl.get(output_class)
         candidate = False
         if not pins_readable:
             reason = "pins_unreadable"
+        elif active.unreadable:
+            reason = "active_unknown"
         elif is_active:
             reason = "active"
         elif pinned:
@@ -433,6 +474,7 @@ def write_candidates(queue_dir, rows: list[dict], *, now: float, grace_hours: fl
             "unclassified_bytes": total(lambda r: r["reason"] == "unclassified"),
             "pinned_count": sum(bool(r["pinned"]) for r in rows),
             "active_count": sum(r["active"] for r in rows),
+            "active_unknown": any(r["reason"] == "active_unknown" for r in rows),
             "pins_readable": all(r["reason"] != "pins_unreadable" for r in rows),
         },
         "rows": rows,
@@ -487,8 +529,11 @@ def apply(queue_dir, *, epoch: str, owner: str, now: float) -> dict:
     receipts_dir = queue_dir / "gc-receipts" / epoch
     if doc.get("status") == "applied" or (receipts_dir / "_summary.json").exists():
         raise GCRefused(f"epoch {epoch} was already applied; run a new gc --dry-run")
-    if not _is_number(doc.get("apply_not_before")) or not _is_number(doc.get("created_at")):
-        raise GCRefused("candidate list is malformed: apply_not_before or created_at is not a number")
+    deadline, created = doc.get("apply_not_before"), doc.get("created_at")
+    if not (_is_number(deadline) and _is_number(created) and math.isfinite(deadline) and math.isfinite(created)):
+        raise GCRefused("candidate list is malformed: apply_not_before or created_at is not a finite number")
+    if deadline - created < MIN_GRACE_HOURS * 3600.0 - 1e-6:
+        raise GCRefused(f"candidate list is malformed: its grace window is shorter than the approved {MIN_GRACE_HOURS:g} hours")
     if now < float(doc["apply_not_before"]):
         remaining = (float(doc["apply_not_before"]) - now) / 3600.0
         raise GCRefused(f"grace window has not elapsed: {remaining:.1f} h remaining")
@@ -534,7 +579,11 @@ def apply(queue_dir, *, epoch: str, owner: str, now: float) -> dict:
             except PinsUnreadable:
                 holds.append({"name": name, "reason": "pins_unreadable"})
                 continue
-            if name in _active_refs(queue_dir):   # re-read per row: a job may have been submitted mid-run
+            active = ActiveRefs.load(queue_dir)   # re-read per row: a job may have been submitted mid-run
+            if active.unreadable:
+                holds.append({"name": name, "reason": "active_unknown"})
+                continue
+            if active.mentions(name):
                 holds.append({"name": name, "reason": "active"})
                 continue
             manifests = [m for r in recs for m in (r.get("artifact_manifest") or [])]

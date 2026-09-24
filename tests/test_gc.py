@@ -2,7 +2,7 @@
 
 Retention policy (operator-approved 2026-09-24): every output has a class and
 an owner; TTL by class (intermediate 30 d, witness 60 d, final 180 d);
-unclassified is reported, never collected; pins are declared, never inferred;
+unclassified is reported for one cycle, then treated as intermediate; pins are declared, never inferred;
 collection is two-phase (dry-run writes an epoch-bound candidate list, apply
 deletes only that list after a grace window, re-checking every row); every
 deletion writes a receipt before the bytes go; nothing outside the queue's own
@@ -506,7 +506,8 @@ class TestCLIRevisionOne:
         epoch = json.loads(o)["epoch"]
         path = queue_dir / "gc-candidates.json"
         doc = json.loads(path.read_text())
-        doc["apply_not_before"] = time.time() - 1
+        doc["created_at"] = time.time() - 73 * 3600      # pretend the dry-run happened 73 h ago
+        doc["apply_not_before"] = doc["created_at"] + 72 * 3600
         path.write_text(json.dumps(doc))
         rc, o, e = run_cli("gc", "--apply", "--epoch", epoch, "--owner", "ops", queue_dir=queue_dir)
         assert rc == 0, e
@@ -611,3 +612,65 @@ class TestRevisionTwo:
         assert history["status"] == "applied"
         with pytest.raises(gc_mod.GCRefused, match="already applied|epoch mismatch"):
             gc_mod.apply(queue_dir, epoch=cand["epoch"], owner="ops", now=NOW + 10 * DAY)
+
+
+class TestRevisionThree:
+    def test_every_name_mentioned_in_a_queued_record_is_protected(self, queue_dir):
+        a = make_output(queue_dir, "alpha-trace", job_type="trace", agent="lane-a", finished_days_ago=45)
+        b = make_output(queue_dir, "beta-trace", job_type="trace", agent="lane-a", finished_days_ago=45)
+        c = make_output(queue_dir, "gamma-trace", job_type="trace", agent="lane-a", finished_days_ago=45)
+        pj = queue_dir / "pending" / "p-shell"
+        pj.mkdir()
+        (pj / "request.json").write_text(json.dumps({
+            "job_type": "command", "input_path": "", "output_dir": str(queue_dir / "outputs" / "new"), "params": {},
+            "command_argv": ["bash", "-lc", f"python dec.py --ckpt {a}/c --latents {b}/c && cp ~/.local/state/gpu-greenroom/outputs/gamma-trace/x /tmp/y"],
+        }))
+
+        rows = {r["name"]: r for r in gc_mod.scan(queue_dir, load_job_types(queue_dir), now=NOW)}
+
+        assert rows["alpha-trace"]["active"] and rows["beta-trace"]["active"] and rows["gamma-trace"]["active"]
+        assert not any(rows[n]["candidate"] for n in ("alpha-trace", "beta-trace", "gamma-trace"))
+
+    def test_unreadable_queued_record_holds_everything(self, queue_dir):
+        import os
+        out = make_output(queue_dir, "old-trace", job_type="trace", agent="lane-a", finished_days_ago=45)
+        os.utime(out, (NOW - 45 * DAY, NOW - 45 * DAY))
+        cand = candidates(queue_dir)
+        pj = queue_dir / "pending" / "p-torn"
+        pj.mkdir()
+        (pj / "request.json").write_text("")   # a torn or in-progress write
+
+        rows = {r["name"]: r for r in gc_mod.scan(queue_dir, load_job_types(queue_dir), now=NOW)}
+        assert rows["old-trace"]["reason"] == "active_unknown" and not rows["old-trace"]["candidate"]
+
+        summary = gc_mod.apply(queue_dir, epoch=cand["epoch"], owner="ops", now=NOW + 4 * DAY)
+        assert out.exists() and summary["deleted"] == 0
+        assert summary["holds"][0]["reason"] == "active_unknown"
+
+    def test_empty_pin_object_holds_forever(self, queue_dir):
+        make_output(queue_dir, "old-trace", job_type="trace", agent="lane-a", finished_days_ago=45)
+        pins_path = queue_dir / "retention" / "pins.json"
+        pins_path.parent.mkdir()
+        pins_path.write_text(json.dumps({"schema": gc_mod.PINS_SCHEMA, "pins": {"old-trace": {}}}))
+        row = {r["name"]: r for r in gc_mod.scan(queue_dir, load_job_types(queue_dir), now=NOW)}["old-trace"]
+        assert row["pinned"] is True and not row["candidate"]
+
+    def test_apply_refuses_a_list_whose_deadline_is_shorter_than_the_approved_window(self, queue_dir):
+        out = make_output(queue_dir, "old-trace", job_type="trace", agent="lane-a", finished_days_ago=45)
+        cand = candidates(queue_dir)
+        path = queue_dir / "gc-candidates.json"
+        for bad in (float("nan"), NOW + 3600, NOW + 71 * 3600):
+            doc = json.loads(path.read_text())
+            doc["apply_not_before"] = bad if bad == bad else "NaN"
+            path.write_text(json.dumps(doc) if bad == bad else json.dumps(doc).replace('"NaN"', "NaN"))
+            with pytest.raises(gc_mod.GCRefused, match="malformed|grace"):
+                gc_mod.apply(queue_dir, epoch=cand["epoch"], owner="ops", now=NOW + 400 * DAY)
+        assert out.exists()
+
+    def test_future_iso_until_keeps_a_pin(self, queue_dir):
+        make_output(queue_dir, "old-trace", job_type="trace", agent="lane-a", finished_days_ago=45)
+        pins_path = queue_dir / "retention" / "pins.json"
+        pins_path.parent.mkdir()
+        pins_path.write_text(json.dumps({"schema": gc_mod.PINS_SCHEMA, "pins": {"old-trace": {"owner": "a", "reason": "b", "until": "2099-01-01"}}}))
+        row = {r["name"]: r for r in gc_mod.scan(queue_dir, load_job_types(queue_dir), now=NOW)}["old-trace"]
+        assert row["pinned"] is True and not row["candidate"]

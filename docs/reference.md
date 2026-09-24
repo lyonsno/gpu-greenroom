@@ -354,10 +354,15 @@ the newest job's `finished_at`; when no job record carries a numeric
 `finished_at`, the top-level directory's mtime is used instead.
 
 **TTL.** `intermediate` 30 days, `witness` 60 days, `final` 180 days. An
-entry is a candidate when it is past its TTL, not pinned, and not referenced
-by any string in a pending or running job's records: `output_dir`,
-`input_path`, `command_cwd`, `params` values, and `command_argv`, with
-symlinked paths resolved to where they really point.
+entry is a candidate when it is past its TTL, not pinned, and not mentioned
+anywhere in a pending or running job's records. "Mentioned" means the
+entry's name appears in any string value (`output_dir`, `input_path`,
+`command_cwd`, `params`, `command_argv`, anything else), or an absolute
+path in one of them resolves into the entry; the check over-protects on
+purpose. If any pending or running job's `request.json` is missing or
+unparsable, or its `status.json` is present but unparsable, nothing can be
+proven unreferenced: every row reports `active_unknown` and nothing is a
+candidate until the record is readable.
 
 **Graduation.** `unclassified` entries are listed with their size and not
 collected in the cycle that first reports them. Every dry-run is copied to
@@ -384,14 +389,18 @@ window; 72 hours, the approved window, and never less). It also writes one notic
 owner under `gc-notices/<epoch>/` naming that owner's candidates, the
 deadline, and how to pin. It warns, without acting, when `outputs/` exceeds
 `--warn-over-gib` (150) or free space is under `--free-floor-gib` (100).
+These warnings run only in `gc --dry-run` for now; the worker-side warning
+the policy describes is pending with the queue-semantics owner.
 
 `gc --apply --epoch <epoch> --owner <who>` refuses when the epoch does not
 match the current list, when that epoch was already applied, when the grace
-window has not elapsed, when the list is malformed, when pins are
-unreadable, or when any listed path resolves outside `outputs/`. Otherwise
-it walks the list and holds any row whose entry is missing, whose job set or
-newest finish changed, whose directory mtime is newer than the list, that
-was pinned since, or that a pending or running job now references. For the
+window has not elapsed, when the list is malformed or its own deadline is
+shorter than the approved window, when pins are unreadable, or when any
+listed path resolves outside `outputs/`. Otherwise it walks the list and
+holds any row whose entry is missing, whose job set or newest finish
+changed, whose directory mtime is newer than the list, that was pinned
+since, that a pending or running job now mentions, or whose reference
+state cannot be read (`active_unknown`). For the
 rest it writes `gc-receipts/<epoch>/<name>.json` (class, source, reason,
 owner, size, age, job ids, snapshot, and any `artifact_manifest` and
 `input_artifact` digests from those jobs' receipts), removes the directory,
