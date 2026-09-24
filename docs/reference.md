@@ -25,6 +25,13 @@ gpu-greenroom resume --owner NAME --epoch ID    # epoch must match the observed 
 gpu-greenroom recover                  # move running jobs whose worker PID is gone to failed/
 gpu-greenroom doctor --json            # executable discovery, imports, queue writes, dispatch availability
 
+# Retention
+gpu-greenroom gc --dry-run [--grace-hours 72] [--authority TEXT] [--no-size] [--json]
+gpu-greenroom gc --apply --epoch ID --owner NAME
+gpu-greenroom retain NAME --owner NAME --reason TEXT [--until ISO-DATETIME]
+gpu-greenroom retain --list
+gpu-greenroom retain NAME --unpin
+
 # Operator console
 gpu-greenroom operator --port 8765                       # one-shot; prints a token URL
 gpu-greenroom operator --local-operator --admission-control --identity-label Agent --port 8766
@@ -121,6 +128,7 @@ rich config:
 | `timeout` | no | Seconds. Absent or `null` means no timeout. |
 | `source_attestation` | no | `"git-clean-input"`: before launch, hash the input file and record its repository root, commit, and dirty state; refuse to run if the tree is dirty; re-check after the run and fail the job if the input or commit changed underneath it. |
 | `runtime_identity_cmd` | no | Command list run before the job. Its stdout, stderr, exit code, and the hash of its executable are recorded in the receipt. Non-zero exit fails the job in the `runtime_identity` phase. Use it to prove which interpreter, backend, or device the job actually ran on. |
+| `output_class` | no | Retention class for this job type's outputs: `final`, `witness`, or `intermediate`. Absent means unclassified, which `gc` reports and never collects. |
 | `artifact_manifest` | no | Glob patterns relative to `output_dir`. After a successful run, every match is hashed into the receipt. A pattern that matches nothing fails the job. |
 
 Params the template does not consume are recorded in the receipt as
@@ -329,6 +337,36 @@ page; `--identity-label` sets the word used for the owner column. Every
 control action carries a request id and lands as a receipt under
 `operator-actions/`, and an action interrupted between marker mutation and
 completion is never replayed as successful.
+
+## Retention and garbage collection
+
+`gc` manages only direct children of the queue's own `outputs/`. Caller-owned
+output directories elsewhere are recorded in receipts and never touched.
+
+Each entry gets a class from the longest-TTL class any of its jobs declared
+(`output_class` on the job type, or `output_class` in a structured command
+manifest or `--output-class`), an owner from the job's `agent_id`, and an
+age from the newest job's `finished_at` (directory mtime when no job record
+exists). TTL by class: `intermediate` 30 days, `witness` 60 days, `final`
+180 days. An entry is a candidate when it is past its TTL, not pinned, and
+not referenced by a pending or running job. `unclassified` entries are
+listed with their size and never collected.
+
+`gc --dry-run` writes `gc-candidates.json` with an `epoch`, totals, every
+row, and `apply_not_before` (now plus the grace window, 72 hours by default).
+`gc --apply --epoch <epoch> --owner <who>` refuses when the epoch does not
+match the current candidate list, when the grace window has not elapsed, or
+when any listed path resolves outside `outputs/`; otherwise it re-checks
+each row for pins and active jobs, writes
+`gc-receipts/<epoch>/<name>.json` (class, owner, size, age, job ids, and any
+`artifact_manifest` and `input_artifact` digests from those jobs' receipts),
+removes the directory, then stamps `deleted_at` on the receipt. A summary
+lands at `gc-receipts/<epoch>/_summary.json`.
+
+`retain <name> --owner --reason [--until]` writes `retention/pins.json`; a
+pinned entry is never a candidate until its `until` passes or it is
+unpinned. Pins are the only retention authority; citation counts in reports
+are diagnostics.
 
 ## Reviewing a new job type
 

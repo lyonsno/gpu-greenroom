@@ -14,6 +14,7 @@ from pathlib import Path
 
 from .control import QueueControlError, QueueRegistry
 from .models import BumpStatus, JobRequest, JobStatus, LeaseStatus
+from . import gc as gc_mod
 from .queue import (
     GPUQueue,
     PauseStateError,
@@ -128,6 +129,7 @@ def _command_payload(args):
             "env": _parse_env_assignments(args.env),
             "output_dir": args.output_dir,
             "route_identity": args.route_identity,
+            "output_class": args.output_class,
             "argv": argv,
             "timeout": args.timeout,
         }
@@ -161,7 +163,11 @@ def _command_payload(args):
     output_dir = payload.get("output_dir") or ""
     if not isinstance(output_dir, str):
         raise ValueError("command manifest output_dir must be a string")
+    output_class = payload.get("output_class")
+    if output_class is not None and output_class not in gc_mod.CLASSES:
+        raise ValueError(f"command manifest output_class must be one of {', '.join(gc_mod.CLASSES)} or absent")
     return {
+        "output_class": output_class,
         "manifest_path": str(manifest_path) if manifest_path else None,
         "repo_root": str(repo_root),
         "cwd": str(cwd),
@@ -215,6 +221,7 @@ def cmd_submit_command(args):
         command_env=payload["env"],
         route_identity=payload["route_identity"],
         command_timeout=payload["timeout"],
+        output_class=payload["output_class"],
         required_worker_capabilities=[STRUCTURED_COMMAND_CAPABILITY],
     )
     job_dir = queue.submit(request)
@@ -227,6 +234,7 @@ def cmd_submit_command(args):
         "output_dir": request.output_dir,
         "agent_id": request.agent_id,
         "route_identity": request.route_identity,
+        "output_class": request.output_class,
         "required_worker_capabilities": request.required_worker_capabilities,
     }
     print(json.dumps(response, indent=2))
@@ -597,6 +605,60 @@ def cmd_bump_wait(args):
     _print_model(bump)
 
 
+def cmd_gc(args):
+    import time as _time
+    queue_dir = args.queue_dir
+    if args.apply:
+        if not args.epoch or not args.owner:
+            print("gc --apply requires --epoch <candidates-epoch> and --owner <who>", file=sys.stderr)
+            sys.exit(2)
+        try:
+            summary = gc_mod.apply(queue_dir, epoch=args.epoch, owner=args.owner, now=_time.time())
+        except gc_mod.GCRefused as exc:
+            print(json.dumps({"status": "refused", "error_message": str(exc)}, indent=2), file=sys.stderr)
+            sys.exit(1)
+        print(json.dumps(summary, indent=2))
+        return
+    rows = gc_mod.scan(queue_dir, _load_job_types(queue_dir), now=_time.time(), compute_size=not args.no_size)
+    doc = gc_mod.write_candidates(queue_dir, rows, now=_time.time(), grace_hours=args.grace_hours, authority=args.authority)
+    if args.json:
+        print(json.dumps({k: v for k, v in doc.items() if k != "rows"} | {"candidates": [r for r in rows if r["candidate"]]}, indent=2))
+        return
+    totals = doc["totals"]
+    gib = lambda b: (b or 0) / 1073741824
+    print(f"epoch {doc['epoch']}  entries {totals['entry_count']}  total {gib(totals['total_bytes']):.1f} GiB")
+    print(f"candidates {totals['candidate_count']} ({gib(totals['candidate_bytes']):.1f} GiB)  unclassified {totals['unclassified_count']} ({gib(totals['unclassified_bytes']):.1f} GiB)  pinned {totals['pinned_count']}  active {totals['active_count']}")
+    for r in sorted((r for r in rows if r["candidate"]), key=lambda r: -(r["size_bytes"] or 0))[:40]:
+        print(f"  {gib(r['size_bytes']):7.2f} GiB  {r['output_class']:12s} {r['age_days']:6.0f} d  {r['owner'] or 'not recorded':24s} {r['name']}")
+    print(f"apply after {_time.strftime('%Y-%m-%d %H:%M', _time.localtime(doc['apply_not_before']))} with: gpu-greenroom gc --apply --epoch {doc['epoch']} --owner <who>")
+
+
+def cmd_retain(args):
+    pins = gc_mod.RetentionPins(args.queue_dir)
+    if args.list:
+        print(json.dumps(pins.entries(), indent=2))
+        return
+    if not args.name:
+        print("retain requires a name (or --list)", file=sys.stderr)
+        sys.exit(2)
+    if args.unpin:
+        print(json.dumps({"name": args.name, "unpinned": pins.unpin(args.name)}))
+        return
+    if not args.owner or not args.reason:
+        print("retain requires --owner and --reason", file=sys.stderr)
+        sys.exit(2)
+    until = None
+    if args.until:
+        from datetime import datetime
+        until = datetime.fromisoformat(args.until).timestamp()
+    try:
+        entry = pins.pin(args.name, owner=args.owner, reason=args.reason, until=until)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(2)
+    print(json.dumps({"name": args.name, **entry}, indent=2))
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="gpu-greenroom",
@@ -643,6 +705,7 @@ def main():
     p_command.add_argument("--env", action="append", default=[], metavar="KEY=VALUE")
     p_command.add_argument("--output-dir", default="")
     p_command.add_argument("--route-identity")
+    p_command.add_argument("--output-class", choices=list(gc_mod.CLASSES), help="Retention class for the output directory (final, witness, intermediate)")
     p_command.add_argument("--timeout", type=float)
     p_command.add_argument("argv", nargs=argparse.REMAINDER)
     p_command.set_defaults(func=cmd_submit_command)
@@ -805,6 +868,28 @@ def main():
     p_bump_wait.add_argument("bump_id")
     p_bump_wait.add_argument("--timeout", type=float)
     p_bump_wait.set_defaults(func=cmd_bump_wait)
+
+    # gc / retain
+    p_gc = sub.add_parser("gc", help="Retention: dry-run lists past-TTL outputs into an epoch-bound candidate list; apply deletes exactly that list after the grace window")
+    gc_mode = p_gc.add_mutually_exclusive_group(required=True)
+    gc_mode.add_argument("--dry-run", action="store_true")
+    gc_mode.add_argument("--apply", action="store_true")
+    p_gc.add_argument("--epoch", help="Candidate-list epoch to apply")
+    p_gc.add_argument("--owner", help="Who is applying (recorded in every receipt)")
+    p_gc.add_argument("--grace-hours", type=float, default=72.0)
+    p_gc.add_argument("--authority", help="Who approved this collection (recorded in candidates and receipts)")
+    p_gc.add_argument("--no-size", action="store_true", help="Skip per-directory size computation")
+    p_gc.add_argument("--json", action="store_true")
+    p_gc.set_defaults(func=cmd_gc)
+
+    p_retain = sub.add_parser("retain", help="Pin an outputs/ entry so gc never collects it")
+    p_retain.add_argument("name", nargs="?")
+    p_retain.add_argument("--owner")
+    p_retain.add_argument("--reason")
+    p_retain.add_argument("--until", help="ISO date/time after which the pin lapses")
+    p_retain.add_argument("--list", action="store_true")
+    p_retain.add_argument("--unpin", action="store_true")
+    p_retain.set_defaults(func=cmd_retain)
 
     args = parser.parse_args()
     if not args.command:

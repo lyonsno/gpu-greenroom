@@ -12,6 +12,7 @@
     ],
     "cwd": "/path/to/trellis2mlx",
     "env": {"PYTHONPATH": "."},
+    "output_class": "final",
     "defaults": {
       "seed": "42",
       "resolution": "512",

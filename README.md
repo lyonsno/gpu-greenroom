@@ -210,6 +210,18 @@ it. Nothing schedules on it, and nothing can be made to.
 four `*_quiescence_unresolved` phases for the cases where the process group
 could not be confirmed dead. "It failed" is never the whole receipt.
 
+**Retention is declared, two-phase, and receipted.** Every output has a
+class (`final`, `witness`, `intermediate`) from its job type or its
+structured command, and an owner from the job's agent id. Class sets the
+TTL (180, 60, and 30 days). `gpu-greenroom gc --dry-run` writes an
+epoch-bound candidate list; `gc --apply --epoch` deletes exactly that list
+after a grace window, re-checking every row, and writes a receipt carrying
+the job's artifact-manifest digests before the bytes go. Unclassified
+outputs are reported and never collected. Nothing infers a pin;
+`gpu-greenroom retain` declares one. This exists because one machine's
+queue reached 314 GiB, 93 percent of it older than 30 days, before anyone
+had to decide.
+
 **Substitution is single-pass and injection-safe.** Templates are lists,
 not shell strings. A param value containing `{input_path}` stays literal.
 Params the template did not consume are reported, not dropped.
