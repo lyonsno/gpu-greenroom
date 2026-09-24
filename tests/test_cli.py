@@ -114,6 +114,36 @@ def test_operator_help_exposes_persistent_local_console_mode():
     assert "--identity-label" in out
 
 
+def test_smoke_request_cli_submits_and_returns_operator_response(tmp_path, queue_dir):
+    request_path = tmp_path / "smoke-request.json"
+    request = {
+        "schema": "gpu-greenroom.interactive-smoke.v1",
+        "id": "9c0a03f6-b2d8-43f4-b7b7-5e848e733661",
+        "kind": "interactive-smoke",
+        "source": {"agent_id": "greenroom-floor-manager", "repo_root": str(tmp_path)},
+        "title": "Inspect Greenroom",
+        "prompt": "Open the page and report whether the controls are legible.",
+        "url": "http://127.0.0.1:8766/",
+        "availability": "prepared",
+        "availability_note": "The monitor is already running.",
+    }
+    request_path.write_text(json.dumps(request), encoding="utf-8")
+
+    rc, out, err = run_cli("smoke-request", "submit", str(request_path), queue_dir=queue_dir)
+    assert rc == 0, err
+    submitted = json.loads(out)
+    assert submitted["created"] is True
+    assert submitted["record"]["status"] == "operator-needed"
+
+    from gpu_queue.smoke_requests import SmokeRequests
+    SmokeRequests(queue_dir / "smoke-requests").respond(request["id"], "Keep the view; widen timing on mobile.")
+    rc, out, err = run_cli("smoke-request", "get", request["id"], queue_dir=queue_dir)
+    assert rc == 0, err
+    returned = json.loads(out)
+    assert returned["status"] == "responded"
+    assert returned["response"]["text"] == "Keep the view; widen timing on mobile."
+
+
 class TestCLIPauseResume:
     def test_pause_cli(self, queue_dir):
         rc, out, _ = run_cli("pause", queue_dir=queue_dir)

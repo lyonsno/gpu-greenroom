@@ -16,6 +16,7 @@ from urllib.parse import parse_qs, urlparse
 
 from .queue import GPUQueue
 from .admission_control import transition
+from .smoke_requests import SmokeRequestConflict, SmokeRequests
 
 
 PAGE = r"""<!doctype html>
@@ -217,6 +218,34 @@ def make_handler(queue: GPUQueue | Path, token: str, *, read_only: bool = False,
                 raise ValueError("request body must be a JSON object")
             return payload
 
+        def _smoke_requests(self) -> SmokeRequests:
+            root = queue if isinstance(queue, Path) else queue.queue_dir
+            return SmokeRequests(root / "smoke-requests")
+
+        def _smoke_post(self, path: str, body: dict) -> bool:
+            if path == "/api/smoke-requests":
+                record, created = self._smoke_requests().submit(body)
+                self._json(HTTPStatus.CREATED if created else HTTPStatus.OK, record)
+                return True
+            parts = path.strip("/").split("/")
+            if len(parts) == 4 and parts[0:2] == ["api", "smoke-requests"] and parts[3] == "response":
+                record = self._smoke_requests().respond(
+                    parts[2], body.get("text"),
+                    responded_by=str(body.get("responded_by") or "operator-console"),
+                )
+                self._json(HTTPStatus.OK, record)
+                return True
+            return False
+
+        @staticmethod
+        def _is_smoke_post_path(path: str) -> bool:
+            parts = path.strip("/").split("/")
+            return path == "/api/smoke-requests" or (
+                len(parts) == 4
+                and parts[0:2] == ["api", "smoke-requests"]
+                and parts[3] == "response"
+            )
+
         def do_GET(self):
             if not self._canonical_authority():
                 self._json(HTTPStatus.MISDIRECTED_REQUEST, {"error": "invalid_host"})
@@ -258,6 +287,22 @@ def make_handler(queue: GPUQueue | Path, token: str, *, read_only: bool = False,
             if not self._authorized():
                 self._json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
                 return
+            if path == "/api/smoke-requests":
+                records, errors = self._smoke_requests().scan()
+                self._json(HTTPStatus.OK, {"schema": "gpu-greenroom.smoke-request-list.v1", "items": records, "errors": errors})
+                return
+            parts = path.strip("/").split("/")
+            if len(parts) == 3 and parts[0:2] == ["api", "smoke-requests"]:
+                try:
+                    record = self._smoke_requests().get(parts[2])
+                except FileNotFoundError:
+                    self._json(HTTPStatus.NOT_FOUND, {"error": "smoke_request_not_found"})
+                    return
+                except ValueError as exc:
+                    self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+                self._json(HTTPStatus.OK, record)
+                return
             if path == "/api/state":
                 query = parse_qs(urlparse(self.path).query)
                 view = query.get("view", ["active"])[0]
@@ -279,28 +324,42 @@ def make_handler(queue: GPUQueue | Path, token: str, *, read_only: bool = False,
                 self._json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
                 return
             path = urlparse(self.path).path
+            if read_only:
+                self._json(HTTPStatus.FORBIDDEN, {"error": "read_only_monitor"})
+                return
+            smoke_route = self._is_smoke_post_path(path)
             if admission_control:
-                if path not in {'/api/pause', '/api/resume'}:
+                if path not in {'/api/pause', '/api/resume'} and not smoke_route:
                     self._json(HTTPStatus.FORBIDDEN, {'error': 'admission_controls_only'})
                     return
                 try:
                     body = self._body()
+                    if self._smoke_post(path, body):
+                        return
                     root = queue if isinstance(queue, Path) else queue.queue_dir
                     result = transition(GPUQueue(root), action=path.removeprefix('/api/'),
                         request_id=body.get('request_id'), owner=body.get('requested_by'), epoch=body.get('epoch'))
-                except (ValueError, RuntimeError, OSError) as exc:
+                except SmokeRequestConflict as exc:
+                    self._json(HTTPStatus.CONFLICT, {'error': str(exc)})
+                    return
+                except FileNotFoundError:
+                    self._json(HTTPStatus.NOT_FOUND, {"error": "smoke_request_not_found"})
+                    return
+                except ValueError as exc:
+                    self._json(HTTPStatus.BAD_REQUEST if smoke_route else HTTPStatus.CONFLICT, {'error': str(exc)})
+                    return
+                except (RuntimeError, OSError) as exc:
                     self._json(HTTPStatus.CONFLICT, {'error': str(exc)})
                     return
                 self._json(HTTPStatus.OK, result)
-                return
-            if read_only:
-                self._json(HTTPStatus.FORBIDDEN, {"error": "read_only_monitor"})
                 return
             path = urlparse(self.path).path
             try:
                 body = self._body()
                 actor = str(body.get("requested_by") or "operator-console")
-                if path == "/api/pause":
+                if self._smoke_post(path, body):
+                    return
+                elif path == "/api/pause":
                     result = queue.pause(owner=actor, contention_class="operator-console")
                 elif path == "/api/resume":
                     result = queue.resume(owner=actor, epoch=body.get("epoch"))
@@ -319,7 +378,16 @@ def make_handler(queue: GPUQueue | Path, token: str, *, read_only: bool = False,
                 else:
                     self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
                     return
-            except (KeyError, ValueError, RuntimeError, OSError, json.JSONDecodeError) as exc:
+            except SmokeRequestConflict as exc:
+                self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
+                return
+            except FileNotFoundError:
+                self._json(HTTPStatus.NOT_FOUND, {"error": "smoke_request_not_found"})
+                return
+            except ValueError as exc:
+                self._json(HTTPStatus.BAD_REQUEST if smoke_route else HTTPStatus.CONFLICT, {"error": str(exc)})
+                return
+            except (KeyError, RuntimeError, OSError) as exc:
                 self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
                 return
             self._json(HTTPStatus.OK, result)

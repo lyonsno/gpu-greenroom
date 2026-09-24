@@ -307,6 +307,48 @@ skip to younger compatible work. Workers support every capability their
 code implements unless `GPU_GREENROOM_WORKER_CAPABILITIES` supplies a
 comma-separated deployment override.
 
+## Interactive-smoke requests
+
+Interactive smoke requests are independent of GPU job state. The requesting
+agent creates a stable UUID record with an explicit owner and monitor URL;
+Greenroom owns the request and any operator response. No owner is inferred
+from a route or working directory. The record is stored at
+`smoke-requests/<request-id>.json` beneath the effective queue directory.
+
+Create a request from a `gpu-greenroom.interactive-smoke.v1` JSON file, then
+read it later by its same ID:
+
+```bash
+gpu-greenroom smoke-request submit /path/to/smoke-request.json
+gpu-greenroom smoke-request get 9c0a03f6-b2d8-43f4-b7b7-5e848e733661
+gpu-greenroom smoke-request list
+```
+
+The request file has an explicit source and availability declaration:
+
+```json
+{
+  "schema": "gpu-greenroom.interactive-smoke.v1",
+  "id": "9c0a03f6-b2d8-43f4-b7b7-5e848e733661",
+  "kind": "interactive-smoke",
+  "source": {"agent_id": "example-agent", "repo_root": "/path/to/repo"},
+  "title": "Inspect the local render",
+  "prompt": "Open the URL and report the visible mismatch.",
+  "url": "http://127.0.0.1:8766/",
+  "availability": "prepared",
+  "availability_note": "The monitor is already running."
+}
+```
+
+The authenticated loopback operator API lists requests at
+`GET /api/smoke-requests`, returns one at `GET /api/smoke-requests/<id>`,
+and records a non-empty operator response at
+`POST /api/smoke-requests/<id>/response` with `{"text":"..."}`. The
+request moves from `operator-needed` to `responded`; a repeated identical
+response is idempotent, while a conflicting second response is rejected.
+These narrow endpoints are available in admission-control mode and do not
+admit or execute GPU jobs. A read-only console still rejects writes.
+
 ## Registered queues and execution-start pause
 
 The queue registry stores only one-time adapter identity: name, queue
