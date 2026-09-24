@@ -294,3 +294,221 @@ class TestCLI:
         assert json.loads(out)["candidates"] == []
         rc, out, err = run_cli("retain", "old-trace", "--owner", "x", queue_dir=queue_dir)
         assert rc == 2
+
+
+def add_job(queue_dir: Path, out: Path, *, job_type: str, agent: str | None, finished_at: float, status: str = "done",
+            input_path: str = "/in.png", argv: list[str] | None = None) -> str:
+    """Append a job record that wrote (or reads) the given entry."""
+    job_id = uuid.uuid4().hex[:12]
+    jd = queue_dir / status / job_id
+    jd.mkdir(parents=True)
+    request = {"job_type": job_type, "input_path": input_path, "output_dir": str(out), "params": {}, "agent_id": agent,
+               "job_id": job_id, "submitted_at": finished_at - 60}
+    if argv is not None:
+        request["command_argv"] = argv
+    (jd / "request.json").write_text(json.dumps(request))
+    (jd / "status.json").write_text(json.dumps({"job_id": job_id, "status": status, "job_type": job_type, "input_path": input_path,
+                                                 "output_dir": str(out), "submitted_at": finished_at - 60, "started_at": finished_at - 30,
+                                                 "finished_at": finished_at if status in ("done", "failed") else None}))
+    return job_id
+
+
+def candidates(queue_dir, now=NOW, grace_hours=72.0):
+    rows = gc_mod.scan(queue_dir, load_job_types(queue_dir), now=now)
+    return gc_mod.write_candidates(queue_dir, rows, now=now, grace_hours=grace_hours)
+
+
+class TestRevisionOne:
+    def test_entry_with_a_newer_job_during_grace_is_held(self, queue_dir):
+        out = make_output(queue_dir, "old-trace", job_type="trace", agent="lane-a", finished_days_ago=45)
+        cand = candidates(queue_dir)
+        add_job(queue_dir, out, job_type="trace", agent="lane-a", finished_at=NOW + 1 * DAY)
+
+        summary = gc_mod.apply(queue_dir, epoch=cand["epoch"], owner="ops", now=NOW + 4 * DAY)
+
+        assert out.exists()
+        assert summary["deleted"] == 0
+        assert summary["holds"] == [{"name": "old-trace", "reason": "changed_since_dry_run"}]
+
+    def test_entry_modified_on_disk_during_grace_is_held(self, queue_dir):
+        import os
+        out = make_output(queue_dir, "old-trace", job_type="trace", agent="lane-a", finished_days_ago=45)
+        os.utime(out, (NOW - 45 * DAY, NOW - 45 * DAY))
+        cand = candidates(queue_dir)
+        (out / "fresh.bin").write_bytes(b"y")
+        os.utime(out, (NOW + DAY, NOW + DAY))
+
+        summary = gc_mod.apply(queue_dir, epoch=cand["epoch"], owner="ops", now=NOW + 4 * DAY)
+
+        assert out.exists()
+        assert summary["holds"][0]["reason"] == "changed_since_dry_run"
+
+    def test_epoch_can_only_be_applied_once(self, queue_dir):
+        import os
+        out = make_output(queue_dir, "old-trace", job_type="trace", agent="lane-a", finished_days_ago=45)
+        os.utime(out, (NOW - 45 * DAY, NOW - 45 * DAY))
+        cand = candidates(queue_dir)
+        first = gc_mod.apply(queue_dir, epoch=cand["epoch"], owner="ops", now=NOW + 4 * DAY)
+        assert first["deleted"] == 1
+        out.mkdir()
+        (out / "recreated").write_text("x")
+        os.utime(out, (NOW - 45 * DAY, NOW - 45 * DAY))
+
+        with pytest.raises(gc_mod.GCRefused, match="already applied"):
+            gc_mod.apply(queue_dir, epoch=cand["epoch"], owner="ops", now=NOW + 200 * DAY)
+        assert out.exists()
+        summary = json.loads((queue_dir / "gc-receipts" / cand["epoch"] / "_summary.json").read_text())
+        assert summary["deleted"] == 1
+
+    def test_pending_job_reading_entry_as_input_or_argv_protects_it(self, queue_dir):
+        out = make_output(queue_dir, "old-trace", job_type="trace", agent="lane-a", finished_days_ago=45)
+        other = make_output(queue_dir, "other-trace", job_type="trace", agent="lane-a", finished_days_ago=45)
+        add_job(queue_dir, queue_dir / "outputs" / "elsewhere", job_type="trace", agent="lane-b", finished_at=NOW, status="pending",
+                input_path=str(out / "blob.bin"))
+        add_job(queue_dir, queue_dir / "outputs" / "elsewhere2", job_type="command", agent="lane-b", finished_at=NOW, status="running",
+                argv=["python", "decode.py", "--from", str(other / "blob.bin")])
+
+        rows = {r["name"]: r for r in gc_mod.scan(queue_dir, load_job_types(queue_dir), now=NOW)}
+
+        assert rows["old-trace"]["active"] is True and not rows["old-trace"]["candidate"]
+        assert rows["other-trace"]["active"] is True and not rows["other-trace"]["candidate"]
+
+    def test_corrupt_pins_fail_closed(self, queue_dir):
+        out = make_output(queue_dir, "old-trace", job_type="trace", agent="lane-a", finished_days_ago=45)
+        pins_path = queue_dir / "retention" / "pins.json"
+        pins_path.parent.mkdir()
+        pins_path.write_text("{broken")
+
+        rows = {r["name"]: r for r in gc_mod.scan(queue_dir, load_job_types(queue_dir), now=NOW)}
+        assert rows["old-trace"]["reason"] == "pins_unreadable" and not rows["old-trace"]["candidate"]
+        with pytest.raises(gc_mod.PinsUnreadable):
+            gc_mod.RetentionPins(queue_dir).pin("x", owner="a", reason="b")
+        assert pins_path.read_text() == "{broken"
+        doc = gc_mod.write_candidates(queue_dir, list(rows.values()), now=NOW)
+        with pytest.raises(gc_mod.GCRefused, match="pins"):
+            gc_mod.apply(queue_dir, epoch=doc["epoch"], owner="ops", now=NOW + 4 * DAY)
+        assert out.exists()
+
+    def test_grace_below_floor_is_refused(self, queue_dir):
+        make_output(queue_dir, "old-trace", job_type="trace", agent="lane-a", finished_days_ago=45)
+        rows = gc_mod.scan(queue_dir, load_job_types(queue_dir), now=NOW)
+        with pytest.raises(ValueError, match="grace"):
+            gc_mod.write_candidates(queue_dir, rows, now=NOW, grace_hours=1.0)
+        assert not (queue_dir / "gc-candidates.json").exists()
+
+    def test_mixed_classified_and_unclassified_jobs_make_entry_unclassified(self, queue_dir):
+        out = make_output(queue_dir, "shared", job_type="trace", agent="lane-a", finished_days_ago=45)
+        add_job(queue_dir, out, job_type="legacy", agent="lane-a", finished_at=NOW - 45 * DAY)
+
+        row = {r["name"]: r for r in gc_mod.scan(queue_dir, load_job_types(queue_dir), now=NOW)}["shared"]
+
+        assert row["output_class"] == "unclassified" and row["class_source"] == "mixed"
+        assert not row["candidate"]
+
+    def test_unclassified_graduates_to_intermediate_after_one_reported_cycle(self, queue_dir):
+        make_output(queue_dir, "old-legacy", job_type="legacy", agent="lane-z", finished_days_ago=400)
+        first = {r["name"]: r for r in gc_mod.scan(queue_dir, load_job_types(queue_dir), now=NOW)}
+        assert first["old-legacy"]["reason"] == "unclassified"
+        candidates(queue_dir, now=NOW)  # the reported cycle
+
+        soon = {r["name"]: r for r in gc_mod.scan(queue_dir, load_job_types(queue_dir), now=NOW + 3600)}
+        assert soon["old-legacy"]["reason"] == "unclassified"  # history younger than the grace window
+
+        later = {r["name"]: r for r in gc_mod.scan(queue_dir, load_job_types(queue_dir), now=NOW + 4 * DAY)}
+        row = later["old-legacy"]
+        assert row["output_class"] == "intermediate" and row["class_source"] == "graduated"
+        assert row["candidate"] and row["reason"] == "graduated"
+
+    def test_dry_run_writes_one_notice_per_owner(self, queue_dir):
+        make_output(queue_dir, "a1", job_type="trace", agent="lane-a", finished_days_ago=45)
+        make_output(queue_dir, "a2", job_type="trace", agent="lane-a", finished_days_ago=45)
+        make_output(queue_dir, "b1", job_type="trace", agent="lane-b", finished_days_ago=45)
+        make_output(queue_dir, "n1", job_type="trace", agent=None, finished_days_ago=45)
+
+        cand = candidates(queue_dir)
+
+        notices = queue_dir / "gc-notices" / cand["epoch"]
+        assert sorted(p.name for p in notices.iterdir()) == ["lane-a.json", "lane-b.json", "not-recorded.json"]
+        a = json.loads((notices / "lane-a.json").read_text())
+        assert sorted(r["name"] for r in a["candidates"]) == ["a1", "a2"]
+        assert a["apply_not_before"] == cand["apply_not_before"] and a["epoch"] == cand["epoch"]
+
+    def test_receipt_records_reason_and_snapshot(self, queue_dir):
+        import os
+        out = make_output(queue_dir, "old-trace", job_type="trace", agent="lane-a", finished_days_ago=45)
+        os.utime(out, (NOW - 45 * DAY, NOW - 45 * DAY))
+        cand = candidates(queue_dir)
+        gc_mod.apply(queue_dir, epoch=cand["epoch"], owner="ops", now=NOW + 4 * DAY)
+        receipt = json.loads((queue_dir / "gc-receipts" / cand["epoch"] / "old-trace.json").read_text())
+        assert receipt["reason"] == "past_ttl"
+        assert receipt["snapshot"]["job_ids"]
+
+    def test_delete_failure_writes_partial_receipt_and_summary(self, queue_dir, monkeypatch):
+        import os
+        x = make_output(queue_dir, "x-trace", job_type="trace", agent="lane-a", finished_days_ago=45)
+        y = make_output(queue_dir, "y-trace", job_type="trace", agent="lane-a", finished_days_ago=45)
+        for d in (x, y):
+            os.utime(d, (NOW - 45 * DAY, NOW - 45 * DAY))
+        cand = candidates(queue_dir)
+        real_rmtree = gc_mod.shutil.rmtree
+
+        def flaky(path, *a, **k):
+            if Path(path).name == "x-trace":
+                raise PermissionError("simulated")
+            return real_rmtree(path, *a, **k)
+        monkeypatch.setattr(gc_mod.shutil, "rmtree", flaky)
+
+        summary = gc_mod.apply(queue_dir, epoch=cand["epoch"], owner="ops", now=NOW + 4 * DAY)
+
+        assert summary["deleted"] == 1 and not y.exists() and x.exists()
+        assert {"name": "x-trace", "reason": "delete_failed"} in [{"name": h["name"], "reason": h["reason"]} for h in summary["holds"]]
+        receipt = json.loads((queue_dir / "gc-receipts" / cand["epoch"] / "x-trace.json").read_text())
+        assert receipt["partial"] is True and receipt["deleted_at"] is None
+        assert (queue_dir / "gc-receipts" / cand["epoch"] / "_summary.json").exists()
+
+    def test_relative_output_dir_records_are_ignored_not_resolved_against_cwd(self, queue_dir):
+        make_output(queue_dir, "old-trace", job_type="trace", agent="lane-a", finished_days_ago=45)
+        add_job(queue_dir, Path("outputs/old-trace"), job_type="legacy", agent="lane-q", finished_at=NOW - 1 * DAY)
+
+        row = {r["name"]: r for r in gc_mod.scan(queue_dir, load_job_types(queue_dir), now=NOW)}["old-trace"]
+
+        assert row["output_class"] == "intermediate"   # the relative record did not attach to the entry
+        assert "lane-q" not in (row["owner"] or "")
+
+    def test_malformed_candidates_file_is_refused(self, queue_dir):
+        make_output(queue_dir, "old-trace", job_type="trace", agent="lane-a", finished_days_ago=45)
+        cand = candidates(queue_dir)
+        path = queue_dir / "gc-candidates.json"
+        doc = json.loads(path.read_text())
+        doc["apply_not_before"] = "soon"
+        path.write_text(json.dumps(doc))
+        with pytest.raises(gc_mod.GCRefused, match="malformed"):
+            gc_mod.apply(queue_dir, epoch=cand["epoch"], owner="ops", now=NOW + 4 * DAY)
+
+
+class TestCLIRevisionOne:
+    def test_retain_rejects_bad_until_without_traceback(self, queue_dir):
+        rc, out, err = run_cli("retain", "x", "--owner", "a", "--reason", "b", "--until", "not-a-date", queue_dir=queue_dir)
+        assert rc == 2 and "until" in err and "Traceback" not in err
+
+    def test_dry_run_json_survives_malformed_job_types(self, queue_dir):
+        (queue_dir / "job_types.json").write_text("{broken")
+        rc, out, err = run_cli("gc", "--dry-run", "--json", queue_dir=queue_dir)
+        assert rc == 0
+        json.loads(out)  # stdout must be pure JSON
+        assert "job_types" in err
+
+    def test_apply_already_applied_epoch_exits_one(self, queue_dir):
+        import os
+        out = make_output(queue_dir, "old-trace", job_type="trace", agent="lane-a", finished_days_ago=45, now=time.time())
+        os.utime(out, (time.time() - 45 * DAY, time.time() - 45 * DAY))
+        rc, o, e = run_cli("gc", "--dry-run", "--json", "--grace-hours", "24", queue_dir=queue_dir)
+        epoch = json.loads(o)["epoch"]
+        path = queue_dir / "gc-candidates.json"
+        doc = json.loads(path.read_text())
+        doc["apply_not_before"] = time.time() - 1
+        path.write_text(json.dumps(doc))
+        rc, o, e = run_cli("gc", "--apply", "--epoch", epoch, "--owner", "ops", queue_dir=queue_dir)
+        assert rc == 0, e
+        rc, o, e = run_cli("gc", "--apply", "--epoch", epoch, "--owner", "ops", queue_dir=queue_dir)
+        assert rc == 1 and "already applied" in e

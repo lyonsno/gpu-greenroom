@@ -342,31 +342,58 @@ completion is never replayed as successful.
 
 `gc` manages only direct children of the queue's own `outputs/`. Caller-owned
 output directories elsewhere are recorded in receipts and never touched.
+Records whose `output_dir` is relative are ignored rather than resolved
+against the working directory.
 
-Each entry gets a class from the longest-TTL class any of its jobs declared
-(`output_class` on the job type, or `output_class` in a structured command
-manifest or `--output-class`), an owner from the job's `agent_id`, and an
-age from the newest job's `finished_at` (directory mtime when no job record
-exists). TTL by class: `intermediate` 30 days, `witness` 60 days, `final`
-180 days. An entry is a candidate when it is past its TTL, not pinned, and
-not referenced by a pending or running job. `unclassified` entries are
-listed with their size and never collected.
+**Class and owner.** An entry's class is the longest-TTL class among the
+jobs that wrote into it (`output_class` on the job type, or `output_class`
+in a structured command manifest or `--output-class`). If any job that wrote
+into it carries no class, the entry is `unclassified` (`class_source`
+`mixed` when others were classified). Owner is the job's `agent_id`. Age is
+the newest job's `finished_at`; when no job record carries a numeric
+`finished_at`, the top-level directory's mtime is used instead.
 
-`gc --dry-run` writes `gc-candidates.json` with an `epoch`, totals, every
-row, and `apply_not_before` (now plus the grace window, 72 hours by default).
+**TTL.** `intermediate` 30 days, `witness` 60 days, `final` 180 days. An
+entry is a candidate when it is past its TTL, not pinned, and not referenced
+by a pending or running job as `output_dir`, `input_path`, or a path inside
+its `command_argv`.
+
+**Graduation.** `unclassified` entries are listed with their size and not
+collected in the cycle that first reports them. Every dry-run is copied to
+`gc-history/<epoch>.json`; once a history entry older than the grace window
+lists a name as unclassified, later scans classify it `intermediate` with
+`class_source` `graduated` and `reason` `graduated` when past the TTL.
+
+**Pins.** `retain <name> --owner --reason [--until]` writes
+`retention/pins.json` under a file lock; a pinned entry is never a candidate
+until its `until` passes or it is unpinned. Pins are the only retention
+authority. An unreadable or unknown-schema pins file fails closed: every
+row reports `pins_unreadable`, nothing is a candidate, `retain` refuses to
+overwrite it, and `apply` refuses.
+
+**Two phases.** `gc --dry-run` writes `gc-candidates.json` with an `epoch`,
+`status` `open`, totals, every row with a `snapshot` (newest job finish,
+directory mtime, job ids), and `apply_not_before` (now plus the grace
+window; 72 hours by default, never under 24). It also writes one notice per
+owner under `gc-notices/<epoch>/` naming that owner's candidates, the
+deadline, and how to pin. It warns, without acting, when `outputs/` exceeds
+`--warn-over-gib` (150) or free space is under `--free-floor-gib` (100).
+
 `gc --apply --epoch <epoch> --owner <who>` refuses when the epoch does not
-match the current candidate list, when the grace window has not elapsed, or
-when any listed path resolves outside `outputs/`; otherwise it re-checks
-each row for pins and active jobs, writes
-`gc-receipts/<epoch>/<name>.json` (class, owner, size, age, job ids, and any
-`artifact_manifest` and `input_artifact` digests from those jobs' receipts),
-removes the directory, then stamps `deleted_at` on the receipt. A summary
-lands at `gc-receipts/<epoch>/_summary.json`.
-
-`retain <name> --owner --reason [--until]` writes `retention/pins.json`; a
-pinned entry is never a candidate until its `until` passes or it is
-unpinned. Pins are the only retention authority; citation counts in reports
-are diagnostics.
+match the current list, when that epoch was already applied, when the grace
+window has not elapsed, when the list is malformed, when pins are
+unreadable, or when any listed path resolves outside `outputs/`. Otherwise
+it walks the list and holds any row whose entry is missing, whose job set or
+newest finish changed, whose directory mtime is newer than the list, that
+was pinned since, or that a pending or running job now references. For the
+rest it writes `gc-receipts/<epoch>/<name>.json` (class, source, reason,
+owner, size, age, job ids, snapshot, and any `artifact_manifest` and
+`input_artifact` digests from those jobs' receipts), removes the directory,
+then stamps `deleted_at`. A removal that fails partway leaves the receipt
+marked `partial` with the error and is recorded as a `delete_failed` hold.
+The run always writes `gc-receipts/<epoch>/_summary.json`, marks the
+candidate list `applied`, and updates the history copy, so the same epoch
+cannot be applied twice.
 
 ## Reviewing a new job type
 

@@ -214,13 +214,16 @@ could not be confirmed dead. "It failed" is never the whole receipt.
 class (`final`, `witness`, `intermediate`) from its job type or its
 structured command, and an owner from the job's agent id. Class sets the
 TTL (180, 60, and 30 days). `gpu-greenroom gc --dry-run` writes an
-epoch-bound candidate list; `gc --apply --epoch` deletes exactly that list
-after a grace window, re-checking every row, and writes a receipt carrying
-the job's artifact-manifest digests before the bytes go. Unclassified
-outputs are reported and never collected. Nothing infers a pin;
-`gpu-greenroom retain` declares one. This exists because one machine's
-queue reached 314 GiB, 93 percent of it older than 30 days, before anyone
-had to decide.
+epoch-bound candidate list with a snapshot of each entry and one notice
+per owner; `gc --apply --epoch` deletes exactly that list, once, after a
+grace window of at least a day, holding any entry that changed, was pinned,
+or is referenced by a queued job as output, input, or argument, and writes
+a receipt carrying the job's artifact-manifest digests before the bytes
+go. Unclassified outputs are reported for one cycle, then treated as
+intermediate. Nothing infers a pin; `gpu-greenroom retain` declares one,
+and an unreadable pin file stops collection entirely. This exists because
+one machine's queue reached 314 GiB, 93 percent of it older than 30 days,
+before anyone had to decide.
 
 **Substitution is single-pass and injection-safe.** Templates are lists,
 not shell strings. A param value containing `{input_path}` stays literal.

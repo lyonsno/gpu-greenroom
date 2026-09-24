@@ -298,7 +298,7 @@ def _load_job_types(queue_dir):
             custom = json.loads(config_path.read_text())
             job_types.update(custom)
         except (json.JSONDecodeError, OSError) as e:
-            print(f"Warning: could not load {config_path}: {e}")
+            print(f"Warning: could not load job_types.json at {config_path}: {e}", file=sys.stderr)
     return job_types
 
 
@@ -620,16 +620,32 @@ def cmd_gc(args):
         print(json.dumps(summary, indent=2))
         return
     rows = gc_mod.scan(queue_dir, _load_job_types(queue_dir), now=_time.time(), compute_size=not args.no_size)
-    doc = gc_mod.write_candidates(queue_dir, rows, now=_time.time(), grace_hours=args.grace_hours, authority=args.authority)
+    try:
+        doc = gc_mod.write_candidates(queue_dir, rows, now=_time.time(), grace_hours=args.grace_hours, authority=args.authority)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(2)
+    gib = lambda b: (b or 0) / 1073741824
+    warnings = []
+    if not args.no_size and gib(doc["totals"]["total_bytes"]) > args.warn_over_gib:
+        warnings.append(f"outputs/ holds {gib(doc['totals']['total_bytes']):.1f} GiB, over the {args.warn_over_gib:g} GiB threshold")
+    try:
+        free_gib = shutil.disk_usage(queue_dir).free / 1073741824
+        if free_gib < args.free_floor_gib:
+            warnings.append(f"free space {free_gib:.1f} GiB is below the {args.free_floor_gib:g} GiB floor")
+    except OSError:
+        pass
     if args.json:
-        print(json.dumps({k: v for k, v in doc.items() if k != "rows"} | {"candidates": [r for r in rows if r["candidate"]]}, indent=2))
+        print(json.dumps({k: v for k, v in doc.items() if k != "rows"} | {"candidates": [r for r in rows if r["candidate"]], "warnings": warnings}, indent=2))
         return
     totals = doc["totals"]
-    gib = lambda b: (b or 0) / 1073741824
     print(f"epoch {doc['epoch']}  entries {totals['entry_count']}  total {gib(totals['total_bytes']):.1f} GiB")
-    print(f"candidates {totals['candidate_count']} ({gib(totals['candidate_bytes']):.1f} GiB)  unclassified {totals['unclassified_count']} ({gib(totals['unclassified_bytes']):.1f} GiB)  pinned {totals['pinned_count']}  active {totals['active_count']}")
+    print(f"candidates {totals['candidate_count']} ({gib(totals['candidate_bytes']):.1f} GiB, of which graduated {totals['graduated_count']} / {gib(totals['graduated_bytes']):.1f} GiB)  unclassified {totals['unclassified_count']} ({gib(totals['unclassified_bytes']):.1f} GiB)  pinned {totals['pinned_count']}  active {totals['active_count']}")
     for r in sorted((r for r in rows if r["candidate"]), key=lambda r: -(r["size_bytes"] or 0))[:40]:
         print(f"  {gib(r['size_bytes']):7.2f} GiB  {r['output_class']:12s} {r['age_days']:6.0f} d  {r['owner'] or 'not recorded':24s} {r['name']}")
+    for w in warnings:
+        print(f"warning: {w}")
+    print(f"notices per owner: {Path(queue_dir) / 'gc-notices' / doc['epoch']}")
     print(f"apply after {_time.strftime('%Y-%m-%d %H:%M', _time.localtime(doc['apply_not_before']))} with: gpu-greenroom gc --apply --epoch {doc['epoch']} --owner <who>")
 
 
@@ -650,10 +666,14 @@ def cmd_retain(args):
     until = None
     if args.until:
         from datetime import datetime
-        until = datetime.fromisoformat(args.until).timestamp()
+        try:
+            until = datetime.fromisoformat(args.until).timestamp()
+        except ValueError:
+            print(f"retain --until must be an ISO date or datetime, got {args.until!r}", file=sys.stderr)
+            sys.exit(2)
     try:
         entry = pins.pin(args.name, owner=args.owner, reason=args.reason, until=until)
-    except ValueError as exc:
+    except (ValueError, gc_mod.PinsUnreadable) as exc:
         print(str(exc), file=sys.stderr)
         sys.exit(2)
     print(json.dumps({"name": args.name, **entry}, indent=2))
@@ -879,6 +899,8 @@ def main():
     p_gc.add_argument("--grace-hours", type=float, default=72.0)
     p_gc.add_argument("--authority", help="Who approved this collection (recorded in candidates and receipts)")
     p_gc.add_argument("--no-size", action="store_true", help="Skip per-directory size computation")
+    p_gc.add_argument("--warn-over-gib", type=float, default=150.0, help="Warn when outputs/ exceeds this size (diagnostic only)")
+    p_gc.add_argument("--free-floor-gib", type=float, default=100.0, help="Warn when free space is below this (diagnostic only)")
     p_gc.add_argument("--json", action="store_true")
     p_gc.set_defaults(func=cmd_gc)
 
