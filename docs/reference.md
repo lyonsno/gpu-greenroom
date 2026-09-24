@@ -355,26 +355,32 @@ the newest job's `finished_at`; when no job record carries a numeric
 
 **TTL.** `intermediate` 30 days, `witness` 60 days, `final` 180 days. An
 entry is a candidate when it is past its TTL, not pinned, and not referenced
-by a pending or running job as `output_dir`, `input_path`, or a path inside
-its `command_argv`.
+by any string in a pending or running job's records: `output_dir`,
+`input_path`, `command_cwd`, `params` values, and `command_argv`, with
+symlinked paths resolved to where they really point.
 
 **Graduation.** `unclassified` entries are listed with their size and not
 collected in the cycle that first reports them. Every dry-run is copied to
-`gc-history/<epoch>.json`; once a history entry older than the grace window
-lists a name as unclassified, later scans classify it `intermediate` with
-`class_source` `graduated` and `reason` `graduated` when past the TTL.
+`gc-history/<epoch>.json`; once a cycle whose own `apply_not_before` has
+passed lists a name as unclassified, later scans classify it `intermediate`
+with `class_source` `graduated` and `reason` `graduated` when past the TTL.
+An entry where some job declared a class and another did not
+(`class_source` `mixed`) never graduates; it stays unclassified until the
+declaration is resolved.
 
 **Pins.** `retain <name> --owner --reason [--until]` writes
 `retention/pins.json` under a file lock; a pinned entry is never a candidate
 until its `until` passes or it is unpinned. Pins are the only retention
-authority. An unreadable or unknown-schema pins file fails closed: every
-row reports `pins_unreadable`, nothing is a candidate, `retain` refuses to
-overwrite it, and `apply` refuses.
+authority. An unreadable or unknown-schema pins file, or a pin entry that
+is not an object, fails closed: every row reports `pins_unreadable`, nothing
+is a candidate, `retain` refuses to overwrite it, and `apply` refuses. A
+pin whose `until` cannot be read (neither a timestamp nor an ISO date) holds
+forever rather than lapsing.
 
 **Two phases.** `gc --dry-run` writes `gc-candidates.json` with an `epoch`,
 `status` `open`, totals, every row with a `snapshot` (newest job finish,
 directory mtime, job ids), and `apply_not_before` (now plus the grace
-window; 72 hours by default, never under 24). It also writes one notice per
+window; 72 hours, the approved window, and never less). It also writes one notice per
 owner under `gc-notices/<epoch>/` naming that owner's candidates, the
 deadline, and how to pin. It warns, without acting, when `outputs/` exceeds
 `--warn-over-gib` (150) or free space is under `--free-floor-gib` (100).
@@ -391,9 +397,10 @@ owner, size, age, job ids, snapshot, and any `artifact_manifest` and
 `input_artifact` digests from those jobs' receipts), removes the directory,
 then stamps `deleted_at`. A removal that fails partway leaves the receipt
 marked `partial` with the error and is recorded as a `delete_failed` hold.
-The run always writes `gc-receipts/<epoch>/_summary.json`, marks the
-candidate list `applied`, and updates the history copy, so the same epoch
-cannot be applied twice.
+The run always writes `gc-receipts/<epoch>/_summary.json` and marks the
+history copy `applied`; it marks the current candidate list `applied` only
+if it still belongs to that epoch, so a dry-run written meanwhile is not
+clobbered, and the same epoch cannot be applied twice.
 
 ## Reviewing a new job type
 

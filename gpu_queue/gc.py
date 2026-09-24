@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import math
 import os
 import shutil
 import time
@@ -43,7 +44,7 @@ PINS_SCHEMA = "gpu-greenroom.retention-pins.v1"
 CLASSES = ("final", "witness", "intermediate")  # longest TTL first: the conservative choice on conflict
 DEFAULT_TTL_DAYS = {"intermediate": 30.0, "witness": 60.0, "final": 180.0}
 DEFAULT_GRACE_HOURS = 72.0
-MIN_GRACE_HOURS = 24.0
+MIN_GRACE_HOURS = 72.0   # the approved window; there is no shorter grace
 DAY = 86400.0
 NOT_RECORDED = "not-recorded"
 
@@ -98,6 +99,9 @@ class RetentionPins:
         doc = _load_json(self.path)
         if not isinstance(doc, dict) or doc.get("schema") != PINS_SCHEMA or not isinstance(doc.get("pins"), dict):
             raise PinsUnreadable(f"retention pins file is unreadable or has an unknown schema: {self.path}")
+        for name, entry in doc["pins"].items():
+            if not isinstance(name, str) or not isinstance(entry, dict):
+                raise PinsUnreadable(f"retention pin entry for {name!r} is not an object: {self.path}")
         return doc
 
     def entries(self) -> dict:
@@ -129,11 +133,38 @@ class RetentionPins:
         return True
 
     def is_pinned(self, name: str, now: float) -> bool:
+        """A pin holds until its ``until`` passes; an ``until`` nobody can read holds forever."""
         entry = self.entries().get(name)
         if not entry:
             return False
-        until = entry.get("until")
-        return until is None or (_is_number(until) and float(until) > now)
+        until = _parse_until(entry.get("until"))
+        if until is _UNPARSEABLE:
+            return True   # fail closed: a malformed deadline never unpins
+        return until is None or until > now
+
+
+_UNPARSEABLE = object()
+
+
+def _parse_until(value):
+    """None (no deadline), a timestamp, or _UNPARSEABLE."""
+    if value is None:
+        return None
+    if _is_number(value) and math.isfinite(value):
+        return float(value)
+    if isinstance(value, str) and value.strip():
+        from datetime import datetime, timezone
+        text = value.strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return _UNPARSEABLE
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    return _UNPARSEABLE
 
 
 def _top_level_name(candidate: str | None, outputs: Path) -> str | None:
@@ -183,8 +214,40 @@ def _job_records(queue_dir: Path) -> dict[str, list[dict]]:
     return records
 
 
+def _strings_in(value):
+    """Every string anywhere inside a JSON value."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _strings_in(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _strings_in(item)
+
+
+def _names_in_string(text: str, outputs: Path, outputs_prefix: str) -> set[str]:
+    """Entry names a string refers to: as a path (symlinks resolved), an option value, or a substring."""
+    names: set[str] = set()
+    pieces = [text] + [piece for piece in text.split("=") if piece]
+    for piece in pieces:
+        name = _top_level_name(piece, outputs)
+        if name:
+            names.add(name)
+    if outputs_prefix in text:
+        tail = text.split(outputs_prefix, 1)[1]
+        name = tail.split(os.sep, 1)[0]
+        if name:
+            names.add(name)
+    return names
+
+
 def _active_refs(queue_dir: Path) -> set[str]:
-    """Top-level entries a pending or running job writes to, reads from, or names in its argv."""
+    """Top-level entries any string in a pending or running job's records refers to.
+
+    Covers output_dir, input_path, command_cwd, params values, and argv,
+    with symlinked paths resolved to their real location.
+    """
     outputs = (queue_dir / "outputs").resolve()
     outputs_prefix = str(outputs) + os.sep
     names: set[str] = set()
@@ -194,19 +257,9 @@ def _active_refs(queue_dir: Path) -> set[str]:
             continue
         for job_dir in status_dir.iterdir():
             for record_name in ("request.json", "status.json"):
-                doc = _load_json(job_dir / record_name) or {}
-                for key in ("output_dir", "input_path"):
-                    name = _top_level_name(doc.get(key), outputs)
-                    if name:
-                        names.add(name)
-                argv = doc.get("command_argv")
-                if isinstance(argv, list):
-                    for part in argv:
-                        if isinstance(part, str) and outputs_prefix in part:
-                            tail = part.split(outputs_prefix, 1)[1]
-                            name = tail.split(os.sep, 1)[0]
-                            if name:
-                                names.add(name)
+                doc = _load_json(job_dir / record_name)
+                for text in _strings_in(doc):
+                    names |= _names_in_string(text, outputs, outputs_prefix)
     return names
 
 
@@ -252,8 +305,8 @@ def _history_dir(queue_dir: Path) -> Path:
     return queue_dir / "gc-history"
 
 
-def reported_unclassified(queue_dir, *, before: float) -> set[str]:
-    """Entries a dry-run listed as unclassified in a cycle that began at or before ``before``."""
+def reported_unclassified(queue_dir, *, now: float) -> set[str]:
+    """Entries a dry-run listed as unclassified in a cycle whose own apply deadline has passed."""
     queue_dir = Path(queue_dir).resolve()
     names: set[str] = set()
     history = _history_dir(queue_dir)
@@ -263,8 +316,13 @@ def reported_unclassified(queue_dir, *, before: float) -> set[str]:
         doc = _load_json(path)
         if not isinstance(doc, dict) or doc.get("schema") != CANDIDATES_SCHEMA:
             continue
-        created = doc.get("created_at")
-        if not _is_number(created) or created > before:
+        deadline = doc.get("apply_not_before")
+        if not _is_number(deadline):
+            created, grace = doc.get("created_at"), doc.get("grace_hours")
+            if not (_is_number(created) and _is_number(grace)):
+                continue
+            deadline = created + grace * 3600.0
+        if deadline > now:
             continue
         for row in doc.get("rows", []):
             if row.get("reason") == "unclassified" and row.get("name"):
@@ -272,15 +330,14 @@ def reported_unclassified(queue_dir, *, before: float) -> set[str]:
     return names
 
 
-def scan(queue_dir, job_types: dict, *, now: float, ttl_days: dict | None = None, compute_size: bool = True,
-         graduation_after_hours: float = DEFAULT_GRACE_HOURS) -> list[dict]:
+def scan(queue_dir, job_types: dict, *, now: float, ttl_days: dict | None = None, compute_size: bool = True) -> list[dict]:
     """One row per top-level directory in outputs/, with class, owner, age, snapshot, and candidacy."""
     queue_dir = Path(queue_dir).resolve()
     outputs = queue_dir / "outputs"
     ttl = {**DEFAULT_TTL_DAYS, **(ttl_days or {})}
     records = _job_records(queue_dir)
     active = _active_refs(queue_dir)
-    graduated = reported_unclassified(queue_dir, before=now - graduation_after_hours * 3600.0)
+    graduated = reported_unclassified(queue_dir, now=now)
     pins = RetentionPins(queue_dir)
     try:
         pins.load()
@@ -295,8 +352,8 @@ def scan(queue_dir, job_types: dict, *, now: float, ttl_days: dict | None = None
             continue
         recs = records.get(entry.name, [])
         output_class, class_source = resolve_class(recs, job_types)
-        if output_class == "unclassified" and entry.name in graduated:
-            output_class, class_source = "intermediate", "graduated"
+        if output_class == "unclassified" and class_source is None and entry.name in graduated:
+            output_class, class_source = "intermediate", "graduated"   # never for mixed entries: a declared class must be seen
         finished = [r["finished_at"] for r in recs if _is_number(r.get("finished_at"))]
         newest_finished = max(finished) if finished else None
         dir_mtime = entry.stat().st_mtime
@@ -348,8 +405,8 @@ def scan(queue_dir, job_types: dict, *, now: float, ttl_days: dict | None = None
 def write_candidates(queue_dir, rows: list[dict], *, now: float, grace_hours: float = DEFAULT_GRACE_HOURS,
                      authority: str | None = None) -> dict:
     """Write the epoch-bound candidate list, its history copy, and one notice per owner."""
-    if not _is_number(grace_hours) or grace_hours < MIN_GRACE_HOURS:
-        raise ValueError(f"grace window must be at least {MIN_GRACE_HOURS:g} hours (policy default {DEFAULT_GRACE_HOURS:g})")
+    if not _is_number(grace_hours) or not math.isfinite(grace_hours) or grace_hours < MIN_GRACE_HOURS:
+        raise ValueError(f"grace window must be a finite number of hours, at least {MIN_GRACE_HOURS:g} (the approved window)")
     queue_dir = Path(queue_dir).resolve()
     epoch = uuid.uuid4().hex[:12]
 
@@ -527,6 +584,8 @@ def apply(queue_dir, *, epoch: str, owner: str, now: float) -> dict:
         doc["status"] = "applied"
         doc["applied_at"] = summary["applied_at"]
         doc["applied_by"] = owner
-        _write_json_atomic(candidates_path, doc)
         _write_json_atomic(_history_dir(queue_dir) / f"{epoch}.json", doc)
+        current = _load_json(candidates_path) if candidates_path.exists() else None
+        if isinstance(current, dict) and current.get("epoch") == epoch:
+            _write_json_atomic(candidates_path, doc)   # a newer dry-run written meanwhile is left alone
     return summary

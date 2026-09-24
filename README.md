@@ -216,8 +216,8 @@ structured command, and an owner from the job's agent id. Class sets the
 TTL (180, 60, and 30 days). `gpu-greenroom gc --dry-run` writes an
 epoch-bound candidate list with a snapshot of each entry and one notice
 per owner; `gc --apply --epoch` deletes exactly that list, once, after a
-grace window of at least a day, holding any entry that changed, was pinned,
-or is referenced by a queued job as output, input, or argument, and writes
+72-hour grace window, holding any entry that changed, was pinned, or is
+referenced anywhere in a queued job's records, and writes
 a receipt carrying the job's artifact-manifest digests before the bytes
 go. Unclassified outputs are reported for one cycle, then treated as
 intermediate. Nothing infers a pin; `gpu-greenroom retain` declares one,

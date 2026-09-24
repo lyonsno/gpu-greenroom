@@ -502,7 +502,7 @@ class TestCLIRevisionOne:
         import os
         out = make_output(queue_dir, "old-trace", job_type="trace", agent="lane-a", finished_days_ago=45, now=time.time())
         os.utime(out, (time.time() - 45 * DAY, time.time() - 45 * DAY))
-        rc, o, e = run_cli("gc", "--dry-run", "--json", "--grace-hours", "24", queue_dir=queue_dir)
+        rc, o, e = run_cli("gc", "--dry-run", "--json", queue_dir=queue_dir)
         epoch = json.loads(o)["epoch"]
         path = queue_dir / "gc-candidates.json"
         doc = json.loads(path.read_text())
@@ -512,3 +512,102 @@ class TestCLIRevisionOne:
         assert rc == 0, e
         rc, o, e = run_cli("gc", "--apply", "--epoch", epoch, "--owner", "ops", queue_dir=queue_dir)
         assert rc == 1 and "already applied" in e
+
+
+class TestRevisionTwo:
+    def test_params_cwd_and_symlinked_argv_references_protect_entries(self, queue_dir, tmp_path):
+        p_entry = make_output(queue_dir, "p-trace", job_type="trace", agent="lane-a", finished_days_ago=45)
+        c_entry = make_output(queue_dir, "c-trace", job_type="trace", agent="lane-a", finished_days_ago=45)
+        s_entry = make_output(queue_dir, "s-trace", job_type="trace", agent="lane-a", finished_days_ago=45)
+        link = tmp_path / "link-to-outputs"
+        link.symlink_to(queue_dir / "outputs")
+        pj = queue_dir / "pending" / "p-params"
+        pj.mkdir()
+        (pj / "request.json").write_text(json.dumps({"job_type": "trace", "input_path": "/in.png", "output_dir": str(queue_dir / "outputs" / "new1"),
+                                                     "params": {"source_plate": str(p_entry / "blob.bin")}}))
+        cj = queue_dir / "pending" / "p-cwd"
+        cj.mkdir()
+        (cj / "request.json").write_text(json.dumps({"job_type": "command", "input_path": "", "output_dir": str(queue_dir / "outputs" / "new2"),
+                                                     "params": {}, "command_cwd": str(c_entry), "command_argv": ["true"]}))
+        sj = queue_dir / "pending" / "p-symlink"
+        sj.mkdir()
+        (sj / "request.json").write_text(json.dumps({"job_type": "command", "input_path": "", "output_dir": str(queue_dir / "outputs" / "new3"),
+                                                     "params": {}, "command_argv": ["python", "x.py", str(link / "s-trace" / "blob.bin")]}))
+
+        rows = {r["name"]: r for r in gc_mod.scan(queue_dir, load_job_types(queue_dir), now=NOW)}
+
+        assert rows["p-trace"]["active"] and rows["c-trace"]["active"] and rows["s-trace"]["active"]
+
+    def test_malformed_pin_entries_fail_closed(self, queue_dir):
+        out = make_output(queue_dir, "old-trace", job_type="trace", agent="lane-a", finished_days_ago=45)
+        pins_path = queue_dir / "retention" / "pins.json"
+        pins_path.parent.mkdir()
+        pins_path.write_text(json.dumps({"schema": gc_mod.PINS_SCHEMA, "pins": {"old-trace": {"owner": "a", "reason": "b", "until": "next-year"}}}))
+        row = {r["name"]: r for r in gc_mod.scan(queue_dir, load_job_types(queue_dir), now=NOW)}["old-trace"]
+        assert row["pinned"] is True and not row["candidate"]   # unparseable until means pinned, not unpinned
+
+        pins_path.write_text(json.dumps({"schema": gc_mod.PINS_SCHEMA, "pins": {"old-trace": "yes"}}))
+        row = {r["name"]: r for r in gc_mod.scan(queue_dir, load_job_types(queue_dir), now=NOW)}["old-trace"]
+        assert row["reason"] == "pins_unreadable" and not row["candidate"]
+        with pytest.raises(gc_mod.PinsUnreadable):
+            gc_mod.RetentionPins(queue_dir).is_pinned("old-trace", NOW)
+
+    def test_iso_until_string_in_pin_is_honored(self, queue_dir):
+        make_output(queue_dir, "old-trace", job_type="trace", agent="lane-a", finished_days_ago=45)
+        pins_path = queue_dir / "retention" / "pins.json"
+        pins_path.parent.mkdir()
+        pins_path.write_text(json.dumps({"schema": gc_mod.PINS_SCHEMA, "pins": {"old-trace": {"owner": "a", "reason": "b", "until": "2000-01-01T00:00:00+00:00"}}}))
+        row = {r["name"]: r for r in gc_mod.scan(queue_dir, load_job_types(queue_dir), now=NOW)}["old-trace"]
+        assert row["pinned"] is False and row["candidate"]   # an expired ISO until lapses like a numeric one
+
+    def test_nan_and_sub_floor_grace_are_refused_and_floor_is_the_approved_window(self, queue_dir):
+        make_output(queue_dir, "old-trace", job_type="trace", agent="lane-a", finished_days_ago=45)
+        rows = gc_mod.scan(queue_dir, load_job_types(queue_dir), now=NOW)
+        for bad in (float("nan"), float("inf"), 24.0, 71.9, -5.0, "72"):
+            with pytest.raises((ValueError, TypeError), match="grace"):
+                gc_mod.write_candidates(queue_dir, rows, now=NOW, grace_hours=bad)
+        assert not (queue_dir / "gc-candidates.json").exists()
+        assert gc_mod.MIN_GRACE_HOURS == 72.0
+
+    def test_mixed_entries_never_graduate(self, queue_dir):
+        out = make_output(queue_dir, "shared", job_type="legacy", agent="lane-a", finished_days_ago=400)
+        first = candidates(queue_dir, now=NOW)
+        assert {r["name"]: r for r in first["rows"]}["shared"]["reason"] == "unclassified"
+        add_job(queue_dir, out, job_type="mesh", agent="lane-a", finished_at=NOW - 35 * DAY)   # a later job declares final
+
+        row = {r["name"]: r for r in gc_mod.scan(queue_dir, load_job_types(queue_dir), now=NOW + 10 * DAY)}["shared"]
+
+        assert row["output_class"] == "unclassified" and row["class_source"] == "mixed"
+        assert not row["candidate"]
+
+    def test_graduation_waits_for_the_reporting_cycles_own_deadline(self, queue_dir):
+        make_output(queue_dir, "old-legacy", job_type="legacy", agent="lane-z", finished_days_ago=400)
+        candidates(queue_dir, now=NOW, grace_hours=100.0)
+        early = {r["name"]: r for r in gc_mod.scan(queue_dir, load_job_types(queue_dir), now=NOW + 80 * 3600)}["old-legacy"]
+        assert early["reason"] == "unclassified"
+        late = {r["name"]: r for r in gc_mod.scan(queue_dir, load_job_types(queue_dir), now=NOW + 101 * 3600)}["old-legacy"]
+        assert late["reason"] == "graduated"
+
+    def test_apply_does_not_clobber_a_newer_dry_run(self, queue_dir, monkeypatch):
+        import os
+        out = make_output(queue_dir, "old-trace", job_type="trace", agent="lane-a", finished_days_ago=45)
+        os.utime(out, (NOW - 45 * DAY, NOW - 45 * DAY))
+        cand = candidates(queue_dir)
+        real_rmtree = gc_mod.shutil.rmtree
+        newer = {}
+
+        def rmtree_then_dry_run(path, *a, **k):
+            real_rmtree(path, *a, **k)
+            rows = gc_mod.scan(queue_dir, load_job_types(queue_dir), now=NOW + 5 * DAY)
+            newer["doc"] = gc_mod.write_candidates(queue_dir, rows, now=NOW + 5 * DAY)
+        monkeypatch.setattr(gc_mod.shutil, "rmtree", rmtree_then_dry_run)
+
+        summary = gc_mod.apply(queue_dir, epoch=cand["epoch"], owner="ops", now=NOW + 4 * DAY)
+
+        assert summary["deleted"] == 1
+        current = json.loads((queue_dir / "gc-candidates.json").read_text())
+        assert current["epoch"] == newer["doc"]["epoch"] and current["status"] == "open"
+        history = json.loads((queue_dir / "gc-history" / f"{cand['epoch']}.json").read_text())
+        assert history["status"] == "applied"
+        with pytest.raises(gc_mod.GCRefused, match="already applied|epoch mismatch"):
+            gc_mod.apply(queue_dir, epoch=cand["epoch"], owner="ops", now=NOW + 10 * DAY)
