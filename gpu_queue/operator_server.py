@@ -32,7 +32,7 @@ PAGE = r"""<!doctype html>
 <main><section id="smokeRequests" class="smoke-panel" aria-labelledby="smokeHeading"><div class="smoke-heading"><h2 id="smokeHeading">Smoke requests</h2><button id="refreshSmoke" type="button">Refresh</button><span id="smokeStatus" class="meta" aria-live="polite">Loading</span></div><div id="smokeRequestList"><div class="empty">Loading requests…</div></div></section><div id="pauseMeta" class="meta" hidden></div><div id="lease" class="meta" hidden></div><div class="toolbar" id="filters"></div><table><thead><tr><th class="id">Job</th><th class="status">State</th><th class="routeCol">Route</th><th class="age">Elapsed</th><th class="actions">Actions</th></tr></thead><tbody id="jobs"></tbody></table><div id="empty" class="empty" hidden>No jobs in this view.</div></main><div id="error" class="error"></div>
 <script>
 const hash=new URLSearchParams(location.hash.slice(1)),bootstrap=globalThis.__GREENROOM_BOOTSTRAP_TOKEN__||'';if(bootstrap){sessionStorage.setItem('greenroom-token',bootstrap)}else if(hash.get('token')){sessionStorage.setItem('greenroom-token',hash.get('token'));history.replaceState(null,'',location.pathname)}const token=sessionStorage.getItem('greenroom-token')||'';let filter='active',last=null;const statuses=['active','all','pending','running','done','failed','cancelled'];
-const smokeDrafts=new Map(),smokeSubmitting=new Set();let smokeLoadGeneration=0;
+const smokeDrafts=new Map(),smokeSubmitting=new Set();let smokeLoadGeneration=0,smokeHasLoaded=false,smokeRefreshUnavailable=false;
 function auth(){return {'Authorization':'Bearer '+token,'Content-Type':'application/json'}}async function request(path,options={}){const r=await fetch(path,options);if(r.status===401&&globalThis.__GREENROOM_LOCAL_OPERATOR__){if(!sessionStorage.getItem('greenroom-auth-reload')){sessionStorage.setItem('greenroom-auth-reload','1');location.reload();return new Promise(()=>{})}}else if(r.ok){sessionStorage.removeItem('greenroom-auth-reload')}return r}function err(e){const n=document.querySelector('#error');n.textContent=e;n.style.display='block';setTimeout(()=>n.style.display='none',6000)}function elapsed(j){const end=j.finished_at||Date.now()/1000,start=j.started_at||j.submitted_at;if(!start)return '—';const s=Math.max(0,end-start);if(s<60)return Math.round(s)+'s';if(s<3600)return Math.floor(s/60)+'m '+Math.round(s%60)+'s';return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'}function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 let busy=false;
 function duration(seconds){if(seconds==null)return 'not recorded';const s=Math.floor(seconds);return s>=3600?`${Math.floor(s/3600)}h ${Math.floor(s%3600/60)}m`:s>=60?`${Math.floor(s/60)}m ${s%60}s`:`${s}s`}
@@ -69,6 +69,9 @@ function renderSmoke(payload){
     selectionEnd=focusControl==='textarea'?focused.selectionEnd:null,
     selectionDirection=focusControl==='textarea'?focused.selectionDirection:null;
   host.querySelectorAll('form.smokeReply').forEach(form=>smokeDrafts.set(form.dataset.id,form.querySelector('textarea').value));
+  const missingReply=[...host.querySelectorAll('form.smokeReply')].find(form=>!items.some(item=>item.request?.id===form.dataset.id));
+  if(missingReply){keepLastSmokeView('Request missing from refresh; showing last loaded requests');return}
+  smokeRefreshUnavailable=false;smokeHasLoaded=true;
   document.querySelector('#smokeStatus').textContent=payload.errors?.length?`${payload.errors.length} unreadable record(s)`:items.length?`${items.length} request(s)`:'No requests';
   if(payload.errors?.length)err(payload.errors.join('\n'));
   if(!items.length){host.innerHTML='<div class="empty">No smoke requests.</div>';return}
@@ -82,13 +85,18 @@ function renderSmoke(payload){
     const id=form.dataset.id,textarea=form.querySelector('textarea'),button=form.querySelector('button[type="submit"]');
     textarea.value=smokeDrafts.get(id)||'';
     textarea.addEventListener('input',()=>smokeDrafts.set(id,textarea.value));
-    button.disabled=smokeSubmitting.has(id);
+    button.disabled=smokeRefreshUnavailable||smokeSubmitting.has(id);
     form.addEventListener('submit',sendSmokeResponse);
     if(id===focusId&&focusControl){
       const target=focusControl==='textarea'?textarea:button;
       if(!target.disabled){target.focus({preventScroll:true});if(focusControl==='textarea'&&selectionStart!==null)target.setSelectionRange(selectionStart,selectionEnd,selectionDirection)}
     }
   });
+}
+function keepLastSmokeView(message){
+  smokeRefreshUnavailable=true;
+  document.querySelector('#smokeStatus').textContent=message;
+  document.querySelectorAll('#smokeRequestList button[type="submit"]').forEach(button=>button.disabled=true);
 }
 async function loadSmoke(){
   const generation=++smokeLoadGeneration;
@@ -100,6 +108,7 @@ async function loadSmoke(){
     renderSmoke(payload);
   }catch(e){
     if(generation!==smokeLoadGeneration)return;
+    if(smokeHasLoaded){keepLastSmokeView('Refresh failed; showing last loaded requests');err(e.message);return}
     document.querySelector('#smokeStatus').textContent='State unavailable';
     document.querySelector('#smokeRequestList').innerHTML='<div class="empty">Smoke requests unavailable.</div>';
     err(e.message);
