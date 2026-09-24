@@ -1,16 +1,23 @@
 import json
 import http.client
+import hashlib
+import os
+from pathlib import Path
 import re
+import shutil
 import socket
+import subprocess
 import threading
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+from uuid import uuid4
 
 import pytest
 
 from gpu_queue.models import ExternalLease, JobRequest, JobStatus
 from gpu_queue.operator_server import PAGE, make_handler, operator_url, queue_snapshot
 from gpu_queue.queue import GPUQueue
+from gpu_queue.smoke_requests import SmokeRequests
 from http.server import ThreadingHTTPServer
 
 
@@ -38,6 +45,75 @@ def test_smoke_refresh_keeps_last_view_when_request_state_becomes_unavailable():
     assert "smokeRefreshUnavailable" in PAGE
     assert "showing last loaded requests" in PAGE
     assert "Request missing from refresh" in PAGE
+
+
+def _run_operator_browser_witness(tmp_path, scenario, *, responded=False):
+    chrome = os.environ.get("GREENROOM_CHROME") or "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    node = shutil.which("node")
+    if not Path(chrome).is_file() or not node:
+        pytest.skip("the browser witness requires local Chrome and Node.js")
+
+    queue_dir = tmp_path / "queue"
+    queue_dir.mkdir()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(queue_dir, "secret", admission_control=True))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    identity = str(uuid4())
+    request = {
+        "schema": "gpu-greenroom.interactive-smoke.v1",
+        "id": identity,
+        "kind": "interactive-smoke",
+        "source": {"agent_id": "greenroom-floor-manager", "repo_root": str(tmp_path)},
+        "title": "Browser witness request",
+        "prompt": "Observe a deterministic local candidate page.",
+        "url": base,
+        "availability": "prepared",
+        "availability_note": "The isolated candidate monitor is running.",
+    }
+    smoke_requests = SmokeRequests(queue_dir / "smoke-requests")
+    smoke_requests.submit(request)
+    if responded:
+        smoke_requests.respond(identity, "The local browser witness has a durable response.")
+    witness = Path(__file__).with_name("operator_browser_witness.mjs")
+    revision = subprocess.run(
+        ["git", "rev-parse", "HEAD"], check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    diff = subprocess.run(
+        ["git", "diff", "--binary", "HEAD", "--", "gpu_queue/operator_server.py", "tests/test_operator_server.py"], check=True, capture_output=True,
+    ).stdout
+    source_fingerprint = hashlib.sha256(diff + b"\0" + witness.read_bytes()).hexdigest()[:12]
+    source_identity = f"{revision}+candidate-{source_fingerprint}"
+    try:
+        result = subprocess.run(
+            [node, str(witness), chrome, base, scenario, identity, source_identity, str(tmp_path)],
+            check=False, capture_output=True, text=True, timeout=35,
+        )
+        assert result.returncode == 0, f"browser witness failed:\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        report = json.loads(result.stdout.strip().splitlines()[-1])
+        assert report["effectiveRoute"] == base
+        assert report["effectiveMode"] == "admission-control with disposable request fixture"
+        assert report["apiBehavior"] == "scenario-specific browser fetch interception"
+        assert report["sourceRevision"] == source_identity
+        assert report["browser"].startswith("Chrome/")
+        assert Path(report["artifact"]).is_file() and Path(report["artifact"]).stat().st_size > 0
+        print("GREENROOM_BROWSER_WITNESS " + json.dumps(report, sort_keys=True))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_browser_keeps_accepted_smoke_reply_disabled_after_refresh_failure(tmp_path):
+    _run_operator_browser_witness(tmp_path, "stale-submit")
+
+
+def test_browser_does_not_render_malformed_successful_smoke_list_as_empty(tmp_path):
+    _run_operator_browser_witness(tmp_path, "malformed-list", responded=True)
+
+
+def test_browser_does_not_render_all_unreadable_smoke_records_as_empty(tmp_path):
+    _run_operator_browser_witness(tmp_path, "unreadable-list", responded=True)
 
 
 def test_read_only_operator_page_identifies_response_controls_as_unavailable(tmp_path):
