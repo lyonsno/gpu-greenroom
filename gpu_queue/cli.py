@@ -14,6 +14,7 @@ from pathlib import Path
 
 from .control import QueueControlError, QueueRegistry
 from .models import BumpStatus, JobRequest, JobStatus, LeaseStatus
+from .smoke_requests import SmokeRequests
 from .queue import (
     GPUQueue,
     PauseStateError,
@@ -95,6 +96,20 @@ def cmd_submit(args):
     if request.agent_id:
         print(f"  Agent ID: {request.agent_id}")
     print(f"  Dir: {job_dir}")
+
+
+def cmd_smoke_request(args):
+    store = SmokeRequests(Path(args.queue_dir).expanduser() / "smoke-requests")
+    if args.smoke_action == "submit":
+        request_path = Path(args.request_file).expanduser()
+        payload = json.loads(request_path.read_text(encoding="utf-8"))
+        record, created = store.submit(payload)
+        print(json.dumps({"created": created, "record": record}, indent=2))
+    elif args.smoke_action == "get":
+        print(json.dumps(store.get(args.request_id), indent=2))
+    elif args.smoke_action == "list":
+        records, errors = store.scan()
+        print(json.dumps({"items": records, "errors": errors}, indent=2))
 
 
 def _parse_env_assignments(assignments):
@@ -661,6 +676,18 @@ def main():
     p_cancel = sub.add_parser("cancel", help="Cancel a pending job")
     p_cancel.add_argument("job_id")
     p_cancel.set_defaults(func=cmd_cancel)
+
+    # Interactive-smoke requests are Greenroom-owned records, separate from GPU jobs.
+    p_smoke = sub.add_parser("smoke-request", help="Create or inspect Greenroom-owned interactive-smoke requests")
+    smoke_sub = p_smoke.add_subparsers(dest="smoke_action", required=True)
+    p_smoke_submit = smoke_sub.add_parser("submit", help="Submit an operator-needed smoke request from JSON")
+    p_smoke_submit.add_argument("request_file", help="gpu-greenroom.interactive-smoke.v1 JSON file")
+    p_smoke_submit.set_defaults(func=cmd_smoke_request)
+    p_smoke_get = smoke_sub.add_parser("get", help="Read one request and its returned operator response")
+    p_smoke_get.add_argument("request_id")
+    p_smoke_get.set_defaults(func=cmd_smoke_request)
+    p_smoke_list = smoke_sub.add_parser("list", help="List smoke requests and malformed-record diagnostics")
+    p_smoke_list.set_defaults(func=cmd_smoke_request)
 
     # operator console
     p_operator = sub.add_parser("operator", help="Run the authenticated localhost operator console")

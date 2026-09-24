@@ -6,6 +6,8 @@ import threading
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+import pytest
+
 from gpu_queue.models import ExternalLease, JobRequest, JobStatus
 from gpu_queue.operator_server import PAGE, make_handler, operator_url, queue_snapshot
 from gpu_queue.queue import GPUQueue
@@ -31,6 +33,88 @@ def test_operator_snapshot_exposes_pause_and_route(tmp_path):
     assert snapshot["pause_state"]["owner"] == "test"
     assert snapshot["jobs"][0]["requested_route"] == "test/route"
     assert snapshot["jobs"][0]["repo_root"] == "/work/repo"
+
+
+def test_greenroom_smoke_request_round_trips_operator_response_over_authenticated_api(tmp_path):
+    queue = GPUQueue(tmp_path / "queue")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(queue, "secret", admission_control=True))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    request = {
+        "schema": "gpu-greenroom.interactive-smoke.v1",
+        "id": "9c0a03f6-b2d8-43f4-b7b7-5e848e733661",
+        "kind": "interactive-smoke",
+        "source": {
+            "agent_id": "greenroom-floor-manager",
+            "repo_root": str(tmp_path),
+        },
+        "title": "Inspect the current Greenroom smoke",
+        "prompt": "Open the page and report whether the operator controls are legible.",
+        "url": "http://127.0.0.1:8766/",
+        "availability": "prepared",
+        "availability_note": "The monitor is already running.",
+    }
+    headers = {"Authorization": "Bearer secret", "Content-Type": "application/json"}
+    try:
+        response = urlopen(Request(base + "/api/smoke-requests", data=json.dumps(request).encode(), headers=headers))
+        created = json.load(response)
+        assert response.status == 201
+        assert created["request"] == request
+        assert created["status"] == "operator-needed"
+
+        returned = urlopen(Request(base + "/api/smoke-requests/" + request["id"], headers=headers))
+        assert json.load(returned) == created
+
+        answered = urlopen(Request(
+            base + "/api/smoke-requests/" + request["id"] + "/response",
+            data=json.dumps({"text": "The row hierarchy is clear; the timing column needs a wider viewport."}).encode(),
+            headers=headers,
+            method="POST",
+        ))
+        result = json.load(answered)
+        assert result["status"] == "responded"
+        assert result["response"]["text"] == "The row hierarchy is clear; the timing column needs a wider viewport."
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_read_only_wins_over_admission_control_for_smoke_response_route(tmp_path):
+    queue_dir = tmp_path / "queue"
+    queue_dir.mkdir()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(
+        queue_dir, "secret", read_only=True, admission_control=True,
+    ))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    body = {
+        "schema": "gpu-greenroom.interactive-smoke.v1",
+        "id": "9c0a03f6-b2d8-43f4-b7b7-5e848e733661",
+        "kind": "interactive-smoke",
+        "source": {"agent_id": "example-agent", "repo_root": str(tmp_path)},
+        "title": "Inspect Greenroom",
+        "prompt": "Report the visible state.",
+        "url": "http://127.0.0.1:8766/",
+        "availability": "prepared",
+        "availability_note": "The monitor is running.",
+    }
+    try:
+        with pytest.raises(HTTPError) as error:
+            urlopen(Request(
+                base + "/api/smoke-requests",
+                data=json.dumps(body).encode(),
+                headers={"Authorization": "Bearer secret", "Content-Type": "application/json"},
+            ))
+        assert error.value.code == 403
+        assert json.loads(error.value.read())["error"] == "read_only_monitor"
+        assert not (queue_dir / "smoke-requests").exists()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
 
 
 def test_operator_snapshot_serializes_external_lease(tmp_path):
