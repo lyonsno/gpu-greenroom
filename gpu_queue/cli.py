@@ -613,7 +613,7 @@ def cmd_gc(args):
             print("gc --apply requires --epoch <candidates-epoch> and --owner <who>", file=sys.stderr)
             sys.exit(2)
         try:
-            summary = gc_mod.apply(queue_dir, epoch=args.epoch, owner=args.owner, now=_time.time())
+            summary = gc_mod.apply(queue_dir, epoch=args.epoch, owner=args.owner, now=_time.time(), job_types=_load_job_types(queue_dir))
         except gc_mod.GCRefused as exc:
             print(json.dumps({"status": "refused", "error_message": str(exc)}, indent=2), file=sys.stderr)
             sys.exit(1)
@@ -642,7 +642,8 @@ def cmd_gc(args):
     print(f"epoch {doc['epoch']}  entries {totals['entry_count']}  total {gib(totals['total_bytes']):.1f} GiB")
     print(f"candidates {totals['candidate_count']} ({gib(totals['candidate_bytes']):.1f} GiB, of which graduated {totals['graduated_count']} / {gib(totals['graduated_bytes']):.1f} GiB)  unclassified {totals['unclassified_count']} ({gib(totals['unclassified_bytes']):.1f} GiB)  pinned {totals['pinned_count']}  active {totals['active_count']}")
     for r in sorted((r for r in rows if r["candidate"]), key=lambda r: -(r["size_bytes"] or 0))[:40]:
-        print(f"  {gib(r['size_bytes']):7.2f} GiB  {r['output_class']:12s} {r['age_days']:6.0f} d  {r['owner'] or 'not recorded':24s} {r['name']}")
+        refs = f"  [referenced by {len(r['job_type_refs'])} registered job type(s)]" if r.get("job_type_refs") else ""
+        print(f"  {gib(r['size_bytes']):7.2f} GiB  {r['output_class']:12s} {r['age_days']:6.0f} d  {r['owner'] or 'not recorded':24s} {r['name']}{refs}")
     for w in warnings:
         print(f"warning: {w}")
     print(f"notices per owner: {Path(queue_dir) / 'gc-notices' / doc['epoch']}")

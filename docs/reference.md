@@ -357,12 +357,17 @@ the newest job's `finished_at`; when no job record carries a numeric
 entry is a candidate when it is past its TTL, not pinned, and not mentioned
 anywhere in a pending or running job's records. "Mentioned" means the
 entry's name appears in any string value (`output_dir`, `input_path`,
-`command_cwd`, `params`, `command_argv`, anything else), or an absolute
-path in one of them resolves into the entry; the check over-protects on
-purpose. If any pending or running job's `request.json` is missing or
+`command_cwd`, `params`, `command_argv`, anything else) or in the job type
+configuration that job would run under (`cmd`, `cwd`, `env`, `defaults`),
+compared case-insensitively, or an absolute path in one of them resolves
+into the entry; the check over-protects on purpose. References that never
+spell the name (shell variables, globs, paths inside a config file the job
+reads) are not seen. An entry mentioned by a registered job type that has
+no queued job is reported as `job_type_refs`, a diagnostic, not a hold. If any pending or running job's `request.json` is missing or
 unparsable, or its `status.json` is present but unparsable, nothing can be
-proven unreferenced: every row reports `active_unknown` and nothing is a
-candidate until the record is readable.
+proven unreferenced: every row reports `active_unknown`, the candidate
+list names the unreadable records, and nothing is a candidate until they
+are readable.
 
 **Graduation.** `unclassified` entries are listed with their size and not
 collected in the cycle that first reports them. Every dry-run is copied to

@@ -674,3 +674,65 @@ class TestRevisionThree:
         pins_path.write_text(json.dumps({"schema": gc_mod.PINS_SCHEMA, "pins": {"old-trace": {"owner": "a", "reason": "b", "until": "2099-01-01"}}}))
         row = {r["name"]: r for r in gc_mod.scan(queue_dir, load_job_types(queue_dir), now=NOW)}["old-trace"]
         assert row["pinned"] is True and not row["candidate"]
+
+
+class TestFollowUpAdvisory:
+    def test_queued_jobs_type_config_references_protect_entries(self, queue_dir):
+        ckpt = make_output(queue_dir, "train-run7", job_type="trace", agent="lane-a", finished_days_ago=45)
+        cwd_entry = make_output(queue_dir, "fixture-root", job_type="trace", agent="lane-a", finished_days_ago=45)
+        jt = load_job_types(queue_dir)
+        jt["decode"] = {"cmd": ["python", "decode.py", "--ckpt", "{ckpt}"], "defaults": {"ckpt": str(ckpt / "ckpt.pt")}, "output_class": "intermediate"}
+        jt["render"] = {"cmd": ["true"], "cwd": str(cwd_entry), "output_class": "witness"}
+        (queue_dir / "job_types.json").write_text(json.dumps(jt))
+        for i, job_type in enumerate(("decode", "render")):
+            pj = queue_dir / "pending" / f"p{i}"
+            pj.mkdir()
+            (pj / "request.json").write_text(json.dumps({"job_type": job_type, "input_path": "/in.png",
+                                                         "output_dir": str(queue_dir / "outputs" / f"new{i}"), "params": {}}))
+
+        rows = {r["name"]: r for r in gc_mod.scan(queue_dir, jt, now=NOW)}
+        assert rows["train-run7"]["active"] and not rows["train-run7"]["candidate"]
+        assert rows["fixture-root"]["active"] and not rows["fixture-root"]["candidate"]
+
+    def test_apply_sees_type_config_references_submitted_during_grace(self, queue_dir):
+        import os
+        ckpt = make_output(queue_dir, "train-run7", job_type="trace", agent="lane-a", finished_days_ago=45)
+        os.utime(ckpt, (NOW - 45 * DAY, NOW - 45 * DAY))
+        cand = candidates(queue_dir)
+        jt = load_job_types(queue_dir)
+        jt["decode"] = {"cmd": ["python", "decode.py"], "defaults": {"ckpt": str(ckpt / "ckpt.pt")}, "output_class": "intermediate"}
+        (queue_dir / "job_types.json").write_text(json.dumps(jt))
+        pj = queue_dir / "pending" / "p-late"
+        pj.mkdir()
+        (pj / "request.json").write_text(json.dumps({"job_type": "decode", "input_path": "/in.png", "output_dir": str(queue_dir / "outputs" / "new"), "params": {}}))
+
+        summary = gc_mod.apply(queue_dir, epoch=cand["epoch"], owner="ops", now=NOW + 4 * DAY, job_types=jt)
+
+        assert ckpt.exists() and summary["holds"][0]["reason"] == "active"
+
+    def test_case_different_mention_still_protects(self, queue_dir):
+        out = make_output(queue_dir, "TrainRun", job_type="trace", agent="lane-a", finished_days_ago=45)
+        pj = queue_dir / "pending" / "p-case"
+        pj.mkdir()
+        (pj / "request.json").write_text(json.dumps({"job_type": "command", "input_path": "", "output_dir": str(queue_dir / "outputs" / "new"),
+                                                     "params": {}, "command_argv": ["cat", "outputs/trainrun/x"]}))
+        row = {r["name"]: r for r in gc_mod.scan(queue_dir, load_job_types(queue_dir), now=NOW)}["TrainRun"]
+        assert row["active"]
+
+    def test_unreadable_record_is_named(self, queue_dir):
+        make_output(queue_dir, "old-trace", job_type="trace", agent="lane-a", finished_days_ago=45)
+        pj = queue_dir / "pending" / "p-torn"
+        pj.mkdir()
+        (pj / "request.json").write_text("")
+        rows = gc_mod.scan(queue_dir, load_job_types(queue_dir), now=NOW)
+        doc = gc_mod.write_candidates(queue_dir, rows, now=NOW)
+        assert doc["totals"]["active_unknown"] is True
+        assert [str(pj / "request.json")] == doc["totals"]["unreadable_records"]
+
+    def test_registered_type_references_are_reported_not_authority(self, queue_dir):
+        out = make_output(queue_dir, "old-trace", job_type="trace", agent="lane-a", finished_days_ago=45)
+        jt = load_job_types(queue_dir)
+        jt["stale-fixture"] = {"cmd": ["cat", str(out / "blob.bin")], "output_class": "witness"}
+        row = {r["name"]: r for r in gc_mod.scan(queue_dir, jt, now=NOW)}["old-trace"]
+        assert row["job_type_refs"] == ["stale-fixture"]
+        assert row["candidate"]   # a registered but idle job type is a diagnostic, not a pin

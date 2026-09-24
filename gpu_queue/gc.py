@@ -255,18 +255,23 @@ class ActiveRefs:
     present but unparsable; then nothing can be proven unreferenced.
     """
 
-    def __init__(self, names: set[str], texts: list[str], unreadable: bool):
+    def __init__(self, names: set[str], texts: list[str], unreadable_records: list[str]):
         self.names = names
-        self.blob = "\n".join(texts)
-        self.unreadable = unreadable
+        self.blob = "\n".join(texts).casefold()
+        self.unreadable_records = unreadable_records
+
+    @property
+    def unreadable(self) -> bool:
+        return bool(self.unreadable_records)
 
     @classmethod
-    def load(cls, queue_dir: Path) -> "ActiveRefs":
+    def load(cls, queue_dir: Path, job_types: dict | None = None) -> "ActiveRefs":
+        """Strings from every pending or running job's records, plus its job type's config."""
         outputs = (queue_dir / "outputs").resolve()
         outputs_prefix = str(outputs) + os.sep
         names: set[str] = set()
         texts: list[str] = []
-        unreadable = False
+        unreadable: list[str] = []
         for status in ("pending", "running"):
             status_dir = queue_dir / status
             if not status_dir.is_dir():
@@ -276,20 +281,36 @@ class ActiveRefs:
                     continue
                 request = _load_json(job_dir / "request.json")
                 if not isinstance(request, dict):
-                    unreadable = True
+                    unreadable.append(str(job_dir / "request.json"))
                 state = None
                 if (job_dir / "status.json").exists():
                     state = _load_json(job_dir / "status.json")
                     if not isinstance(state, dict):
-                        unreadable = True
-                for doc in (request, state):
+                        unreadable.append(str(job_dir / "status.json"))
+                config = None
+                if job_types and isinstance(request, dict):
+                    config = job_types.get(request.get("job_type") or "")
+                for doc in (request, state, config):
                     for text in _strings_in(doc):
                         texts.append(text)
                         names |= _names_in_string(text, outputs, outputs_prefix)
         return cls(names, texts, unreadable)
 
     def mentions(self, name: str) -> bool:
-        return name in self.names or (bool(name) and name in self.blob)
+        return name in self.names or (bool(name) and name.casefold() in self.blob)
+
+
+def registered_type_references(job_types: dict, outputs: Path) -> dict[str, list[str]]:
+    """Entry names mentioned by any registered job type's config, as a diagnostic (not authority)."""
+    refs: dict[str, list[str]] = {}
+    outputs_prefix = str(outputs) + os.sep
+    for type_name, config in (job_types or {}).items():
+        for text in _strings_in(config):
+            for name in _names_in_string(text, outputs, outputs_prefix):
+                refs.setdefault(name, [])
+                if type_name not in refs[name]:
+                    refs[name].append(type_name)
+    return refs
 
 
 def _active_refs(queue_dir: Path) -> set[str]:
@@ -370,7 +391,8 @@ def scan(queue_dir, job_types: dict, *, now: float, ttl_days: dict | None = None
     outputs = queue_dir / "outputs"
     ttl = {**DEFAULT_TTL_DAYS, **(ttl_days or {})}
     records = _job_records(queue_dir)
-    active = ActiveRefs.load(queue_dir)
+    active = ActiveRefs.load(queue_dir, job_types)
+    type_refs = registered_type_references(job_types, outputs.resolve())
     graduated = reported_unclassified(queue_dir, now=now)
     pins = RetentionPins(queue_dir)
     try:
@@ -435,6 +457,7 @@ def scan(queue_dir, job_types: dict, *, now: float, ttl_days: dict | None = None
             "ttl_days": limit,
             "pinned": pinned,
             "active": is_active,
+            "job_type_refs": sorted(type_refs.get(entry.name, [])),
             "size_bytes": _dir_size(entry) if compute_size else None,
             "candidate": candidate,
             "reason": reason,
@@ -475,6 +498,8 @@ def write_candidates(queue_dir, rows: list[dict], *, now: float, grace_hours: fl
             "pinned_count": sum(bool(r["pinned"]) for r in rows),
             "active_count": sum(r["active"] for r in rows),
             "active_unknown": any(r["reason"] == "active_unknown" for r in rows),
+            "unreadable_records": ActiveRefs.load(queue_dir).unreadable_records,
+            "registered_type_referenced_count": sum(bool(r.get("job_type_refs")) for r in rows),
             "pins_readable": all(r["reason"] != "pins_unreadable" for r in rows),
         },
         "rows": rows,
@@ -514,7 +539,7 @@ def _entry_changed(row: dict, current: dict | None, created_at: float) -> bool:
     return current["dir_mtime"] > created_at
 
 
-def apply(queue_dir, *, epoch: str, owner: str, now: float) -> dict:
+def apply(queue_dir, *, epoch: str, owner: str, now: float, job_types: dict | None = None) -> dict:
     """Delete exactly the candidate list for ``epoch``, once, after its grace window, with receipts."""
     queue_dir = Path(queue_dir).resolve()
     outputs = queue_dir / "outputs"
@@ -579,7 +604,7 @@ def apply(queue_dir, *, epoch: str, owner: str, now: float) -> dict:
             except PinsUnreadable:
                 holds.append({"name": name, "reason": "pins_unreadable"})
                 continue
-            active = ActiveRefs.load(queue_dir)   # re-read per row: a job may have been submitted mid-run
+            active = ActiveRefs.load(queue_dir, job_types)   # re-read per row: a job may have been submitted mid-run
             if active.unreadable:
                 holds.append({"name": name, "reason": "active_unknown"})
                 continue
