@@ -229,10 +229,9 @@ def make_handler(queue: GPUQueue | Path, token: str, *, read_only: bool = False,
                 return True
             parts = path.strip("/").split("/")
             if len(parts) == 4 and parts[0:2] == ["api", "smoke-requests"] and parts[3] == "response":
-                record = self._smoke_requests().respond(
-                    parts[2], body.get("text"),
-                    responded_by=str(body.get("responded_by") or "operator-console"),
-                )
+                if "responded_by" in body:
+                    raise ValueError("response actor identity is not authenticated; omit responded_by")
+                record = self._smoke_requests().respond(parts[2], body.get("text"))
                 self._json(HTTPStatus.OK, record)
                 return True
             return False

@@ -346,6 +346,10 @@ and records a non-empty operator response at
 `POST /api/smoke-requests/<id>/response` with `{"text":"..."}`. The
 request moves from `operator-needed` to `responded`; a repeated identical
 response is idempotent, while a conflicting second response is rejected.
+The response record binds its text to the request but labels the actor as an
+`unverified-caller`; the shared bearer credential and this endpoint do not
+authenticate a human identity. A stored response therefore does not by itself
+prove that Noah or another named operator supplied it.
 These narrow endpoints are available in admission-control mode and do not
 admit or execute GPU jobs. A read-only console still rejects writes.
 

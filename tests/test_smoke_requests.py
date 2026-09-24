@@ -36,17 +36,33 @@ def test_smoke_request_submit_is_idempotent_but_identity_cannot_change(tmp_path,
     assert store.get(request_payload["id"]) == first
 
 
+def test_smoke_request_replay_rejects_json_values_python_compares_equal(tmp_path, request_payload):
+    store = SmokeRequests(tmp_path / "smoke-requests")
+    integer_request = deepcopy(request_payload)
+    integer_request["source"]["generation"] = 1
+    boolean_request = deepcopy(request_payload)
+    boolean_request["source"]["generation"] = True
+
+    stored, created = store.submit(integer_request)
+    assert created is True
+    assert stored["request"]["source"]["generation"] == 1
+    with pytest.raises(SmokeRequestConflict, match="different request"):
+        store.submit(boolean_request)
+    assert store.get(request_payload["id"])["request"]["source"]["generation"] == 1
+
+
 def test_smoke_request_response_is_exact_and_bound_to_original_request(tmp_path, request_payload):
     store = SmokeRequests(tmp_path / "smoke-requests")
     submitted, _ = store.submit(request_payload)
     response_text = "Keep the same view.\nThe route label wraps at narrow widths.\n"
 
-    answered = store.respond(request_payload["id"], response_text, responded_by="operator")
-    replay = store.respond(request_payload["id"], response_text, responded_by="another-client")
+    answered = store.respond(request_payload["id"], response_text)
+    replay = store.respond(request_payload["id"], response_text)
 
     assert answered["status"] == "responded"
     assert answered["response"]["request_digest"] == submitted["request_digest"]
     assert answered["response"]["text"] == response_text
+    assert answered["response"]["actor"] == {"kind": "unverified-caller", "id": None}
     assert replay == answered
     with pytest.raises(SmokeRequestConflict, match="different response"):
         store.respond(request_payload["id"], "A conflicting second answer")

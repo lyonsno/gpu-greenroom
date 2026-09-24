@@ -152,8 +152,8 @@ class SmokeRequests:
                 raise ValueError("response is not bound to this request")
             if not isinstance(response.get("text"), str) or not response["text"].strip():
                 raise ValueError("response text is missing")
-            if not isinstance(response.get("responded_by"), str) or not response["responded_by"].strip():
-                raise ValueError("response actor is missing")
+            if response.get("actor") != {"kind": "unverified-caller", "id": None}:
+                raise ValueError("response actor attribution must remain unverified")
             _timestamp(response.get("responded_at"), "responded_at")
         return record
 
@@ -165,7 +165,7 @@ class SmokeRequests:
             except FileNotFoundError:
                 existing = None
             if existing is not None:
-                if existing["request"] != request:
+                if existing["request_digest"] != _digest(request):
                     raise SmokeRequestConflict("request id already belongs to a different request")
                 return existing, False
             record = {
@@ -178,12 +178,10 @@ class SmokeRequests:
             }
             return self._write(record), True
 
-    def respond(self, identity: str, text: object, *, responded_by: str = "operator-console") -> dict:
+    def respond(self, identity: str, text: object) -> dict:
         request_id = _canonical_id(identity)
         if not isinstance(text, str) or not text.strip():
             raise ValueError("response text must be a non-empty string")
-        if not isinstance(responded_by, str) or not responded_by.strip():
-            raise ValueError("responded_by must be a non-empty string")
         with self._locked(request_id):
             record = self.get(request_id)
             if record["status"] == "responded":
@@ -193,7 +191,7 @@ class SmokeRequests:
             record["response"] = {
                 "request_digest": record["request_digest"],
                 "text": text,
-                "responded_by": responded_by,
+                "actor": {"kind": "unverified-caller", "id": None},
                 "responded_at": _now(),
             }
             record["status"] = "responded"

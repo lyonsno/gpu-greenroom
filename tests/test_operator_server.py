@@ -66,6 +66,19 @@ def test_greenroom_smoke_request_round_trips_operator_response_over_authenticate
         returned = urlopen(Request(base + "/api/smoke-requests/" + request["id"], headers=headers))
         assert json.load(returned) == created
 
+        forged_actor = Request(
+            base + "/api/smoke-requests/" + request["id"] + "/response",
+            data=json.dumps({
+                "text": "The row hierarchy is clear; the timing column needs a wider viewport.",
+                "responded_by": "Noah Lyons",
+            }).encode(),
+            headers=headers,
+            method="POST",
+        )
+        with pytest.raises(HTTPError) as rejected_actor:
+            urlopen(forged_actor)
+        assert rejected_actor.value.code == 400
+
         answered = urlopen(Request(
             base + "/api/smoke-requests/" + request["id"] + "/response",
             data=json.dumps({"text": "The row hierarchy is clear; the timing column needs a wider viewport."}).encode(),
@@ -75,6 +88,7 @@ def test_greenroom_smoke_request_round_trips_operator_response_over_authenticate
         result = json.load(answered)
         assert result["status"] == "responded"
         assert result["response"]["text"] == "The row hierarchy is clear; the timing column needs a wider viewport."
+        assert result["response"]["actor"] == {"kind": "unverified-caller", "id": None}
     finally:
         server.shutdown()
         server.server_close()
