@@ -81,7 +81,7 @@ def test_matrix_provides_repo_local_benchmark_routes_for_fresh_queue(tmp_path):
     assert str(REPO_ROOT / "benchmarks" / "bench_mlx.py") in encoded
     assert str(REPO_ROOT / "benchmarks" / "bench_pytorch.py") in encoded
     assert str(REPO_ROOT / "benchmarks" / "moge_webgpu.sh") in encoded
-    assert "/Users/noahlyons/dev/gpu-greenroom/benchmarks" not in encoded
+    assert "/Users/" not in encoded.replace(str(REPO_ROOT), "")   # only the resolved repo root, never a hardcoded home path
 
 
 def test_webgpu_route_and_wrapper_receive_matrix_image(tmp_path):
@@ -145,7 +145,7 @@ def test_job_types_example_does_not_ship_stale_moge_benchmark_paths():
     assert "moge-bench-mlx" not in config
     assert "moge-bench-pytorch" not in config
     assert "moge-bench-webgpu" not in config
-    assert "/Users/noahlyons/dev/gpu-greenroom/benchmarks" not in json.dumps(config)
+    assert "/Users/" not in json.dumps(config).replace(str(REPO_ROOT), "")
 
 
 def test_collect_receipt_uses_active_queue_dir(tmp_path, monkeypatch):

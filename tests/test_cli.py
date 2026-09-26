@@ -49,7 +49,7 @@ class TestCLISubmit:
         assert req["params"]["seed"] == "123"
         assert req["params"]["resolution"] == "512"
 
-    def test_submit_persists_caller_declared_diaulos(self, queue_dir):
+    def test_submit_persists_caller_declared_agent_id(self, queue_dir):
         rc, _, err = run_cli(
             "submit", "trellis2mlx", "/tmp/test.png", "/tmp/out",
             "--agent-id", "greenroom-floor-manager", queue_dir=queue_dir,

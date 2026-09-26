@@ -35,6 +35,8 @@ DEFAULT_QUEUE_DIR = os.environ.get(
     os.path.expanduser("~/.local/state/gpu-greenroom"),
 )
 REPO_ROOT = Path(__file__).resolve().parent.parent
+# Sibling checkouts next to this repo unless MOGE_WORKSPACE says otherwise.
+WORKSPACE = Path(os.environ.get("MOGE_WORKSPACE", REPO_ROOT.parent))
 
 # Benchmark job definitions
 BENCHMARK_JOBS = {
@@ -64,7 +66,7 @@ def build_benchmark_job_types(repo_root: str | Path = REPO_ROOT) -> dict:
     return {
         "moge-bench-mlx": {
             "cmd": [
-                _expanded_env_path("MOGE_BENCH_MLX_PYTHON", "~/dev/pixal3d-mlx/.venv/bin/python"),
+                _expanded_env_path("MOGE_BENCH_MLX_PYTHON", str(WORKSPACE / "pixal3d-mlx" / ".venv" / "bin" / "python")),
                 "-u",
                 str(benchmarks_dir / "bench_mlx.py"),
                 "--image",
@@ -74,13 +76,13 @@ def build_benchmark_job_types(repo_root: str | Path = REPO_ROOT) -> dict:
                 "--output-dir",
                 "{output_dir}",
             ],
-            "env": {"PYTHONPATH": _expanded_env_path("MOGE_MLX_DIR", "~/dev/moge-mlx")},
+            "env": {"PYTHONPATH": _expanded_env_path("MOGE_MLX_DIR", str(WORKSPACE / "moge-mlx"))},
             "defaults": {"runs": "10"},
             "timeout": 300,
         },
         "moge-bench-pytorch": {
             "cmd": [
-                _expanded_env_path("MOGE_BENCH_PYTORCH_PYTHON", "~/dev/moge-standalone/.venv/bin/python"),
+                _expanded_env_path("MOGE_BENCH_PYTORCH_PYTHON", str(WORKSPACE / "moge-standalone" / ".venv" / "bin" / "python")),
                 "-u",
                 str(benchmarks_dir / "bench_pytorch.py"),
                 "--image",
@@ -92,7 +94,7 @@ def build_benchmark_job_types(repo_root: str | Path = REPO_ROOT) -> dict:
                 "--output-dir",
                 "{output_dir}",
             ],
-            "env": {"PYTHONPATH": _expanded_env_path("MOGE_STANDALONE_DIR", "~/dev/moge-standalone")},
+            "env": {"PYTHONPATH": _expanded_env_path("MOGE_STANDALONE_DIR", str(WORKSPACE / "moge-standalone"))},
             "defaults": {"runs": "10", "device": "mps"},
             "timeout": 300,
         },
@@ -383,9 +385,7 @@ def main():
     else:
         output_dir = Path(args.queue_dir) / "benchmark-results" / f"moge-matrix-{timestamp}"
 
-    input_image = args.image or os.path.expanduser(
-        "~/dev/moge-webgpu/public/test_fixtures/input.png"
-    )
+    input_image = args.image or str(WORKSPACE / "moge-webgpu" / "public" / "test_fixtures" / "input.png")
 
     print(f"MoGe Benchmark Matrix", file=sys.stderr)
     print(f"  Runtimes: {', '.join(runtimes)}", file=sys.stderr)
@@ -410,9 +410,9 @@ def main():
     git_commits = {}
     for name, path in [
         ("gpu-greenroom", str(Path(__file__).resolve().parent.parent)),
-        ("moge-mlx", os.path.expanduser("~/dev/moge-mlx")),
-        ("moge-webgpu", os.path.expanduser("~/dev/moge-webgpu")),
-        ("moge-standalone", os.path.expanduser("~/dev/moge-standalone")),
+        ("moge-mlx", str(WORKSPACE / "moge-mlx")),
+        ("moge-webgpu", str(WORKSPACE / "moge-webgpu")),
+        ("moge-standalone", str(WORKSPACE / "moge-standalone")),
     ]:
         info = get_git_info(path)
         if info:

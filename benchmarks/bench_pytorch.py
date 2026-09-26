@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 import time
 
 import torch
@@ -18,9 +19,13 @@ import numpy as np
 from PIL import Image
 
 
+# Sibling checkouts next to this repo unless MOGE_WORKSPACE says otherwise.
+WORKSPACE = Path(os.environ.get("MOGE_WORKSPACE", Path(__file__).resolve().parents[2]))
+
+
 def get_model_and_input(device_str, fixture_path):
     """Load MoGe-2 model and prepare input from the test fixture."""
-    moge_dir = os.path.expanduser("~/dev/moge-standalone")
+    moge_dir = str(WORKSPACE / "moge-standalone")
     sys.path.insert(0, moge_dir)
 
     from moge.model.v2 import MoGeModel
@@ -109,9 +114,7 @@ def main():
     parser.add_argument("--output-dir", default=None, help="Write results JSON to this directory")
     args = parser.parse_args()
 
-    fixture = args.image or os.path.expanduser(
-        "~/dev/moge-webgpu/public/test_fixtures/input.png"
-    )
+    fixture = args.image or str(WORKSPACE / "moge-webgpu" / "public" / "test_fixtures" / "input.png")
     fixture = os.path.abspath(fixture)
 
     print(f"PyTorch MoGe-2 benchmark -- device={args.device}, runs={args.runs}", file=sys.stderr)

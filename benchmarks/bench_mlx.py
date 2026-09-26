@@ -11,11 +11,16 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 import time
 
 import mlx.core as mx
 import numpy as np
 from PIL import Image
+
+
+# Sibling checkouts next to this repo unless MOGE_WORKSPACE says otherwise.
+WORKSPACE = Path(os.environ.get("MOGE_WORKSPACE", Path(__file__).resolve().parents[2]))
 
 
 def main():
@@ -26,9 +31,7 @@ def main():
     parser.add_argument("--output-dir", default=None, help="Write results JSON to this directory")
     args = parser.parse_args()
 
-    fixture = args.image or os.path.expanduser(
-        "~/dev/moge-webgpu/public/test_fixtures/input.png"
-    )
+    fixture = args.image or str(WORKSPACE / "moge-webgpu" / "public" / "test_fixtures" / "input.png")
 
     print(f"MLX MoGe-2 benchmark -- runs={args.runs}", file=sys.stderr)
     print(f"Image: {fixture}", file=sys.stderr)
