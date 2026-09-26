@@ -85,6 +85,7 @@ class Records:
     def __init__(self, queue_dir: Path):
         self.queue_dir = queue_dir
         self.jobs: dict[str, dict] = {}
+        self._directory_level: dict[str, set[str]] = {}   # digests known only from shared gc receipts
         self._load_jobs()
         self._load_gc_receipts()
         self._index()
@@ -152,6 +153,7 @@ class Records:
                 continue
             deletion = "confirmed" if doc.get("deleted_at") else ("partial" if doc.get("partial") else "unconfirmed")
             job_ids = [j for j in (doc.get("job_ids") or []) if isinstance(j, str)]
+            has_maps = isinstance(doc.get("artifact_manifest_by_job"), dict) or isinstance(doc.get("input_artifacts_by_job"), dict)
             by_job = doc.get("artifact_manifest_by_job") if isinstance(doc.get("artifact_manifest_by_job"), dict) else {}
             inputs_by_job = doc.get("input_artifacts_by_job") if isinstance(doc.get("input_artifacts_by_job"), dict) else {}
             flat = [m for m in (doc.get("artifact_manifest") or []) if isinstance(m, dict) and m.get("sha256")]
@@ -167,10 +169,15 @@ class Records:
                 job["deleted"] = deletion == "confirmed"
                 job["deleted_by_epoch"] = doc.get("epoch")
                 known = {a["sha256"] for a in job["artifacts"]}
-                if job_id in by_job or not shared:
-                    mine = by_job.get(job_id) if job_id in by_job else flat
-                    for m in mine or []:
+                if has_maps:
+                    # the receipt says which job produced what; a job missing from the map produced nothing recorded
+                    for m in by_job.get(job_id) or []:
                         if isinstance(m, dict) and m.get("sha256") and m["sha256"] not in known:
+                            job["artifacts"].append({"path": m.get("path"), "sha256": m["sha256"], "size_bytes": m.get("size_bytes"), "attribution": "job"})
+                            known.add(m["sha256"])
+                elif not shared:
+                    for m in flat:
+                        if m["sha256"] not in known:
                             job["artifacts"].append({"path": m.get("path"), "sha256": m["sha256"], "size_bytes": m.get("size_bytes"), "attribution": "job"})
                             known.add(m["sha256"])
                 else:
@@ -178,12 +185,15 @@ class Records:
                         if m["sha256"] not in known:
                             job["artifacts"].append({"path": m.get("path"), "sha256": m["sha256"], "size_bytes": m.get("size_bytes"), "attribution": "gc-receipt-shared"})
                             known.add(m["sha256"])
+                            self._directory_level.setdefault(m["sha256"], set()).add(f"{doc.get('epoch')}/{doc.get('name')}")
                 if job["record_source"] == "gc-receipt" and not job["inputs"]:
                     if job_id in inputs_by_job and isinstance(inputs_by_job[job_id], dict):
                         i = inputs_by_job[job_id]
                         p, rel = _abs(i.get("path"))
                         job["inputs"].append({"path": p, "relative": rel, "sha256": i.get("sha256"), "digest_recorded": bool(i.get("sha256")),
                                               "basis": "job", "producer": None, "producer_basis": None, "candidates": [], "ambiguous": False})
+                    elif has_maps:
+                        pass   # the map is authoritative: no recorded input for this job
                     elif not shared:
                         for i in flat_inputs:
                             p, rel = _abs(i.get("path"))
@@ -205,6 +215,8 @@ class Records:
                 if artifact["attribution"] != "job":
                     continue   # directory-level evidence never enters the per-job digest index
                 self.by_digest.setdefault(artifact["sha256"], set()).add(job_id)
+                if job["record_source"] == "gc-receipt":
+                    continue   # a gc receipt's path is the directory, not this job's output_dir: no artifact-path index
                 if job["output_dir"] and not job["output_dir_relative"] and artifact.get("path"):
                     self.by_artifact_path.setdefault(os.path.join(job["output_dir"], artifact["path"]), []).append(job_id)
             if job["output_dir"] and not job["output_dir_relative"]:
@@ -252,7 +264,11 @@ class Records:
             if digest and recorded_there and recorded_there != digest:
                 accepted, reason = False, "digest contradicts the producer's recorded digest for this path"
             pf, cs = producer.get("finished_at"), consumer.get("started_at")
-            if accepted and pf is not None and cs is not None and pf > cs:
+            if accepted and producer.get("status") in ("pending", "running") and producer.get("record_source") != "gc-receipt":
+                accepted, reason = False, f"producer has not finished (status {producer.get('status')})"
+            elif accepted and pf is None and producer.get("record_source") != "gc-receipt" and producer.get("status") == "cancelled" and producer.get("started_at") is None:
+                accepted, reason = False, "producer was cancelled before it started"
+            elif accepted and pf is not None and cs is not None and pf > cs:
                 accepted, reason = False, "producer finished after the consumer started"
             basis = "+".join(b for b in BASIS_ORDER if b in bases)
             score = sum(BASIS_RANK[b] for b in bases)
@@ -270,18 +286,20 @@ class Records:
             inp["ambiguous"] = len(accepted) > 1
             inp["producer"] = accepted[0]["job_id"] if accepted else None
             inp["producer_basis"] = accepted[0]["basis"] if accepted else None
+            for c in accepted:
+                self._consumers.setdefault(c["job_id"], []).append({"job_id": job_id, "basis": c["basis"], "via": c["via"], "ambiguous": len(accepted) > 1})
+
+    def attach_all(self) -> None:
+        """Attach producers to every job once; consumers_of reads the reverse index this builds."""
+        self._consumers: dict[str, list[dict]] = {}
+        for job_id in self.jobs:
+            self.attach_producers(job_id)
 
     def consumers_of(self, job_id: str) -> list[dict]:
-        """Jobs whose inputs accept this job as a producer."""
-        found = []
-        for other_id, other in self.jobs.items():
-            if other_id == job_id:
-                continue
-            for inp in other["inputs"]:
-                for c in self.candidates_for(inp, other_id):
-                    if c["job_id"] == job_id and c["accepted"]:
-                        accepted = [x for x in self.candidates_for(inp, other_id) if x["accepted"]]
-                        found.append({"job_id": other_id, "basis": c["basis"], "via": c["via"], "ambiguous": len(accepted) > 1})
+        """Jobs whose inputs accepted this job as a producer (from the reverse index)."""
+        if not hasattr(self, "_consumers"):
+            self.attach_all()
+        found = list(self._consumers.get(job_id, []))
         found.sort(key=lambda kv: (self.jobs[kv["job_id"]].get("finished_at") or 0, kv["job_id"]))
         return found
 
@@ -306,6 +324,9 @@ def resolve_subject(queue_dir, subject: str, records: Records | None = None) -> 
         ids = records.by_digest.get(subject)
         if ids:
             return answer(ids, "artifact_digest")
+        where = records._directory_level.get(subject)
+        if where:
+            raise LineageNotFound(f"digest {subject} is recorded only at directory level by shared gc receipt(s) {', '.join(sorted(where))}; it cannot be attributed to one job")
         raise LineageNotFound(f"no receipt records an artifact with digest {subject}")
     norm, _rel = _abs(subject if os.path.isabs(subject) else os.path.abspath(subject))
     if norm:
@@ -331,8 +352,7 @@ def lineage(queue_dir, subject: str) -> dict:
     records = Records(queue_dir)
     match = resolve_subject(queue_dir, subject, records)
     root_id = match["job_id"]
-    for job_id in records.jobs:
-        records.attach_producers(job_id)
+    records.attach_all()
     nodes: list[dict] = []
     edges: list[dict] = []
     seen: set[str] = {root_id}

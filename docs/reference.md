@@ -442,8 +442,10 @@ For each input, candidate producers are every job whose recorded artifact
 path equals the input (`artifact-path`), whose recorded output directory
 contains it (`output-dir`, longest match), or whose recorded artifact
 digest equals the input's recorded digest (`sha256`). A candidate is
-rejected when it finished after the consumer started, or when the input's
-recorded digest contradicts the producer's recorded digest for that path.
+rejected when it has not finished (a pending or running job produces
+nothing yet), when it finished after the consumer started, or when the
+input's recorded digest contradicts the producer's recorded digest for that
+path.
 Among accepted candidates the strongest basis wins (`artifact-path` over
 `output-dir` over `sha256` alone), then the most recent; when more than one
 is accepted the input and its edges are marked `ambiguous` and all are
@@ -452,9 +454,13 @@ shown. Relative recorded paths are shown and never matched.
 A gc receipt marks its jobs `deletion` `confirmed`, `partial`, or
 `unconfirmed`; `deleted` is true only when confirmed. Since the per-job
 manifest change, gc receipts carry `artifact_manifest_by_job` and
-`input_artifacts_by_job`; older receipts shared by several jobs attribute
-artifacts and inputs to the directory (`attribution` `gc-receipt-shared`),
-which never enters the digest index. A job whose record is gone entirely is
+`input_artifacts_by_job`, and those maps are authoritative: a job missing
+from them produced nothing recorded. Older receipts shared by several jobs
+attribute artifacts and inputs to the directory (`attribution`
+`gc-receipt-shared`), which never enters the digest index; asking lineage
+for such a digest says which receipt holds it. A job reconstructed from a
+gc receipt alone contributes its digests but not artifact paths, since the
+receipt records the directory, not the job's own output_dir. A job whose record is gone entirely is
 reconstructed from the gc receipt alone (`record_source` `gc-receipt`).
 
 Output: `gpu-greenroom.lineage.v1` JSON (`subject`, `subject_matched_by`,

@@ -1,10 +1,12 @@
 """Fail-first contract for `gpu-greenroom lineage`.
 
-Lineage walks receipts, not files. Every job's receipt records its input
-(path and digest), its effective route and worker identity, and the digests
-of its outputs. Producers are found by digest first and by path second;
-consumers the same way in reverse. A directory collected by gc still appears
-in lineage because the gc receipt kept the job ids and the artifact digests.
+Lineage walks receipts, not files. A job record carries one input path, a
+digest only when its job type attested the input, and artifact digests only
+when it configured a manifest. Producers are matched by recorded artifact
+path, then output-directory containment, then digest, with time order and
+recorded-digest contradictions rejecting candidates and ambiguity shown. A
+directory collected by gc still appears through the gc receipt's job ids
+and digests.
 """
 
 from __future__ import annotations
@@ -338,3 +340,67 @@ class TestRealWorkerReceipts:
         m = lin.resolve_subject(queue_dir, sha(b"PNG-B"))
         assert m["ambiguous"] is True and set(m["candidates"]) == {ids["b"], twin}
         assert m["job_id"] == twin          # the most recently finished candidate is primary (twin finished after B)
+
+
+class TestRevisionTwo:
+    def test_a_queued_job_into_a_reused_directory_is_never_a_producer(self, queue_dir):
+        ids = chain(queue_dir)
+        # the ordinary rerun pattern: a new job is queued into B's directory but has not run
+        pj = queue_dir / "pending" / "p-rerun"
+        pj.mkdir()
+        (pj / "request.json").write_text(json.dumps({"job_type": "render", "input_path": "/x.png", "output_dir": str(queue_dir / "outputs" / "skull-render"), "params": {}, "job_id": "p-rerun"}))
+        (pj / "status.json").write_text(json.dumps({"job_id": "p-rerun", "status": "pending", "job_type": "render", "output_dir": str(queue_dir / "outputs" / "skull-render")}))
+        g = lin.lineage(queue_dir, ids["c"])
+        inp = g["subject"]["inputs"][0]
+        assert inp["producer"] == ids["b"] and inp["ambiguous"] is False
+        rejected = {c["job_id"]: c["reason"] for c in inp["candidates"] if not c["accepted"]}
+        assert "p-rerun" in rejected and "not finished" in rejected["p-rerun"]
+        assert "p-rerun" not in [n["job_id"] for n in g["nodes"]]
+        assert [n["job_id"] for n in lin.lineage(queue_dir, "p-rerun")["nodes"] if n["relation"] == "descendant"] == []
+
+    def test_consumer_search_reuses_attached_producers(self, queue_dir, monkeypatch):
+        ids = chain(queue_dir)
+        calls = {"n": 0}
+        real = lin.Records.candidates_for
+        def counting(self, inp, consumer_id):
+            calls["n"] += 1
+            return real(self, inp, consumer_id)
+        monkeypatch.setattr(lin.Records, "candidates_for", counting)
+        lin.lineage(queue_dir, ids["a"])
+        inputs = sum(len(j["inputs"]) for j in lin.Records(queue_dir / ".." / "queue").jobs.values()) if False else None
+        assert calls["n"] <= 8   # once per input across all jobs (4 inputs), not once per input per walked node
+
+    def test_gc_receipt_with_per_job_maps_is_authoritative_for_jobs_missing_from_them(self, queue_dir):
+        import shutil
+        ids = chain(queue_dir)
+        plain = job(queue_dir, job_type="mesh", agent="lane-a", input_path="/other/p.png", input_bytes=None, outputs={}, name="skull-mesh", finished=NOW - 2900)
+        rdir = queue_dir / "gc-receipts" / "e4"
+        rdir.mkdir(parents=True)
+        (rdir / "skull-mesh.json").write_text(json.dumps({
+            "schema": "gpu-greenroom.gc-receipt.v1", "epoch": "e4", "name": "skull-mesh", "path": str(queue_dir / "outputs" / "skull-mesh"),
+            "job_ids": [ids["a"], plain], "deleted_at": NOW - 10, "applied_by": "ops",
+            "artifact_manifest": [{"path": "mesh.glb", "sha256": sha(b"MESH-A"), "size_bytes": 6}],
+            "artifact_manifest_by_job": {ids["a"]: [{"path": "mesh.glb", "sha256": sha(b"MESH-A"), "size_bytes": 6}]},
+            "input_artifacts_by_job": {},
+        }))
+        shutil.rmtree(queue_dir / "outputs" / "skull-mesh")
+        g = lin.lineage(queue_dir, ids["b"])
+        node = {n["job_id"]: n for n in g["nodes"] + [g["subject"]]}
+        # the plain job produced nothing according to the map; it must not be credited with A's mesh
+        assert all(a["attribution"] == "job" for a in node[ids["a"]]["artifacts"])
+        assert plain not in node or node[plain]["artifacts"] == []
+
+    def test_digest_known_only_at_directory_level_says_so(self, queue_dir):
+        import shutil
+        ids = chain(queue_dir)
+        second = job(queue_dir, job_type="mesh", agent="lane-a", input_path="/o/2.png", input_bytes=None, outputs={"m2.glb": b"M2"}, name="skull-mesh", finished=NOW - 2900)
+        rdir = queue_dir / "gc-receipts" / "e5"
+        rdir.mkdir(parents=True)
+        (rdir / "skull-mesh.json").write_text(json.dumps({
+            "schema": "gpu-greenroom.gc-receipt.v1", "epoch": "e5", "name": "skull-mesh", "path": str(queue_dir / "outputs" / "skull-mesh"),
+            "job_ids": [ids["a"], second], "deleted_at": NOW - 10, "applied_by": "ops",
+            "artifact_manifest": [{"path": "only-in-receipt.bin", "sha256": "ee" * 32, "size_bytes": 1}],
+        }))
+        shutil.rmtree(queue_dir / "done" / ids["a"]); shutil.rmtree(queue_dir / "done" / second)
+        with pytest.raises(lin.LineageNotFound, match="directory level.*e5"):
+            lin.resolve_subject(queue_dir, "ee" * 32)
