@@ -442,10 +442,16 @@ For each input, candidate producers are every job whose recorded artifact
 path equals the input (`artifact-path`), whose recorded output directory
 contains it (`output-dir`, longest match), or whose recorded artifact
 digest equals the input's recorded digest (`sha256`). A candidate is
-rejected when it has not finished (a pending or running job produces
-nothing yet), when it finished after the consumer started, or when the
-input's recorded digest contradicts the producer's recorded digest for that
-path.
+rejected when it has not finished (a pending or running job is not
+credited until it finishes, and one still running when the consumer started
+is never credited), when the queue cancelled it before it started, when a
+gc receipt confirms its bytes were deleted at or before the consumer
+started, when it finished after the consumer started, or when the input's
+recorded digest contradicts the producer's recorded digest for that path.
+Failed jobs stay eligible and are shown with their status. A job known only
+from a gc receipt is indexed by the receipt's directory, which may be a
+parent of its true output directory; its containment edges carry
+`output-dir` like any other.
 Among accepted candidates the strongest basis wins (`artifact-path` over
 `output-dir` over `sha256` alone), then the most recent; when more than one
 is accepted the input and its edges are marked `ambiguous` and all are
@@ -460,7 +466,8 @@ attribute artifacts and inputs to the directory (`attribution`
 `gc-receipt-shared`), which never enters the digest index; asking lineage
 for such a digest says which receipt holds it. A job reconstructed from a
 gc receipt alone contributes its digests but not artifact paths, since the
-receipt records the directory, not the job's own output_dir. A job whose record is gone entirely is
+receipt records the directory, not the job's own output_dir. A job whose
+record is gone entirely is
 reconstructed from the gc receipt alone (`record_source` `gc-receipt`).
 
 Output: `gpu-greenroom.lineage.v1` JSON (`subject`, `subject_matched_by`,

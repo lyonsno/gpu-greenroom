@@ -12,10 +12,14 @@ Edges are labeled by their evidence: ``artifact-path`` (the input is a
 recorded artifact of the producer), ``output-dir`` (the input lies inside
 the producer's recorded output directory), ``sha256`` (the input's
 recorded digest equals a recorded artifact digest), or combinations. A
-producer that finished after its consumer started is rejected; a recorded
-input digest that contradicts the producer's recorded digest for the same
-path rejects that producer; when more than one producer remains, the
-input is marked ambiguous and every accepted candidate is shown. Relative
+producer is rejected when it has not finished, when the queue cancelled it
+before it started, when a gc receipt confirms its bytes were deleted at or
+before the consumer started, or when it finished after its consumer
+started; a recorded input digest that contradicts the producer's recorded
+digest for the same path rejects that producer; when more than one producer
+remains, the input is marked ambiguous and every accepted candidate is
+shown. Per-job maps in a gc receipt are authoritative: a job missing from
+them recorded nothing. Relative
 recorded paths are never resolved. Deleting bytes does not delete what the
 receipts recorded, and lineage shows exactly what they recorded, no more.
 """
@@ -86,6 +90,7 @@ class Records:
         self.queue_dir = queue_dir
         self.jobs: dict[str, dict] = {}
         self._directory_level: dict[str, set[str]] = {}   # digests known only from shared gc receipts
+        self._consumers: dict[str, list[dict]] = {}       # reverse index, filled by attach_all / attach_producers
         self._load_jobs()
         self._load_gc_receipts()
         self._index()
@@ -97,7 +102,7 @@ class Records:
             "effective_route": None, "effective_argv": None, "worker_commit": None, "worker_source_root": None,
             "started_at": None, "finished_at": None, "exit_code": None, "failure_phase": None,
             "output_dir": None, "output_dir_relative": False, "artifacts": [], "inputs": [], "inputs_attribution": "job",
-            "record_source": "job-record", "deleted": False, "deletion": None, "deleted_by_epoch": None,
+            "record_source": "job-record", "deleted": False, "deletion": None, "deleted_by_epoch": None, "deleted_at": None,
         }
         base.update(over)
         return base
@@ -168,6 +173,7 @@ class Records:
                 job["deletion"] = deletion
                 job["deleted"] = deletion == "confirmed"
                 job["deleted_by_epoch"] = doc.get("epoch")
+                job["deleted_at"] = doc.get("deleted_at") if isinstance(doc.get("deleted_at"), (int, float)) else None
                 known = {a["sha256"] for a in job["artifacts"]}
                 if has_maps:
                     # the receipt says which job produced what; a job missing from the map produced nothing recorded
@@ -266,8 +272,11 @@ class Records:
             pf, cs = producer.get("finished_at"), consumer.get("started_at")
             if accepted and producer.get("status") in ("pending", "running") and producer.get("record_source") != "gc-receipt":
                 accepted, reason = False, f"producer has not finished (status {producer.get('status')})"
-            elif accepted and pf is None and producer.get("record_source") != "gc-receipt" and producer.get("status") == "cancelled" and producer.get("started_at") is None:
+            elif accepted and producer.get("status") == "cancelled" and producer.get("started_at") is None and producer.get("record_source") != "gc-receipt":
+                # GPUQueue.cancel stamps finished_at on a job that never started; the missing started_at is the fact that matters
                 accepted, reason = False, "producer was cancelled before it started"
+            elif accepted and producer.get("deleted") and producer.get("deleted_at") is not None and cs is not None and producer["deleted_at"] <= cs:
+                accepted, reason = False, f"producer's bytes were deleted (gc epoch {producer.get('deleted_by_epoch')}) before the consumer started"
             elif accepted and pf is not None and cs is not None and pf > cs:
                 accepted, reason = False, "producer finished after the consumer started"
             basis = "+".join(b for b in BASIS_ORDER if b in bases)
@@ -297,7 +306,7 @@ class Records:
 
     def consumers_of(self, job_id: str) -> list[dict]:
         """Jobs whose inputs accepted this job as a producer (from the reverse index)."""
-        if not hasattr(self, "_consumers"):
+        if not self._consumers and self.jobs:
             self.attach_all()
         found = list(self._consumers.get(job_id, []))
         found.sort(key=lambda kv: (self.jobs[kv["job_id"]].get("finished_at") or 0, kv["job_id"]))
@@ -426,7 +435,7 @@ def render_text(graph: dict) -> str:
                 prod = "external / not found" + (f"; rejected {len(rejected)}: " + "; ".join(f"{c['job_id']} ({c['reason']})" for c in rejected) if rejected else "")
             out.append(f"    input: {i.get('path')}  [{digest}]  {prod}")
         if n.get("deletion") == "confirmed":
-            out.append(f"    deleted by gc epoch {n.get('deleted_by_epoch')}")
+            out.append(f"    deleted by gc epoch {n.get('deleted_by_epoch')}" + (f" at {n['deleted_at']:.0f}" if n.get("deleted_at") is not None else ""))
         elif n.get("deletion"):
             out.append(f"    deletion {n['deletion']} (gc epoch {n.get('deleted_by_epoch')})")
         if n.get("record_source") == "gc-receipt":

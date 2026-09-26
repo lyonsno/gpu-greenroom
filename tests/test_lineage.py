@@ -367,8 +367,7 @@ class TestRevisionTwo:
             return real(self, inp, consumer_id)
         monkeypatch.setattr(lin.Records, "candidates_for", counting)
         lin.lineage(queue_dir, ids["a"])
-        inputs = sum(len(j["inputs"]) for j in lin.Records(queue_dir / ".." / "queue").jobs.values()) if False else None
-        assert calls["n"] <= 8   # once per input across all jobs (4 inputs), not once per input per walked node
+        assert calls["n"] == 4   # exactly once per input across all jobs (the chain has 4 inputs); a doubled pass would be 8
 
     def test_gc_receipt_with_per_job_maps_is_authoritative_for_jobs_missing_from_them(self, queue_dir):
         import shutil
@@ -404,3 +403,71 @@ class TestRevisionTwo:
         shutil.rmtree(queue_dir / "done" / ids["a"]); shutil.rmtree(queue_dir / "done" / second)
         with pytest.raises(lin.LineageNotFound, match="directory level.*e5"):
             lin.resolve_subject(queue_dir, "ee" * 32)
+
+
+class TestRevisionThree:
+    """Record shapes the real writers produce, which the revision-two rules assumed away."""
+
+    def _job_types(self):
+        writer = ("import pathlib, sys; out = pathlib.Path(sys.argv[1]); out.mkdir(parents=True, exist_ok=True); "
+                  "(out / 'mesh.glb').write_bytes(b'MESH')")
+        reader = ("import pathlib, sys; out = pathlib.Path(sys.argv[2]); out.mkdir(parents=True, exist_ok=True); "
+                  "(out / 'view.png').write_bytes(pathlib.Path(sys.argv[1]).read_bytes() + b'-VIEW')")
+        return {
+            "mesh": {"cmd": [sys.executable, "-c", writer, "{output_dir}"], "artifact_manifest": ["mesh.glb"], "output_class": "intermediate"},
+            "render": {"cmd": [sys.executable, "-c", reader, "{input_path}", "{output_dir}"], "artifact_manifest": ["view.png"]},
+        }
+
+    def test_a_job_cancelled_by_the_real_queue_before_it_started_is_never_a_producer(self, queue_dir, tmp_path):
+        from gpu_queue.models import JobRequest
+        from gpu_queue.queue import GPUQueue
+        jt = self._job_types(); q = GPUQueue(queue_dir)
+        m = queue_dir / "outputs" / "m"
+        (tmp_path / "plate.png").write_bytes(b"PLATE")
+        a = JobRequest(job_type="mesh", input_path=str(tmp_path / "plate.png"), output_dir=str(m), agent_id="lane-a")
+        q.submit(a); assert q.run_one(jt) is True
+        x = JobRequest(job_type="mesh", input_path=str(tmp_path / "plate.png"), output_dir=str(m), agent_id="lane-x")
+        q.submit(x); assert q.cancel(x.job_id)
+        st = json.loads((queue_dir / "cancelled" / x.job_id / "status.json").read_text())
+        assert st["started_at"] is None and st["finished_at"] is not None   # the shape GPUQueue.cancel really writes
+        b = JobRequest(job_type="render", input_path=str(m / "mesh.glb"), output_dir=str(queue_dir / "outputs" / "r"), agent_id="lane-b")
+        q.submit(b); assert q.run_one(jt) is True
+
+        g = lin.lineage(queue_dir, b.job_id)
+        inp = g["subject"]["inputs"][0]
+        assert inp["producer"] == a.job_id and inp["ambiguous"] is False
+        xc = [c for c in inp["candidates"] if c["job_id"] == x.job_id][0]
+        assert xc["accepted"] is False and "cancelled before it started" in xc["reason"]
+        assert [n for n in lin.lineage(queue_dir, x.job_id)["nodes"] if n["relation"] == "descendant"] == []
+
+    def test_a_producer_whose_bytes_gc_deleted_before_the_consumer_started_is_rejected(self, queue_dir, tmp_path):
+        from gpu_queue import gc as gc_mod
+        from gpu_queue.models import JobRequest
+        from gpu_queue.queue import GPUQueue
+        jt = self._job_types(); q = GPUQueue(queue_dir)
+        m = queue_dir / "outputs" / "m"
+        (tmp_path / "plate.png").write_bytes(b"PLATE")
+        a = JobRequest(job_type="mesh", input_path=str(tmp_path / "plate.png"), output_dir=str(m), agent_id="lane-a")
+        q.submit(a); assert q.run_one(jt) is True
+        t0 = time.time()
+        rows = gc_mod.scan(queue_dir, jt, now=t0 + 60, ttl_days={"intermediate": 0.0})
+        assert {r["name"]: r for r in rows}["m"]["candidate"]
+        cand = gc_mod.write_candidates(queue_dir, rows, now=t0 + 60)
+        summary = gc_mod.apply(queue_dir, epoch=cand["epoch"], owner="ops", now=t0 + 60 + 73 * 3600, job_types=jt)
+        assert summary["holds"] == [] and not m.exists()          # the receipt is the real collector's, bytes gone
+        receipt = json.loads((queue_dir / "gc-receipts" / cand["epoch"] / "m.json").read_text())
+        deleted_at = receipt["deleted_at"]                        # the collector stamps the wall clock, not the policy clock
+        assert deleted_at is not None
+        # the rerun writes the same bytes, so digests alone cannot tell A from A2: only the deletion time can
+        a2 = job(queue_dir, job_type="mesh", agent="lane-a2", input_path=str(tmp_path / "plate.png"), input_bytes=b"PLATE",
+                 outputs={"mesh.glb": b"MESH"}, name="m", finished=deleted_at + 7200)
+        c = job(queue_dir, job_type="render", agent="lane-c", input_path=str(m / "mesh.glb"), input_bytes=b"MESH",
+                outputs={"view.png": b"V"}, name="r", finished=deleted_at + 7300)
+
+        g = lin.lineage(queue_dir, c)
+        inp = g["subject"]["inputs"][0]
+        assert inp["producer"] == a2 and inp["ambiguous"] is False
+        ac = [cnd for cnd in inp["candidates"] if cnd["job_id"] == a.job_id][0]
+        assert ac["accepted"] is False and "deleted" in ac["reason"] and "before the consumer started" in ac["reason"]
+        assert all(n["job_id"] != a.job_id for n in g["nodes"])          # a rejected candidate is not an ancestor
+        assert lin.lineage(queue_dir, a.job_id)["subject"]["deleted_at"] == deleted_at
