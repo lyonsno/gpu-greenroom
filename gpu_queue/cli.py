@@ -15,6 +15,7 @@ from pathlib import Path
 from .control import QueueControlError, QueueRegistry
 from .models import BumpStatus, JobRequest, JobStatus, LeaseStatus
 from . import gc as gc_mod
+from . import lineage as lineage_mod
 from .queue import (
     GPUQueue,
     PauseStateError,
@@ -680,6 +681,18 @@ def cmd_retain(args):
     print(json.dumps({"name": args.name, **entry}, indent=2))
 
 
+def cmd_lineage(args):
+    try:
+        graph = lineage_mod.lineage(args.queue_dir, args.subject)
+    except lineage_mod.LineageNotFound as exc:
+        print(json.dumps({"status": "not_found", "error_message": str(exc)}, indent=2), file=sys.stderr)
+        sys.exit(1)
+    if args.json:
+        print(json.dumps(graph, indent=2))
+    else:
+        print(lineage_mod.render_text(graph))
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="gpu-greenroom",
@@ -913,6 +926,11 @@ def main():
     p_retain.add_argument("--list", action="store_true")
     p_retain.add_argument("--unpin", action="store_true")
     p_retain.set_defaults(func=cmd_retain)
+
+    p_lineage = sub.add_parser("lineage", help="Walk receipts to show how an artifact was produced and what consumed it")
+    p_lineage.add_argument("subject", help="A job id, a sha256 digest, or a path (an artifact path, or any file whose content matches a recorded artifact)")
+    p_lineage.add_argument("--json", action="store_true")
+    p_lineage.set_defaults(func=cmd_lineage)
 
     args = parser.parse_args()
     if not args.command:

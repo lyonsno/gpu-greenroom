@@ -25,6 +25,9 @@ gpu-greenroom resume --owner NAME --epoch ID    # epoch must match the observed 
 gpu-greenroom recover                  # move running jobs whose worker PID is gone to failed/
 gpu-greenroom doctor --json            # executable discovery, imports, queue writes, dispatch availability
 
+# Lineage
+gpu-greenroom lineage <job-id | sha256 | path> [--json]
+
 # Retention
 gpu-greenroom gc --dry-run [--grace-hours 72] [--authority TEXT] [--no-size] [--json]
 gpu-greenroom gc --apply --epoch ID --owner NAME
@@ -417,6 +420,23 @@ The run always writes `gc-receipts/<epoch>/_summary.json` and marks the
 history copy `applied`; it marks the current candidate list `applied` only
 if it still belongs to that epoch, so a dry-run written meanwhile is not
 clobbered, and the same epoch cannot be applied twice.
+
+## Lineage
+
+`lineage` resolves its subject as a job id, a 64-hex sha256 digest, or a
+path. A path matches an artifact recorded in a receipt (by exact path or by
+being inside a recorded `output_dir`); if it names a file that exists, its
+content is hashed and matched by digest, so a copy of an artifact resolves
+too. Ancestors are found from each job's recorded input by digest first
+(`input_artifact.sha256` against every `artifact_manifest`) and by path
+second; descendants the same way in reverse. Records come from
+`done/`, `failed/`, `cancelled/`, `running/`, and `pending/` job dirs, and
+from `gc-receipts/*/*.json`, so a collected directory still appears with
+`deleted: true` and its `deleted_by_epoch`; a job whose record is gone
+entirely is reconstructed from the gc receipt alone (`record_source`
+`gc-receipt`). Output: `gpu-greenroom.lineage.v1` JSON (`subject`,
+`subject_matched_by`, `nodes` with `relation` and `depth`, `edges` with
+`via` as `sha256:` or `path:`), or a text tree.
 
 ## Reviewing a new job type
 
