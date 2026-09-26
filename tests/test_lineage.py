@@ -555,3 +555,11 @@ class TestSharedRecords:
         assert g["subject"]["inputs"][0]["producer"] == ids["a"]
         na = lin.lineage(queue_dir, ids["a"])["subject"]
         assert na["status"] == "done" and na["duplicate_records"] == ["running"]
+
+    def test_a_job_the_real_worker_records_as_failed_is_shown_as_failed_and_stays_eligible(self, queue_dir, tmp_path):
+        rq = RealQueue(queue_dir)
+        (tmp_path / "in.png").write_bytes(b"IN")
+        f = rq.run_failing(tmp_path / "in.png", queue_dir / "outputs" / "broken", agent="lane-f")
+        n = lin.lineage(queue_dir, f)["subject"]
+        assert n["status"] == "failed" and n["exit_code"] == 3 and n["never_started"] is False and n["record_unreadable"] == []
+        assert "failed" in lin.render_text(lin.lineage(queue_dir, f))

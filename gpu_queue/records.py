@@ -152,7 +152,8 @@ class GcReceipt:
 
 
 def load_gc_receipts(queue_dir: Path) -> tuple[list[GcReceipt], list[str]]:
-    """(receipts in a fixed order: by deletion time, then epoch, then name; paths of torn receipt files)."""
+    """(receipts in a fixed order: confirmed deletions first by deletion time, then the rest by time written, then epoch and name;
+    paths of torn receipt files)."""
     receipts_dir = Path(queue_dir) / "gc-receipts"
     receipts: list[GcReceipt] = []
     unreadable: list[str] = []
