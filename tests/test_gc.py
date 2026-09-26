@@ -729,13 +729,28 @@ class TestFollowUpAdvisory:
         assert doc["totals"]["active_unknown"] is True
         assert [str(pj / "request.json")] == doc["totals"]["unreadable_records"]
 
-    def test_registered_type_references_are_reported_not_authority(self, queue_dir):
+    def test_registered_type_references_hold_the_entry(self, queue_dir):
         out = make_output(queue_dir, "old-trace", job_type="trace", agent="lane-a", finished_days_ago=45)
         jt = load_job_types(queue_dir)
-        jt["stale-fixture"] = {"cmd": ["cat", str(out / "blob.bin")], "output_class": "witness"}
-        row = {r["name"]: r for r in gc_mod.scan(queue_dir, jt, now=NOW)}["old-trace"]
-        assert row["job_type_refs"] == ["stale-fixture"]
-        assert row["candidate"]   # a registered but idle job type is a diagnostic, not a pin
+        jt["consumer"] = {"cmd": ["cat", str(out / "blob.bin")], "output_class": "witness"}
+        rows = gc_mod.scan(queue_dir, jt, now=NOW)
+        row = {r["name"]: r for r in rows}["old-trace"]
+        assert row["job_type_refs"] == ["consumer"]
+        assert row["candidate"] is False and row["reason"] == "referenced_by_registered_type"
+        doc = gc_mod.write_candidates(queue_dir, rows, now=NOW)
+        assert doc["totals"]["registered_type_referenced_count"] == 1
+        assert doc["totals"]["referenced_hold_bytes"] == row["size_bytes"] > 0
+
+    def test_a_reference_added_after_the_dry_run_holds_at_apply(self, queue_dir):
+        out = make_output(queue_dir, "old-trace", job_type="trace", agent="lane-a", finished_days_ago=45)
+        jt = load_job_types(queue_dir)
+        rows = gc_mod.scan(queue_dir, jt, now=NOW)
+        assert {r["name"]: r for r in rows}["old-trace"]["candidate"]
+        doc = gc_mod.write_candidates(queue_dir, rows, now=NOW)
+        jt["consumer"] = {"cmd": ["cat", str(out / "blob.bin")], "output_class": "witness"}
+        result = gc_mod.apply(queue_dir, epoch=doc["epoch"], owner="lane-a", now=NOW + 73 * 3600, job_types=jt)
+        assert {"name": "old-trace", "reason": "referenced_by_registered_type"} in result["holds"]
+        assert (out / "blob.bin").exists()
 
 
 class TestGraduationUnderHold:

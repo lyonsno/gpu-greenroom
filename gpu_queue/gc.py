@@ -441,6 +441,8 @@ def scan(queue_dir, job_types: dict, *, now: float, ttl_days: dict | None = None
             reason = "active"
         elif pinned:
             reason = "pinned"
+        elif type_refs.get(entry.name):
+            reason = "referenced_by_registered_type"   # a registered job type names this entry in its config: its default input or fixture
         elif output_class == "unclassified" or limit is None:
             reason = "unclassified"
         elif age_days <= limit:
@@ -503,6 +505,7 @@ def write_candidates(queue_dir, rows: list[dict], *, now: float, grace_hours: fl
             "active_unknown": any(r["reason"] == "active_unknown" for r in rows),
             "unreadable_records": ActiveRefs.load(queue_dir).unreadable_records,
             "registered_type_referenced_count": sum(bool(r.get("job_type_refs")) for r in rows),
+            "referenced_hold_bytes": total(lambda r: r["reason"] == "referenced_by_registered_type"),
             "pins_readable": all(r["reason"] != "pins_unreadable" for r in rows),
         },
         "rows": rows,
@@ -546,6 +549,7 @@ def apply(queue_dir, *, epoch: str, owner: str, now: float, job_types: dict | No
     """Delete exactly the candidate list for ``epoch``, once, after its grace window, with receipts."""
     queue_dir = Path(queue_dir).resolve()
     outputs = queue_dir / "outputs"
+    type_refs = registered_type_references(job_types, outputs.resolve()) if job_types else {}
     if not isinstance(owner, str) or not owner.strip():
         raise GCRefused("apply requires --owner")
     candidates_path = queue_dir / "gc-candidates.json"
@@ -613,6 +617,9 @@ def apply(queue_dir, *, epoch: str, owner: str, now: float, job_types: dict | No
                 continue
             if active.mentions(name):
                 holds.append({"name": name, "reason": "active"})
+                continue
+            if type_refs.get(name):
+                holds.append({"name": name, "reason": "referenced_by_registered_type"})
                 continue
             manifests = [m for r in recs for m in (r.get("artifact_manifest") or [])]
             inputs = [r["input_artifact"] for r in recs if r.get("input_artifact")]

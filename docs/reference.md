@@ -363,7 +363,7 @@ compared case-insensitively, or an absolute path in one of them resolves
 into the entry; the check over-protects on purpose. References that never
 spell the name (shell variables, globs, paths inside a config file the job
 reads) are not seen. An entry mentioned by a registered job type that has
-no queued job is reported as `job_type_refs`, a diagnostic, not a hold. If any pending or running job's `request.json` is missing or
+no queued job is reported as `job_type_refs` and held with reason `referenced_by_registered_type`: a registered job type names that directory in its config, so it is a default input or fixture, and deleting it would break the type whether or not it has run lately. The summary carries `registered_type_referenced_count` and `referenced_hold_bytes`; a stale reference is released by editing the referencing type, not by the collector. If any pending or running job's `request.json` is missing or
 unparsable, or its `status.json` is present but unparsable, nothing can be
 proven unreferenced: every row reports `active_unknown`, the candidate
 list names the unreadable records, and nothing is a candidate until they
@@ -405,8 +405,9 @@ shorter than the approved window, when pins are unreadable, or when any
 listed path resolves outside `outputs/`. Otherwise it walks the list and
 holds any row whose entry is missing, whose job set or newest finish
 changed, whose directory mtime is newer than the list, that was pinned
-since, that a pending or running job now mentions, or whose reference
-state cannot be read (`active_unknown`). For the
+since, that a pending or running job now mentions, that a registered job
+type now names in its config (`referenced_by_registered_type`), or whose
+reference state cannot be read (`active_unknown`). For the
 rest it writes `gc-receipts/<epoch>/<name>.json` (class, source, reason,
 owner, size, age, job ids, snapshot, and any `artifact_manifest` and
 `input_artifact` digests from those jobs' receipts), removes the directory,
