@@ -58,7 +58,7 @@ def job(queue_dir: Path, *, job_type: str, agent: str, input_path: str, input_by
         "job_id": job_id, "job_type": job_type, "status": status, "input_path": input_path, "output_dir": str(out),
         "effective_route": route, "effective_argv": route.split(), "requested_route": route, "started_at": finished - 50,
         "finished_at": finished, "exit_code": 0 if status == "done" else 1,
-        "worker": {"pid": 1, "capabilities": [], "source": {"root": "/src", "commit": commit, "dirty": False}},
+        "worker": {"pid": 1, "capabilities": [], "commit": commit, "source_root": "/src", "git_dirty": False},
         "input_artifact": {"path": input_path, "sha256": sha(input_bytes), "size_bytes": len(input_bytes)} if input_bytes is not None else None,
         "artifact_manifest": manifest or None,
     }))
@@ -178,3 +178,163 @@ class TestCLI:
         chain(queue_dir)
         rc, out, err = self.run(queue_dir, "nope")
         assert rc == 1 and "no receipt" in err and "Traceback" not in err
+
+
+class TestMatchingIsTruthful:
+    """Findings from the wrong-object assessment: a digest match must not override a recorded path,
+    a producer must have finished before its consumer started, ambiguity must be visible,
+    gc-only reconstruction must not invent per-job inputs, and a reused output directory
+    must not merge old and new producers."""
+
+    def test_digest_collision_with_a_later_job_does_not_displace_the_path_producer(self, queue_dir):
+        ids = chain(queue_dir)
+        # an unrelated job finishes AFTER C started, with an artifact whose bytes equal C's input
+        late = job(queue_dir, job_type="edit", agent="lane-z", input_path="/elsewhere/z.png", input_bytes=b"Z",
+                   outputs={"copy.png": b"PNG-B"}, name="late-copy", finished=NOW - 100)
+        g = lin.lineage(queue_dir, ids["c"])
+        subject_input = g["subject"]["inputs"][0]
+        assert subject_input["producer"] == ids["b"]
+        assert subject_input["producer_basis"] == "artifact-path+sha256"
+        rejected = {c["job_id"]: c for c in subject_input["candidates"]}
+        assert rejected[late]["accepted"] is False and "after" in rejected[late]["reason"]
+        assert late not in [n["job_id"] for n in g["nodes"] if n["relation"] == "ancestor"]
+
+    def test_equal_bytes_from_two_valid_producers_is_marked_ambiguous_not_guessed(self, queue_dir):
+        ids = chain(queue_dir)
+        # a second legitimate producer of identical bytes that finished before C started, with no path relation
+        twin = job(queue_dir, job_type="render", agent="lane-t", input_path="/elsewhere/t.png", input_bytes=b"T",
+                   outputs={"front.png": b"PNG-B"}, name="twin-render", finished=NOW - 1500)
+        g = lin.lineage(queue_dir, ids["c"])
+        subject_input = g["subject"]["inputs"][0]
+        assert subject_input["producer"] == ids["b"]          # the recorded path wins
+        assert subject_input["ambiguous"] is True
+        assert {c["job_id"] for c in subject_input["candidates"] if c["accepted"]} == {ids["b"], twin}
+        edges = {(e["from"], e["to"]): e for e in g["edges"]}
+        assert edges[(ids["b"], ids["c"])]["basis"] == "artifact-path+sha256"
+        assert edges[(twin, ids["c"])]["basis"] == "sha256" and edges[(twin, ids["c"])]["ambiguous"] is True
+
+    def test_gc_only_reconstruction_does_not_invent_per_job_inputs(self, queue_dir):
+        import shutil
+        ids = chain(queue_dir)
+        # two jobs shared one output directory; gc kept a flattened list of both inputs
+        second = job(queue_dir, job_type="mesh", agent="lane-a", input_path="/other/plate2.png", input_bytes=b"PLATE2",
+                     outputs={"mesh2.glb": b"MESH-A2"}, name="skull-mesh", finished=NOW - 2900)
+        rdir = queue_dir / "gc-receipts" / "e2"
+        rdir.mkdir(parents=True)
+        (rdir / "skull-mesh.json").write_text(json.dumps({
+            "schema": "gpu-greenroom.gc-receipt.v1", "epoch": "e2", "name": "skull-mesh", "path": str(queue_dir / "outputs" / "skull-mesh"),
+            "job_ids": [ids["a"], second], "deleted_at": NOW - 10, "applied_by": "ops",
+            "artifact_manifest": [{"path": "mesh.glb", "sha256": sha(b"MESH-A"), "size_bytes": 6}, {"path": "mesh2.glb", "sha256": sha(b"MESH-A2"), "size_bytes": 7}],
+            "input_artifacts": [{"path": str(ids["plate"]), "sha256": sha(b"PLATE"), "size_bytes": 5}, {"path": "/other/plate2.png", "sha256": sha(b"PLATE2"), "size_bytes": 6}],
+        }))
+        shutil.rmtree(queue_dir / "outputs" / "skull-mesh")
+        shutil.rmtree(queue_dir / "done" / ids["a"])
+        shutil.rmtree(queue_dir / "done" / second)
+        g = lin.lineage(queue_dir, ids["b"])
+        a = [n for n in g["nodes"] if n["job_id"] == ids["a"]][0]
+        assert a["record_source"] == "gc-receipt"
+        assert all(i["basis"] == "gc-receipt-shared" for i in a["inputs"])   # attributed to the directory, not to this job
+        assert a["inputs_attribution"] == "shared-across-2-jobs"
+
+    def test_reused_output_directory_after_gc_does_not_merge_producers(self, queue_dir):
+        ids = chain(queue_dir)
+        # a later job reuses the name skull-render after B; C consumed B's bytes before that job existed
+        later = job(queue_dir, job_type="render", agent="lane-n", input_path="/elsewhere/n.png", input_bytes=b"N",
+                    outputs={"front.png": b"PNG-NEW"}, name="skull-render", finished=NOW - 50)
+        g = lin.lineage(queue_dir, ids["c"])
+        ancestors = [n["job_id"] for n in g["nodes"] if n["relation"] == "ancestor"]
+        assert ids["b"] in ancestors and later not in ancestors
+        g2 = lin.lineage(queue_dir, later)
+        assert ids["c"] not in [n["job_id"] for n in g2["nodes"]]   # C did not consume the new job's output
+
+    def test_coverage_limits_are_stated_in_the_graph(self, queue_dir):
+        ids = chain(queue_dir)
+        g = lin.lineage(queue_dir, ids["c"])
+        assert "one input_path" in " ".join(g["limits"]) and "argv" in " ".join(g["limits"])
+
+
+class TestRealWorkerReceipts:
+    """Receipts written by the real worker, not by hand."""
+
+    def _run(self, queue_dir, job_types, request):
+        from gpu_queue.queue import GPUQueue
+        q = GPUQueue(queue_dir)
+        q.submit(request)
+        assert q.run_one(job_types) is True
+
+    def test_chain_through_the_real_worker_shows_worker_commit_and_labels_edges_truthfully(self, queue_dir, tmp_path):
+        from gpu_queue.models import JobRequest
+        from gpu_queue.queue import worker_identity
+        writer = ("import pathlib, sys; out = pathlib.Path(sys.argv[1]); out.mkdir(parents=True, exist_ok=True); "
+                  "(out / 'mesh.glb').write_bytes(b'MESH')")
+        reader = ("import pathlib, sys; out = pathlib.Path(sys.argv[2]); out.mkdir(parents=True, exist_ok=True); "
+                  "(out / 'view.png').write_bytes(pathlib.Path(sys.argv[1]).read_bytes() + b'-VIEW')")
+        job_types = {
+            "mesh": {"cmd": [sys.executable, "-c", writer, "{output_dir}"], "artifact_manifest": ["mesh.glb"]},
+            "render": {"cmd": [sys.executable, "-c", reader, "{input_path}", "{output_dir}"], "artifact_manifest": ["view.png"]},
+        }
+        mesh_out = queue_dir / "outputs" / "real-mesh"
+        a = JobRequest(job_type="mesh", input_path=str(tmp_path / "plate.png"), output_dir=str(mesh_out), agent_id="lane-a")
+        (tmp_path / "plate.png").write_bytes(b"PLATE")
+        self._run(queue_dir, job_types, a)
+        b = JobRequest(job_type="render", input_path=str(mesh_out / "mesh.glb"), output_dir=str(queue_dir / "outputs" / "real-render"), agent_id="lane-b")
+        self._run(queue_dir, job_types, b)
+
+        g = lin.lineage(queue_dir, b.job_id)
+
+        assert g["subject"]["worker_commit"] == worker_identity()["commit"]
+        assert g["subject"]["worker_commit"], "the worker records its commit; lineage must show it"
+        anc = [n for n in g["nodes"] if n["relation"] == "ancestor"]
+        assert [n["job_id"] for n in anc] == [a.job_id]
+        edge = [e for e in g["edges"] if e["from"] == a.job_id and e["to"] == b.job_id][0]
+        assert edge["basis"] == "artifact-path"          # no attestation was configured, so no input digest exists
+        assert edge["via"].startswith("artifact-path:")
+        assert g["subject"]["inputs"][0]["sha256"] is None and g["subject"]["inputs"][0]["digest_recorded"] is False
+        text = lin.render_text(g)
+        assert "worker commit" in text and "no digest recorded" in text and "artifact-path" in text
+
+    def test_contradicting_recorded_digest_draws_no_edge(self, queue_dir):
+        ids = chain(queue_dir)
+        # tamper C's recorded input digest so it no longer matches what B recorded for that path
+        jd = queue_dir / "done" / ids["c"]
+        r = json.loads((jd / "receipt.json").read_text())
+        r["input_artifact"]["sha256"] = "ff" * 32
+        (jd / "receipt.json").write_text(json.dumps(r))
+        g = lin.lineage(queue_dir, ids["c"])
+        assert [n["job_id"] for n in g["nodes"] if n["relation"] == "ancestor"] == []
+        inp = g["subject"]["inputs"][0]
+        assert inp["producer"] is None and any(c["reason"].startswith("digest contradicts") for c in inp["candidates"])
+
+    def test_relative_recorded_paths_are_marked_and_never_resolved(self, queue_dir, monkeypatch):
+        ids = chain(queue_dir)
+        jd = queue_dir / "done" / ids["c"]
+        for name in ("receipt.json", "status.json", "request.json"):
+            doc = json.loads((jd / name).read_text())
+            doc["input_path"] = "front.png"
+            (jd / name).write_text(json.dumps(doc))
+        monkeypatch.chdir(queue_dir / "outputs" / "skull-render")   # the file exists here by name
+        g = lin.lineage(queue_dir, ids["c"])
+        inp = g["subject"]["inputs"][0]
+        assert inp["relative"] is True and inp["producer"] is None and inp["candidates"] == []
+
+    def test_unconfirmed_deletion_is_shown_as_unconfirmed(self, queue_dir):
+        ids = chain(queue_dir)
+        rdir = queue_dir / "gc-receipts" / "e3"
+        rdir.mkdir(parents=True)
+        (rdir / "skull-mesh.json").write_text(json.dumps({
+            "schema": "gpu-greenroom.gc-receipt.v1", "epoch": "e3", "name": "skull-mesh", "path": str(queue_dir / "outputs" / "skull-mesh"),
+            "job_ids": [ids["a"]], "artifact_manifest": [{"path": "mesh.glb", "sha256": sha(b"MESH-A"), "size_bytes": 6}],
+            "deleted_at": None, "partial": True, "error": "simulated", "applied_by": "ops",
+        }))
+        g = lin.lineage(queue_dir, ids["b"])
+        a = [n for n in g["nodes"] if n["job_id"] == ids["a"]][0]
+        assert a["deleted"] is False and a["deletion"] == "partial" and a["deleted_by_epoch"] == "e3"
+        assert "deletion partial" in lin.render_text(g)
+
+    def test_ambiguous_subject_resolution_is_reported(self, queue_dir):
+        ids = chain(queue_dir)
+        twin = job(queue_dir, job_type="render", agent="lane-t", input_path="/elsewhere/t.png", input_bytes=b"T",
+                   outputs={"front.png": b"PNG-B"}, name="twin-render", finished=NOW - 1500)
+        m = lin.resolve_subject(queue_dir, sha(b"PNG-B"))
+        assert m["ambiguous"] is True and set(m["candidates"]) == {ids["b"], twin}
+        assert m["job_id"] == twin          # the most recently finished candidate is primary (twin finished after B)

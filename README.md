@@ -226,12 +226,14 @@ one machine's queue reached 314 GiB, 93 percent of it older than 30 days,
 before anyone had to decide.
 
 **Lineage walks receipts, not files.** `gpu-greenroom lineage <artifact,
-digest, or job id>` follows input digests backward to the jobs that
-produced them and output digests forward to the jobs that consumed them,
-showing each job's route, worker commit, owner, and artifact digests. A
-directory that retention already collected still appears, marked as
-deleted, because its gc receipt kept the job ids and digests. Bytes may be
-gone; the graph is not.
+digest, or job id>` reconstructs producers and consumers from what the
+receipts recorded and labels every edge with its evidence: a recorded
+artifact path, an output directory, or a digest where the job type
+attested its input. A producer that finished after its consumer started
+is rejected, equal bytes from two producers are shown as ambiguous rather
+than guessed, and a directory retention already collected still appears
+through its gc receipt. Deleting bytes does not delete what the receipts
+recorded, and lineage shows exactly what they recorded, no more.
 
 **Substitution is single-pass and injection-safe.** Templates are lists,
 not shell strings. A param value containing `{input_path}` stays literal.

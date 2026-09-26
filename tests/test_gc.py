@@ -768,3 +768,22 @@ class TestGraduationUnderHold:
         later = {r["name"]: r for r in gc_mod.scan(queue_dir, load_job_types(queue_dir), now=NOW + 4 * DAY)}["old-legacy"]
 
         assert later["class_source"] == "graduated" and later["candidate"] and later["reason"] == "graduated"
+
+
+class TestReceiptsKeepPerJobManifests:
+    def test_gc_receipt_records_which_job_produced_which_artifact(self, queue_dir):
+        import os
+        out = make_output(queue_dir, "shared-dir", job_type="trace", agent="lane-a", finished_days_ago=45, manifest=True)
+        second = add_job(queue_dir, out, job_type="trace", agent="lane-a", finished_at=NOW - 44 * DAY)
+        jd = queue_dir / "done" / second
+        r = {"job_id": second, "job_type": "trace", "status": "done", "output_dir": str(out), "finished_at": NOW - 44 * DAY,
+             "artifact_manifest": [{"path": "second.bin", "sha256": "cd" * 32, "size_bytes": 3}], "input_artifact": {"path": "/in2.png", "sha256": "ef" * 32, "size_bytes": 1}}
+        (jd / "receipt.json").write_text(json.dumps(r))
+        os.utime(out, (NOW - 45 * DAY, NOW - 45 * DAY))
+        cand = candidates(queue_dir)
+        gc_mod.apply(queue_dir, epoch=cand["epoch"], owner="ops", now=NOW + 4 * DAY)
+        receipt = json.loads((queue_dir / "gc-receipts" / cand["epoch"] / "shared-dir.json").read_text())
+        by_job = receipt["artifact_manifest_by_job"]
+        assert set(by_job) == set(receipt["job_ids"]) and by_job[second][0]["sha256"] == "cd" * 32
+        assert receipt["input_artifacts_by_job"][second]["sha256"] == "ef" * 32
+        assert len(receipt["artifact_manifest"]) == 2   # the flattened list stays for readers that expect it

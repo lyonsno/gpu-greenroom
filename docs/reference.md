@@ -203,7 +203,7 @@ with a status record and no receipt. `status` is `done`, `failed`, or
   "request_path": "/queue/done/ab8647e17eb0/request.json",
   "stdout_path": "/queue/done/ab8647e17eb0/stdout.log",
   "stderr_path": "/queue/done/ab8647e17eb0/stderr.log",
-  "worker": {"pid": 89531, "capabilities": ["structured-command.v1"], "source": {"…": "…"}},
+  "worker": {"pid": 89531, "capabilities": ["structured-command.v1"], "commit": "9c23d12…", "source_root": "/path/to/gpu-greenroom", "git_dirty": false},
   "input_artifact": {"path": "/inputs/skull.png", "sha256": "…", "size_bytes": 412331},
   "source_attestation": {"mode": "git-clean-input", "root": "/inputs", "commit": "…", "clean_before": true, "clean_after": true, "…": "…"},
   "runtime_identity": {"command": ["…"], "exit_code": 0, "stdout": "Device(gpu, 0)\n", "stderr": "", "executable": {"path": "…", "sha256": "…", "size_bytes": 0}},
@@ -424,19 +424,45 @@ clobbered, and the same epoch cannot be applied twice.
 ## Lineage
 
 `lineage` resolves its subject as a job id, a 64-hex sha256 digest, or a
-path. A path matches an artifact recorded in a receipt (by exact path or by
-being inside a recorded `output_dir`); if it names a file that exists, its
-content is hashed and matched by digest, so a copy of an artifact resolves
-too. Ancestors are found from each job's recorded input by digest first
-(`input_artifact.sha256` against every `artifact_manifest`) and by path
-second; descendants the same way in reverse. Records come from
-`done/`, `failed/`, `cancelled/`, `running/`, and `pending/` job dirs, and
-from `gc-receipts/*/*.json`, so a collected directory still appears with
-`deleted: true` and its `deleted_by_epoch`; a job whose record is gone
-entirely is reconstructed from the gc receipt alone (`record_source`
-`gc-receipt`). Output: `gpu-greenroom.lineage.v1` JSON (`subject`,
-`subject_matched_by`, `nodes` with `relation` and `depth`, `edges` with
-`via` as `sha256:` or `path:`), or a text tree.
+path. A path matches a recorded artifact exactly, or a recorded output
+directory by containment; a path that names an existing file is also
+hashed and matched by content. When more than one job matches, the most
+recently finished is primary and the result says `subject_ambiguous` with
+every candidate.
+
+Records come from `done/`, `failed/`, `cancelled/`, `running/`, and
+`pending/` job dirs and from `gc-receipts/*/*.json`. Each job record
+carries one `input_path` (inputs passed through argv or params are not
+seen), an input digest only when the job type configured
+`source_attestation`, and artifact digests only when it configured
+`artifact_manifest`. The worker's `commit` and `source_root` come from the
+receipt's `worker` object.
+
+For each input, candidate producers are every job whose recorded artifact
+path equals the input (`artifact-path`), whose recorded output directory
+contains it (`output-dir`, longest match), or whose recorded artifact
+digest equals the input's recorded digest (`sha256`). A candidate is
+rejected when it finished after the consumer started, or when the input's
+recorded digest contradicts the producer's recorded digest for that path.
+Among accepted candidates the strongest basis wins (`artifact-path` over
+`output-dir` over `sha256` alone), then the most recent; when more than one
+is accepted the input and its edges are marked `ambiguous` and all are
+shown. Relative recorded paths are shown and never matched.
+
+A gc receipt marks its jobs `deletion` `confirmed`, `partial`, or
+`unconfirmed`; `deleted` is true only when confirmed. Since the per-job
+manifest change, gc receipts carry `artifact_manifest_by_job` and
+`input_artifacts_by_job`; older receipts shared by several jobs attribute
+artifacts and inputs to the directory (`attribution` `gc-receipt-shared`),
+which never enters the digest index. A job whose record is gone entirely is
+reconstructed from the gc receipt alone (`record_source` `gc-receipt`).
+
+Output: `gpu-greenroom.lineage.v1` JSON (`subject`, `subject_matched_by`,
+`subject_ambiguous`, `subject_candidates`, `nodes` with `relation` and
+`depth`, `edges` with `via`, `basis`, and `ambiguous`, and `limits`), or a
+text tree that prints each input with its digest or "no digest recorded",
+its producer and basis, rejected candidates with reasons, and deletion
+state.
 
 ## Reviewing a new job type
 

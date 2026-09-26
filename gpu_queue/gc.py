@@ -623,6 +623,8 @@ def apply(queue_dir, *, epoch: str, owner: str, now: float, job_types: dict | No
                 continue
             manifests = [m for r in recs for m in (r.get("artifact_manifest") or [])]
             inputs = [r["input_artifact"] for r in recs if r.get("input_artifact")]
+            manifests_by_job = {r["job_id"]: r["artifact_manifest"] for r in recs if r.get("artifact_manifest")}
+            inputs_by_job = {r["job_id"]: r["input_artifact"] for r in recs if r.get("input_artifact")}
             size = _dir_size(target)
             receipt = {
                 "schema": RECEIPT_SCHEMA,
@@ -642,6 +644,8 @@ def apply(queue_dir, *, epoch: str, owner: str, now: float, job_types: dict | No
                 "snapshot": row.get("snapshot"),
                 "artifact_manifest": manifests or None,
                 "input_artifacts": inputs or None,
+                "artifact_manifest_by_job": manifests_by_job or None,
+                "input_artifacts_by_job": inputs_by_job or None,
                 "written_at": time.time(),
                 "deleted_at": None,
                 "partial": False,
