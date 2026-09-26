@@ -98,6 +98,25 @@ class TestTornMovesTheWorkerLeaves:
         assert r.duplicates == ["done"] and r.nested is False
 
 
+    def test_a_torn_record_still_outranks_an_empty_husk_and_stays_reported(self, queue_dir, tmp_path):
+        rq = RealQueue(queue_dir)
+        (tmp_path / "in.png").write_bytes(b"IN")
+        f = rq.run_failing(tmp_path / "in.png", queue_dir / "outputs" / "broken")
+        for name in ("request.json", "status.json", "receipt.json"):
+            (queue_dir / "failed" / f / name).write_text("{")               # every record file torn (the worst the writer could leave)
+        (queue_dir / "done" / f).mkdir()                                     # and a husk beside it
+        r = rec.load_job_records(queue_dir)[f]
+        assert r.state_dir == "failed" and sorted(r.unreadable) == ["receipt.json", "request.json", "status.json"] and r.duplicates == ["done"]
+
+    def test_a_torn_file_in_the_preferred_copy_is_not_silenced_by_a_fuller_other_copy(self, queue_dir):
+        _job_dir(queue_dir, "done", "j5", {"status": "done", "started_at": 10.0, "finished_at": 20.0})
+        (queue_dir / "done" / "j5" / "receipt.json").write_text("{")
+        d = _job_dir(queue_dir, "failed", "j5", {"status": "failed", "started_at": 10.0, "finished_at": 20.0})
+        (d / "receipt.json").write_text(json.dumps({"job_id": "j5"}))
+        r = rec.load_job_records(queue_dir)["j5"]
+        assert r.state_dir == "done" and r.unreadable == ["receipt.json"]    # three files each; done outranks failed; the torn file is reported
+
+
 class TestGcReceipts:
     def test_deletions_merge_to_the_earliest_confirmed_and_a_later_receipt_never_downgrades_them(self, queue_dir, tmp_path):
         rq = RealQueue(queue_dir)

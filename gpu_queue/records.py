@@ -8,8 +8,9 @@ through this module for file loading, state-directory precedence and deletion me
 field precedence inside a record stays with each reader (the collector reads status.json
 first for output_dir and finished_at, lineage reads the receipt first). Torn files are
 reported, never trusted. A job id found in two state directories resolves to the copy that
-carries the most record files, then to the one furthest along (done over failed over
-cancelled over running over pending); an empty husk never outranks a record. When the
+carries the most record files (parsed or torn), then to the one furthest along (done over
+failed over cancelled over running over pending); an empty husk never outranks a record,
+and a torn file in the winning copy is still reported. When the
 worker moved a job into a destination directory that already existed, the record sits
 nested one level down (``done/<id>/<id>/``); that copy is read and marked ``nested``.
 """
@@ -55,7 +56,12 @@ class JobRecord:
     duplicates: list[str] = field(default_factory=list)    # other state dirs holding this job id, lost to precedence
     record_dir: Path | None = None                         # the directory the record files were read from
     nested: bool = False                                   # the record sat at <state>/<id>/<id>/ (moved into an existing directory)
-    present: int = 0                                       # how many of request/status/receipt were found (0 = an empty husk)
+    present: int = 0                                       # how many of request/status/receipt parsed
+
+    @property
+    def files(self) -> int:
+        """Record files found, parsed or torn; 0 is an empty husk. Ranking uses this so a torn copy never reads as empty."""
+        return self.present + len(self.unreadable)
 
     @property
     def terminal(self) -> bool:
@@ -114,7 +120,7 @@ def load_job_records(queue_dir: Path) -> dict[str, JobRecord]:
             prev = out.get(rec.job_id)
             if prev is None:
                 out[rec.job_id] = rec
-            elif (rec.present, _PRECEDENCE[state]) > (prev.present, _PRECEDENCE[prev.state_dir]):
+            elif (rec.files, _PRECEDENCE[state]) > (prev.files, _PRECEDENCE[prev.state_dir]):   # a torn file is still a file
                 rec.duplicates = sorted(prev.duplicates + [prev.state_dir])
                 out[rec.job_id] = rec
             else:
