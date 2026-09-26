@@ -12,6 +12,16 @@ from gpu_queue.queue import GPUQueue
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
+def _without_derived_paths(text: str) -> str:
+    """Strip every path the benchmark matrix derives from its checkout (the repo root and the sibling workspace,
+    or MOGE_WORKSPACE when set), so what remains can be checked for hardcoded home paths."""
+    import os
+    workspace = Path(os.environ.get("MOGE_WORKSPACE", REPO_ROOT.parent))
+    for p in sorted({str(REPO_ROOT), str(workspace)}, key=len, reverse=True):
+        text = text.replace(p, "")
+    return text
+
+
 def _write_dummy_job_types(queue_dir: Path) -> None:
     """Write a fake MoGE benchmark route that can run under GPUQueue."""
     script = (
@@ -81,7 +91,7 @@ def test_matrix_provides_repo_local_benchmark_routes_for_fresh_queue(tmp_path):
     assert str(REPO_ROOT / "benchmarks" / "bench_mlx.py") in encoded
     assert str(REPO_ROOT / "benchmarks" / "bench_pytorch.py") in encoded
     assert str(REPO_ROOT / "benchmarks" / "moge_webgpu.sh") in encoded
-    assert "/Users/" not in encoded.replace(str(REPO_ROOT), "")   # only the resolved repo root, never a hardcoded home path
+    assert str(Path.home()) not in _without_derived_paths(encoded)   # never a hardcoded home path
 
 
 def test_webgpu_route_and_wrapper_receive_matrix_image(tmp_path):
@@ -145,7 +155,7 @@ def test_job_types_example_does_not_ship_stale_moge_benchmark_paths():
     assert "moge-bench-mlx" not in config
     assert "moge-bench-pytorch" not in config
     assert "moge-bench-webgpu" not in config
-    assert "/Users/" not in json.dumps(config).replace(str(REPO_ROOT), "")
+    assert str(Path.home()) not in _without_derived_paths(json.dumps(config))
 
 
 def test_collect_receipt_uses_active_queue_dir(tmp_path, monkeypatch):
