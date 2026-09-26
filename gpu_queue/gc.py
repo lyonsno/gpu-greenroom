@@ -380,7 +380,10 @@ def reported_unclassified(queue_dir, *, now: float) -> set[str]:
         if deadline > now:
             continue
         for row in doc.get("rows", []):
-            if row.get("reason") == "unclassified" and row.get("name"):
+            # Key on the recorded class, not the hold reason: an entry reported
+            # unclassified while held (active, active_unknown, pins_unreadable)
+            # still starts its clock; candidacy is re-decided at every scan.
+            if row.get("output_class") == "unclassified" and not row.get("class_source") and row.get("name"):
                 names.add(row["name"])
     return names
 

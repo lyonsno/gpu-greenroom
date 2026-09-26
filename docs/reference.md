@@ -372,7 +372,8 @@ are readable.
 **Graduation.** `unclassified` entries are listed with their size and not
 collected in the cycle that first reports them. Every dry-run is copied to
 `gc-history/<epoch>.json`; once a cycle whose own `apply_not_before` has
-passed lists a name as unclassified, later scans classify it `intermediate`
+passed lists a name with class `unclassified` and no declared source (even
+if that row was held for another reason at the time), later scans classify it `intermediate`
 with `class_source` `graduated` and `reason` `graduated` when past the TTL.
 An entry where some job declared a class and another did not
 (`class_source` `mixed`) never graduates; it stays unclassified until the

@@ -736,3 +736,20 @@ class TestFollowUpAdvisory:
         row = {r["name"]: r for r in gc_mod.scan(queue_dir, jt, now=NOW)}["old-trace"]
         assert row["job_type_refs"] == ["stale-fixture"]
         assert row["candidate"]   # a registered but idle job type is a diagnostic, not a pin
+
+
+class TestGraduationUnderHold:
+    def test_unclassified_entry_held_by_an_unreadable_record_still_starts_its_graduation_clock(self, queue_dir):
+        make_output(queue_dir, "old-legacy", job_type="legacy", agent="lane-z", finished_days_ago=400)
+        torn = queue_dir / "pending" / "p-torn"
+        torn.mkdir()
+        (torn / "request.json").write_text("")
+        first = candidates(queue_dir, now=NOW)
+        row = {r["name"]: r for r in first["rows"]}["old-legacy"]
+        assert row["reason"] == "active_unknown" and row["output_class"] == "unclassified"
+
+        import shutil
+        shutil.rmtree(torn)   # the torn record is cleaned up during the cycle
+        later = {r["name"]: r for r in gc_mod.scan(queue_dir, load_job_types(queue_dir), now=NOW + 4 * DAY)}["old-legacy"]
+
+        assert later["class_source"] == "graduated" and later["candidate"] and later["reason"] == "graduated"
