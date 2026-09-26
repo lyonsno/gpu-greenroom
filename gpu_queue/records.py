@@ -4,8 +4,11 @@ The worker writes ``request.json``, ``status.json`` and ``receipt.json`` under o
 state directories; ``GPUQueue.cancel`` stamps ``finished_at`` on a job that never started;
 the collector re-lists every job that ever wrote under a directory each time it collects
 that directory, so one job accrues several receipts. Every reader of those files goes
-through this module so no reader re-derives the shape on its own. Torn files are reported,
-never trusted; a job id found in two state directories resolves to the copy furthest along.
+through this module for file loading, state-directory precedence and deletion merging;
+field precedence inside a record stays with each reader (the collector reads status.json
+first for output_dir and finished_at, lineage reads the receipt first). Torn files are
+reported, never trusted; a job id found in two state directories resolves to the copy
+furthest along (done over failed over cancelled over running over pending).
 """
 from __future__ import annotations
 
@@ -15,7 +18,7 @@ from pathlib import Path
 
 STATE_DIRS = ("pending", "running", "done", "failed", "cancelled")   # the JobStatus values, in lifecycle order
 TERMINAL = ("done", "failed", "cancelled")
-_PRECEDENCE = {"pending": 1, "running": 2, "done": 3, "failed": 3, "cancelled": 3}
+_PRECEDENCE = {"pending": 1, "running": 2, "cancelled": 3, "failed": 4, "done": 5}
 RECEIPT_SCHEMA = "gpu-greenroom.gc-receipt.v1"
 
 
@@ -25,7 +28,7 @@ def read_json(path: Path) -> tuple[dict | None, bool]:
         text = path.read_text()
     except FileNotFoundError:
         return None, False
-    except OSError:
+    except (OSError, ValueError):          # ValueError covers UnicodeDecodeError: bytes that are not text are a torn file too
         return None, True
     try:
         doc = json.loads(text)
@@ -126,6 +129,7 @@ class GcReceipt:
     path: str | None
     job_ids: list[str]
     deleted_at: float | None
+    written_at: float | None
     partial: bool
     owner: str | None
     artifact_manifest: list[dict]
@@ -166,7 +170,7 @@ def load_gc_receipts(queue_dir: Path) -> tuple[list[GcReceipt], list[str]]:
         receipts.append(GcReceipt(
             epoch=str(doc.get("epoch")), name=str(doc.get("name")), path=doc.get("path") if isinstance(doc.get("path"), str) else None,
             job_ids=[j for j in (doc.get("job_ids") or []) if isinstance(j, str)],
-            deleted_at=_num(doc.get("deleted_at")), partial=bool(doc.get("partial")),
+            deleted_at=_num(doc.get("deleted_at")), written_at=_num(doc.get("written_at")), partial=bool(doc.get("partial")),
             owner=doc.get("owner") if isinstance(doc.get("owner"), str) else None,
             artifact_manifest=[m for m in (doc.get("artifact_manifest") or []) if isinstance(m, dict) and m.get("sha256")],
             input_artifacts=[i for i in (doc.get("input_artifacts") or []) if isinstance(i, dict) and i.get("path")],
@@ -174,30 +178,43 @@ def load_gc_receipts(queue_dir: Path) -> tuple[list[GcReceipt], list[str]]:
             input_artifacts_by_job=doc.get("input_artifacts_by_job") if isinstance(doc.get("input_artifacts_by_job"), dict) else None,
             source=str(path),
         ))
-    receipts.sort(key=lambda r: (r.deleted_at if r.deleted_at is not None else float("inf"), r.epoch, r.name))
+    receipts.sort(key=_receipt_order)
     return receipts, sorted(unreadable)
+
+
+def _receipt_order(r: "GcReceipt"):
+    """Confirmed deletions first by deletion time, then the rest by the time they were written; names break ties."""
+    inf = float("inf")
+    return (0 if r.deleted_at is not None else 1, r.deleted_at if r.deleted_at is not None else inf,
+            r.written_at if r.written_at is not None else inf, r.epoch, r.name)
 
 
 @dataclass
 class Deletion:
     deleted_at: float | None = None      # the earliest confirmed deletion of this job's bytes
-    epoch: str | None = None             # the epoch of that deletion (or the first epoch that listed the job, if none confirmed)
+    epoch: str | None = None             # the epoch of that deletion; without one, the first partial receipt in time, else the first receipt in time
     deletion: str = "unconfirmed"
-    epochs: list[str] = field(default_factory=list)   # every epoch whose receipt lists the job
+    epochs: list[str] = field(default_factory=list)   # every epoch whose receipt lists the job, confirmed deletions first, then by time written
 
 
 def deletions_by_job(receipts: list[GcReceipt]) -> dict[str, Deletion]:
-    """Merge receipts per job: the earliest confirmed deletion governs; a later partial or unconfirmed receipt never downgrades it."""
+    """Merge receipts per job. The earliest confirmed deletion governs and a later partial or unconfirmed receipt never
+    downgrades it. Without a confirmed deletion, a partial receipt outranks an unconfirmed one and the epoch named is the
+    first partial receipt in time; with only unconfirmed receipts it is the first written."""
     out: dict[str, Deletion] = {}
-    for r in sorted(receipts, key=lambda r: (r.deleted_at if r.deleted_at is not None else float("inf"), r.epoch, r.name)):
+    for r in sorted(receipts, key=_receipt_order):
         for job_id in r.job_ids:
             d = out.setdefault(job_id, Deletion())
             if r.epoch not in d.epochs:
                 d.epochs.append(r.epoch)
-            if r.confirmed and (d.deleted_at is None or r.deleted_at < d.deleted_at):
-                d.deleted_at, d.epoch, d.deletion = r.deleted_at, r.epoch, "confirmed"
-            elif not r.confirmed and d.deletion != "confirmed":
-                if r.partial:
-                    d.deletion = "partial"
-                d.epoch = d.epoch or r.epoch
+            if r.confirmed:
+                if d.deleted_at is None or r.deleted_at < d.deleted_at:
+                    d.deleted_at, d.epoch, d.deletion = r.deleted_at, r.epoch, "confirmed"
+            elif d.deletion == "confirmed":
+                continue
+            elif r.partial:
+                if d.deletion != "partial":
+                    d.deletion, d.epoch = "partial", r.epoch
+            elif d.epoch is None:
+                d.epoch = r.epoch
     return out

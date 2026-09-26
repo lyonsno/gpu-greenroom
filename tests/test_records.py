@@ -37,6 +37,20 @@ class TestJobRecords:
             assert r.state_dir == "done" and r.status == "done" and r.finished_at == 20.0
             assert r.duplicates == ["running"]
 
+    def test_two_terminal_copies_resolve_by_lifecycle_order_and_report_the_other(self, queue_dir, monkeypatch):
+        _job_dir(queue_dir, "failed", "j3", {"status": "failed", "started_at": 10.0, "finished_at": 20.0})
+        _job_dir(queue_dir, "done", "j3", {"status": "done", "started_at": 10.0, "finished_at": 21.0})
+        for order in (rec.STATE_DIRS, tuple(reversed(rec.STATE_DIRS))):
+            monkeypatch.setattr(rec, "STATE_DIRS", order)
+            r = rec.load_job_records(queue_dir)["j3"]
+            assert r.state_dir == "done" and r.duplicates == ["failed"]     # done outranks failed outranks cancelled, whatever the walk
+
+    def test_a_record_file_that_is_not_utf8_is_unreadable_not_a_crash(self, queue_dir):
+        d = _job_dir(queue_dir, "done", "j4", {"status": "done", "started_at": 10.0, "finished_at": 20.0})
+        (d / "receipt.json").write_bytes(b'{"x": "\xe2\x82')
+        r = rec.load_job_records(queue_dir)["j4"]
+        assert r.unreadable == ["receipt.json"] and r.finished_at == 20.0
+
     def test_a_record_file_that_exists_but_does_not_parse_is_flagged_not_trusted(self, queue_dir):
         d = _job_dir(queue_dir, "done", "j2", {"status": "done", "started_at": 10.0, "finished_at": 20.0})
         (d / "receipt.json").write_text("{")           # torn write
@@ -78,6 +92,20 @@ class TestGcReceipts:
             assert d[a].deleted_at == r1["deleted_at"] and d[a].epoch == r1["epoch"] and d[a].deletion == "confirmed"
             assert sorted(d[a].epochs) == sorted([r1["epoch"], r2["epoch"], "e3"])
             assert d[a2].deleted_at == r2["deleted_at"] and d[a2].epoch == r2["epoch"]
+
+    def test_unconfirmed_deletions_take_the_epoch_written_first_in_time_and_partial_names_a_partial_epoch(self, queue_dir):
+        def receipt(epoch, written_at, partial):
+            (queue_dir / "gc-receipts" / epoch).mkdir(parents=True)
+            (queue_dir / "gc-receipts" / epoch / "m.json").write_text(json.dumps({
+                "schema": "gpu-greenroom.gc-receipt.v1", "epoch": epoch, "name": "m", "path": str(queue_dir / "outputs" / "m"),
+                "job_ids": ["a"], "deleted_at": None, "partial": partial, "written_at": written_at}))
+        receipt("ffff", 100.0, True)      # the partial one, written first in time, lexically last
+        receipt("0000", 200.0, False)     # unconfirmed, written later, lexically first
+        receipts, _ = rec.load_gc_receipts(queue_dir)
+        for order in (receipts, list(reversed(receipts))):
+            d = rec.deletions_by_job(order)["a"]
+            assert d.deletion == "partial" and d.epoch == "ffff" and d.deleted_at is None
+            assert d.epochs == ["ffff", "0000"]                       # in the order the receipts were written
 
     def test_a_torn_receipt_is_reported_as_unreadable_and_skipped(self, queue_dir):
         (queue_dir / "gc-receipts" / "e1").mkdir(parents=True)

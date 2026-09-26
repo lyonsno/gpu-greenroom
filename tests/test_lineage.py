@@ -477,8 +477,8 @@ class TestRevisionThree:
 class TestSharedRecords:
     """Lineage reads records through the shared loader: deterministic deletions, untrusted torn records, resolved duplicates."""
 
-    @pytest.mark.parametrize("order", ["forward", "reverse"])
-    def test_a_directory_collected_twice_gives_one_answer_whatever_order_receipts_load(self, queue_dir, tmp_path, monkeypatch, order):
+    @pytest.mark.parametrize("last", ["first-collection", "second-collection"])
+    def test_a_directory_collected_twice_gives_one_answer_whichever_receipt_loads_last(self, queue_dir, tmp_path, monkeypatch, last):
         rq = RealQueue(queue_dir)
         (tmp_path / "in.png").write_bytes(b"IN")
         m = queue_dir / "outputs" / "m"
@@ -487,10 +487,11 @@ class TestSharedRecords:
         a2 = rq.run("mesh", tmp_path / "in.png", m, agent="lane-a2")          # same bytes: only deletion time can separate A from A2
         c = rq.run("render", m / "mesh.glb", queue_dir / "outputs" / "r", agent="lane-c")
         r2 = rq.collect("m")                                                    # re-lists A with a later deleted_at
+        last_epoch = r1["epoch"] if last == "first-collection" else r2["epoch"]
         real_glob = Path.glob
         def ordered(self, pattern):
-            found = sorted(real_glob(self, pattern))
-            return iter(found if order == "forward" else list(reversed(found)))
+            found = list(real_glob(self, pattern))
+            return iter(sorted(found, key=lambda p: (last_epoch in str(p), str(p))))   # the chosen receipt loads last, by identity not by chance
         monkeypatch.setattr(Path, "glob", ordered)
 
         g = lin.lineage(queue_dir, c)
@@ -501,6 +502,37 @@ class TestSharedRecords:
         na = lin.lineage(queue_dir, a)["subject"]
         assert na["deleted_by_epoch"] == r1["epoch"] and na["deleted_at"] == r1["deleted_at"]
         assert sorted(na["deleted_by_epochs"]) == sorted([r1["epoch"], r2["epoch"]])
+
+    def test_a_deleted_node_renders_its_deletion_once(self, queue_dir, tmp_path):
+        rq = RealQueue(queue_dir)
+        (tmp_path / "in.png").write_bytes(b"IN")
+        a = rq.run("mesh", tmp_path / "in.png", queue_dir / "outputs" / "m", agent="lane-a")
+        rq.collect("m")
+        lines = [l for l in lin.render_text(lin.lineage(queue_dir, a)).splitlines() if l.strip().startswith(("deleted by", "deletion "))]
+        assert len(lines) == 1 and "deleted by gc epoch" in lines[0]
+
+    def test_a_partial_deletion_still_renders_when_the_record_is_also_torn_across_dirs(self, queue_dir):
+        import shutil
+        ids = chain(queue_dir)
+        (queue_dir / "gc-receipts" / "e1").mkdir(parents=True)
+        (queue_dir / "gc-receipts" / "e1" / "skull-mesh.json").write_text(json.dumps({
+            "schema": "gpu-greenroom.gc-receipt.v1", "epoch": "e1", "name": "skull-mesh", "path": str(queue_dir / "outputs" / "skull-mesh"),
+            "job_ids": [ids["a"]], "deleted_at": None, "partial": True}))
+        shutil.copytree(queue_dir / "done" / ids["a"], queue_dir / "running" / ids["a"])
+        text = lin.render_text(lin.lineage(queue_dir, ids["a"]))
+        assert "deletion partial (gc epoch e1)" in text and "also found under running/" in text
+
+    def test_a_torn_status_file_the_real_writer_can_leave_is_flagged_and_not_credited(self, queue_dir):
+        ids = chain(queue_dir)
+        (queue_dir / "done" / ids["a"] / "status.json").write_bytes(b'{"status": "done", "fini')   # status.json is the file written non-atomically
+        inp = lin.lineage(queue_dir, ids["b"])["subject"]["inputs"][0]
+        ac = [cnd for cnd in inp["candidates"] if cnd["job_id"] == ids["a"]][0]
+        assert ac["accepted"] is False and "status.json" in ac["reason"]
+
+    def test_a_torn_file_that_is_not_utf8_is_unreadable_not_a_crash(self, queue_dir):
+        ids = chain(queue_dir)
+        (queue_dir / "done" / ids["a"] / "receipt.json").write_bytes(b'{"x": "\xe2\x82')
+        assert lin.lineage(queue_dir, ids["a"])["subject"]["record_unreadable"] == ["receipt.json"]
 
     def test_a_producer_with_a_torn_record_file_is_not_credited(self, queue_dir):
         ids = chain(queue_dir)

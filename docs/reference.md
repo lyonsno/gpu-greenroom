@@ -457,10 +457,13 @@ a job listed by several gc receipts (the collector re-lists every job of a
 directory each time it collects it) takes its earliest confirmed
 `deleted_at` and that epoch, and a later partial or unconfirmed receipt
 never downgrades it; a record file that exists but does not parse marks
-the job `record_unreadable` and it is never credited as a producer; a job
-id found in two state directories (a torn move) is read from the copy
-furthest along and reported as `duplicate_records`. Receipt files that do
-not parse are named in the graph's `limits`.
+the job `record_unreadable` and it is never credited as a producer (bytes
+that are not text count as torn); a job id found in two state directories
+(a torn move) is read from the copy furthest along, done over failed over
+cancelled over running over pending, and reported as `duplicate_records`.
+Without a confirmed deletion, a partial receipt outranks an unconfirmed
+one and the epoch shown is the first partial receipt in time. Receipt
+files that do not parse are named in the graph's `limits`.
 Among accepted candidates the strongest basis wins (`artifact-path` over
 `output-dir` over `sha256` alone), then the most recent; when more than one
 is accepted the input and its edges are marked `ambiguous` and all are

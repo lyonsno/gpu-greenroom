@@ -9,6 +9,7 @@ import sys
 import time
 from pathlib import Path
 
+FAILER = "import sys; sys.exit(3)"
 WRITER = ("import pathlib, sys; out = pathlib.Path(sys.argv[1]); out.mkdir(parents=True, exist_ok=True); "
           "(out / 'mesh.glb').write_bytes(b'MESH')")
 READER = ("import pathlib, sys; out = pathlib.Path(sys.argv[2]); out.mkdir(parents=True, exist_ok=True); "
@@ -24,6 +25,7 @@ class RealQueue:
             "mesh": {"cmd": [sys.executable, "-c", WRITER, "{output_dir}"], "artifact_manifest": ["mesh.glb"], "output_class": "intermediate"},
             "render": {"cmd": [sys.executable, "-c", READER, "{input_path}", "{output_dir}"], "artifact_manifest": ["view.png"],
                        "output_class": "intermediate"},
+            "broken": {"cmd": [sys.executable, "-c", FAILER], "output_class": "intermediate"},
         }
 
     def _request(self, job_type, input_path, output_dir, agent):
@@ -36,6 +38,14 @@ class RealQueue:
         assert self.q.run_one(self.job_types) is True
         return req.job_id
 
+    def run_failing(self, input_path, output_dir, agent: str = "lane") -> str:
+        """A job the worker records as failed (non-zero exit); its record lands in failed/."""
+        req = self._request("broken", input_path, output_dir, agent)
+        self.q.submit(req)
+        assert self.q.run_one(self.job_types) is True
+        assert (self.queue_dir / "failed" / req.job_id).is_dir()
+        return req.job_id
+
     def cancel(self, job_type: str, input_path, output_dir, agent: str = "lane") -> str:
         req = self._request(job_type, input_path, output_dir, agent)
         self.q.submit(req)
@@ -43,7 +53,9 @@ class RealQueue:
         return req.job_id
 
     def collect(self, name: str, owner: str = "ops") -> dict:
-        """Collect outputs/<name> with the real collector (zero TTL, policy clock past the grace window); return its receipt."""
+        """Collect with the real collector (zero TTL for every class, so every eligible entry goes, not only <name>;
+        policy clock past the grace window; the collector stamps deleted_at with the wall clock); return <name>'s receipt.
+        Not covered here: a collection that fails partway (a partial receipt); tests that need one write it by hand."""
         from gpu_queue import gc
         t = time.time() + 60
         rows = gc.scan(self.queue_dir, self.job_types, now=t, ttl_days={"intermediate": 0.0, "witness": 0.0, "final": 0.0})

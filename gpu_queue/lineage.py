@@ -109,7 +109,7 @@ class Records:
             "started_at": None, "finished_at": None, "exit_code": None, "failure_phase": None,
             "output_dir": None, "output_dir_relative": False, "artifacts": [], "inputs": [], "inputs_attribution": "job",
             "record_source": "job-record", "deleted": False, "deletion": None, "deleted_by_epoch": None, "deleted_at": None,
-            "deleted_by_epochs": [], "record_unreadable": [], "duplicate_records": [],
+            "deleted_by_epochs": [], "record_unreadable": [], "duplicate_records": [], "never_started": False,
         }
         base.update(over)
         return base
@@ -140,7 +140,7 @@ class Records:
                 exit_code=receipt.get("exit_code", state.get("exit_code")),
                 failure_phase=receipt.get("failure_phase") or state.get("failure_phase"),
                 output_dir=output_dir, output_dir_relative=out_rel, artifacts=artifacts, inputs=inputs,
-                record_unreadable=list(r.unreadable), duplicate_records=list(r.duplicates),
+                record_unreadable=list(r.unreadable), duplicate_records=list(r.duplicates), never_started=r.never_started,
             )
 
     def _load_gc_receipts(self) -> None:
@@ -269,9 +269,8 @@ class Records:
                 accepted, reason = False, f"producer record unreadable ({', '.join(producer['record_unreadable'])}); nothing it says is trusted"
             elif accepted and producer.get("status") in ("pending", "running") and producer.get("record_source") != "gc-receipt":
                 accepted, reason = False, f"producer has not finished (status {producer.get('status')})"
-            elif accepted and producer.get("status") == "cancelled" and producer.get("started_at") is None and producer.get("record_source") != "gc-receipt":
-                # GPUQueue.cancel stamps finished_at on a job that never started; the missing started_at is the fact that matters
-                accepted, reason = False, "producer was cancelled before it started"
+            elif accepted and producer.get("never_started") and producer.get("record_source") != "gc-receipt":
+                accepted, reason = False, "producer was cancelled before it started"   # the shape GPUQueue.cancel writes, judged by records.JobRecord
             elif accepted and producer.get("deleted") and producer.get("deleted_at") is not None and cs is not None and producer["deleted_at"] <= cs:
                 accepted, reason = False, f"producer's bytes were deleted (gc epoch {producer.get('deleted_by_epoch')}) before the consumer started"
             elif accepted and pf is not None and cs is not None and pf > cs:
@@ -435,12 +434,12 @@ def render_text(graph: dict) -> str:
         if n.get("deletion") == "confirmed":
             out.append(f"    deleted by gc epoch {n.get('deleted_by_epoch')}" + (f" at {n['deleted_at']:.0f}" if n.get("deleted_at") is not None else "")
                        + (f" (also listed by {', '.join(e for e in n.get('deleted_by_epochs', []) if e != n.get('deleted_by_epoch'))})" if len(n.get("deleted_by_epochs") or []) > 1 else ""))
+        elif n.get("deletion"):
+            out.append(f"    deletion {n['deletion']} (gc epoch {n.get('deleted_by_epoch')})")
         if n.get("record_unreadable"):
             out.append(f"    record unreadable: {', '.join(n['record_unreadable'])} (not trusted as a producer)")
         if n.get("duplicate_records"):
             out.append(f"    also found under {', '.join(n['duplicate_records'])}/ (torn move; the {n.get('status')} copy is read)")
-        elif n.get("deletion"):
-            out.append(f"    deletion {n['deletion']} (gc epoch {n.get('deleted_by_epoch')})")
         if n.get("record_source") == "gc-receipt":
             out.append("    record from gc receipt only" + (f"; inputs {n['inputs_attribution']}" if n.get("inputs_attribution") != "job" else ""))
         return out
