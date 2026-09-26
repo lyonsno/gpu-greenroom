@@ -459,8 +459,12 @@ directory each time it collects it) takes its earliest confirmed
 never downgrades it; a record file that exists but does not parse marks
 the job `record_unreadable` and it is never credited as a producer (bytes
 that are not text count as torn); a job id found in two state directories
-(a torn move) is read from the copy furthest along, done over failed over
-cancelled over running over pending, and reported as `duplicate_records`.
+(a torn move) is read from the copy with the most record files, then the
+one furthest along (done over failed over cancelled over running over
+pending), and reported as `duplicate_records`; an empty husk never wins.
+When the worker moved a job into a directory that already existed, the
+record sits one level down (`done/<id>/<id>/`); it is read from there and
+the node is marked `nested_record`.
 Without a confirmed deletion, a partial receipt outranks an unconfirmed
 one and the epoch shown is the first partial receipt in time; with only
 unconfirmed receipts it is the first written. Receipt files that do not

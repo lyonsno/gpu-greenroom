@@ -67,6 +67,37 @@ class TestJobRecords:
         assert r.never_started is True
 
 
+class TestTornMovesTheWorkerLeaves:
+    """shutil.move into a destination that already exists nests the job directory inside it (seen on the live queue, four jobs)."""
+
+    def test_a_record_nested_inside_a_pre_existing_destination_is_read_and_outranks_a_receipt_only_copy(self, queue_dir, tmp_path):
+        import shutil
+        rq = RealQueue(queue_dir)
+        (tmp_path / "in.png").write_bytes(b"IN")
+        from gpu_queue.models import JobRequest
+        req = JobRequest(job_type="mesh", input_path=str(tmp_path / "in.png"), output_dir=str(queue_dir / "outputs" / "m"), agent_id="lane-a")
+        (queue_dir / "done" / req.job_id).mkdir()                    # a husk already sits where the worker will move the job
+        rq.q.submit(req)
+        assert rq.q.run_one(rq.job_types) is True
+        nested = queue_dir / "done" / req.job_id / req.job_id
+        assert (nested / "status.json").is_file(), "the worker nested the record inside the husk; that is the shape this test is about"
+        (queue_dir / "failed" / req.job_id).mkdir()
+        shutil.copy(nested / "receipt.json", queue_dir / "failed" / req.job_id / "receipt.json")   # the receipt-only copy seen live
+        r = rec.load_job_records(queue_dir)[req.job_id]
+        assert r.state_dir == "done" and r.nested is True and r.record_dir == nested
+        assert r.status == "done" and r.finished_at is not None and r.output_dir == str(queue_dir / "outputs" / "m")
+        assert r.duplicates == ["failed"] and r.unreadable == []
+
+    def test_an_empty_husk_never_outranks_a_complete_record(self, queue_dir, tmp_path):
+        rq = RealQueue(queue_dir)
+        (tmp_path / "in.png").write_bytes(b"IN")
+        f = rq.run_failing(tmp_path / "in.png", queue_dir / "outputs" / "broken")
+        (queue_dir / "done" / f).mkdir()                              # the empty husk seen live beside a complete failed record
+        r = rec.load_job_records(queue_dir)[f]
+        assert r.state_dir == "failed" and r.status == "failed" and r.finished_at is not None
+        assert r.duplicates == ["done"] and r.nested is False
+
+
 class TestGcReceipts:
     def test_deletions_merge_to_the_earliest_confirmed_and_a_later_receipt_never_downgrades_them(self, queue_dir, tmp_path):
         rq = RealQueue(queue_dir)

@@ -7,8 +7,11 @@ that directory, so one job accrues several receipts. Every reader of those files
 through this module for file loading, state-directory precedence and deletion merging;
 field precedence inside a record stays with each reader (the collector reads status.json
 first for output_dir and finished_at, lineage reads the receipt first). Torn files are
-reported, never trusted; a job id found in two state directories resolves to the copy
-furthest along (done over failed over cancelled over running over pending).
+reported, never trusted. A job id found in two state directories resolves to the copy that
+carries the most record files, then to the one furthest along (done over failed over
+cancelled over running over pending); an empty husk never outranks a record. When the
+worker moved a job into a destination directory that already existed, the record sits
+nested one level down (``done/<id>/<id>/``); that copy is read and marked ``nested``.
 """
 from __future__ import annotations
 
@@ -50,6 +53,9 @@ class JobRecord:
     receipt: dict = field(default_factory=dict)
     unreadable: list[str] = field(default_factory=list)    # record files that exist but did not parse
     duplicates: list[str] = field(default_factory=list)    # other state dirs holding this job id, lost to precedence
+    record_dir: Path | None = None                         # the directory the record files were read from
+    nested: bool = False                                   # the record sat at <state>/<id>/<id>/ (moved into an existing directory)
+    present: int = 0                                       # how many of request/status/receipt were found (0 = an empty husk)
 
     @property
     def terminal(self) -> bool:
@@ -104,22 +110,42 @@ def load_job_records(queue_dir: Path) -> dict[str, JobRecord]:
         for job_dir in sorted(state_dir.iterdir()):
             if not job_dir.is_dir():
                 continue
-            rec = JobRecord(job_dir.name, state)
-            for name, attr in (("request.json", "request"), ("status.json", "state"), ("receipt.json", "receipt")):
-                doc, torn = read_json(job_dir / name)
-                if torn:
-                    rec.unreadable.append(name)
-                elif doc is not None:
-                    setattr(rec, attr, doc)
+            rec = _read_record(job_dir, state)
             prev = out.get(rec.job_id)
             if prev is None:
                 out[rec.job_id] = rec
-            elif _PRECEDENCE[state] > _PRECEDENCE[prev.state_dir]:
+            elif (rec.present, _PRECEDENCE[state]) > (prev.present, _PRECEDENCE[prev.state_dir]):
                 rec.duplicates = sorted(prev.duplicates + [prev.state_dir])
                 out[rec.job_id] = rec
             else:
                 prev.duplicates = sorted(prev.duplicates + [state])
     return out
+
+
+_RECORD_FILES = (("request.json", "request"), ("status.json", "state"), ("receipt.json", "receipt"))
+
+
+def _read_record(job_dir: Path, state: str) -> JobRecord:
+    """Read one job directory; if it holds no record files but a nested <id>/ does, read that (the worker moved into an existing dir)."""
+    rec = JobRecord(job_dir.name, state, record_dir=job_dir)
+    _read_files(rec, job_dir)
+    if rec.present == 0 and not rec.unreadable:
+        nested = job_dir / job_dir.name
+        if nested.is_dir():
+            _read_files(rec, nested)
+            if rec.present or rec.unreadable:
+                rec.record_dir, rec.nested = nested, True
+    return rec
+
+
+def _read_files(rec: JobRecord, directory: Path) -> None:
+    for name, attr in _RECORD_FILES:
+        doc, torn = read_json(directory / name)
+        if torn:
+            rec.unreadable.append(name)
+        elif doc is not None:
+            setattr(rec, attr, doc)
+            rec.present += 1
 
 
 @dataclass

@@ -109,7 +109,7 @@ class Records:
             "started_at": None, "finished_at": None, "exit_code": None, "failure_phase": None,
             "output_dir": None, "output_dir_relative": False, "artifacts": [], "inputs": [], "inputs_attribution": "job",
             "record_source": "job-record", "deleted": False, "deletion": None, "deleted_by_epoch": None, "deleted_at": None,
-            "deleted_by_epochs": [], "record_unreadable": [], "duplicate_records": [], "never_started": False,
+            "deleted_by_epochs": [], "record_unreadable": [], "duplicate_records": [], "never_started": False, "nested_record": False,
         }
         base.update(over)
         return base
@@ -141,6 +141,7 @@ class Records:
                 failure_phase=receipt.get("failure_phase") or state.get("failure_phase"),
                 output_dir=output_dir, output_dir_relative=out_rel, artifacts=artifacts, inputs=inputs,
                 record_unreadable=list(r.unreadable), duplicate_records=list(r.duplicates), never_started=r.never_started,
+                nested_record=r.nested,
             )
 
     def _load_gc_receipts(self) -> None:
@@ -440,6 +441,8 @@ def render_text(graph: dict) -> str:
             out.append(f"    record unreadable: {', '.join(n['record_unreadable'])} (not trusted as a producer)")
         if n.get("duplicate_records"):
             out.append(f"    also found under {', '.join(n['duplicate_records'])}/ (torn move; the {n.get('status')} copy is read)")
+        if n.get("nested_record"):
+            out.append("    record nested one level down (the worker moved it into a directory that already existed)")
         if n.get("record_source") == "gc-receipt":
             out.append("    record from gc receipt only" + (f"; inputs {n['inputs_attribution']}" if n.get("inputs_attribution") != "job" else ""))
         return out

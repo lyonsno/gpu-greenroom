@@ -563,3 +563,19 @@ class TestSharedRecords:
         n = lin.lineage(queue_dir, f)["subject"]
         assert n["status"] == "failed" and n["exit_code"] == 3 and n["never_started"] is False and n["record_unreadable"] == []
         assert "failed" in lin.render_text(lin.lineage(queue_dir, f))
+
+    def test_a_producer_the_worker_nested_inside_a_husk_is_still_found(self, queue_dir, tmp_path):
+        rq = RealQueue(queue_dir)
+        (tmp_path / "in.png").write_bytes(b"IN")
+        from gpu_queue.models import JobRequest
+        m = queue_dir / "outputs" / "m"
+        a = JobRequest(job_type="mesh", input_path=str(tmp_path / "in.png"), output_dir=str(m), agent_id="lane-a")
+        (queue_dir / "done" / a.job_id).mkdir()
+        rq.q.submit(a); assert rq.q.run_one(rq.job_types) is True
+        assert (queue_dir / "done" / a.job_id / a.job_id / "status.json").is_file()
+        b = rq.run("render", m / "mesh.glb", queue_dir / "outputs" / "r", agent="lane-b")
+        g = lin.lineage(queue_dir, b)
+        assert g["subject"]["inputs"][0]["producer"] == a.job_id
+        na = lin.lineage(queue_dir, a.job_id)["subject"]
+        assert na["status"] == "done" and na["nested_record"] is True
+        assert "nested" in lin.render_text(lin.lineage(queue_dir, a.job_id))
