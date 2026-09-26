@@ -366,7 +366,7 @@ compared case-insensitively, or an absolute path in one of them resolves
 into the entry; the check over-protects on purpose. References that never
 spell the name (shell variables, globs, paths inside a config file the job
 reads) are not seen. An entry mentioned by a registered job type that has
-no queued job is reported as `job_type_refs` and held with reason `referenced_by_registered_type`: a registered job type names that directory in its config, so it is a default input or fixture, and deleting it would break the type whether or not it has run lately. The summary carries `registered_type_referenced_count` and `referenced_hold_bytes`; a stale reference is released by editing the referencing type, not by the collector. If any pending or running job's `request.json` is missing or
+no queued job is reported as `job_type_refs` and held with reason `referenced_by_registered_type`: a registered job type names that directory in its config, so it is a default input or fixture, and deleting it would break the type whether or not it has run lately. The summary carries `registered_type_referenced_count` and `referenced_hold_bytes`; a stale reference is released by editing the referencing type, not by the collector. Terminal job records are read through the shared reader (`gpu_queue.records`): a record file that exists but does not parse is counted per row as `records_unreadable` and in the totals as `unreadable_terminal_records`, and the entry's age then comes from whatever did parse, or from its mtime. If any pending or running job's `request.json` is missing or
 unparsable, or its `status.json` is present but unparsable, nothing can be
 proven unreferenced: every row reports `active_unknown`, the candidate
 list names the unreadable records, and nothing is a candidate until they
@@ -451,7 +451,16 @@ recorded digest contradicts the producer's recorded digest for that path.
 Failed jobs stay eligible and are shown with their status. A job known only
 from a gc receipt is indexed by the receipt's directory, which may be a
 parent of its true output directory; its containment edges carry
-`output-dir` like any other.
+`output-dir` like any other. Records are read through one shared reader
+(`gpu_queue.records`), so lineage and the collector agree on their shape:
+a job listed by several gc receipts (the collector re-lists every job of a
+directory each time it collects it) takes its earliest confirmed
+`deleted_at` and that epoch, and a later partial or unconfirmed receipt
+never downgrades it; a record file that exists but does not parse marks
+the job `record_unreadable` and it is never credited as a producer; a job
+id found in two state directories (a torn move) is read from the copy
+furthest along and reported as `duplicate_records`. Receipt files that do
+not parse are named in the graph's `limits`.
 Among accepted candidates the strongest basis wins (`artifact-path` over
 `output-dir` over `sha256` alone), then the most recent; when more than one
 is accepted the input and its edges are marked `ambiguous` and all are

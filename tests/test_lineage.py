@@ -22,6 +22,7 @@ from pathlib import Path
 import pytest
 
 from gpu_queue import lineage as lin
+from tests.realqueue import RealQueue
 
 NOW = 1_800_000_000.0
 
@@ -471,3 +472,54 @@ class TestRevisionThree:
         assert ac["accepted"] is False and "deleted" in ac["reason"] and "before the consumer started" in ac["reason"]
         assert all(n["job_id"] != a.job_id for n in g["nodes"])          # a rejected candidate is not an ancestor
         assert lin.lineage(queue_dir, a.job_id)["subject"]["deleted_at"] == deleted_at
+
+
+class TestSharedRecords:
+    """Lineage reads records through the shared loader: deterministic deletions, untrusted torn records, resolved duplicates."""
+
+    @pytest.mark.parametrize("order", ["forward", "reverse"])
+    def test_a_directory_collected_twice_gives_one_answer_whatever_order_receipts_load(self, queue_dir, tmp_path, monkeypatch, order):
+        rq = RealQueue(queue_dir)
+        (tmp_path / "in.png").write_bytes(b"IN")
+        m = queue_dir / "outputs" / "m"
+        a = rq.run("mesh", tmp_path / "in.png", m, agent="lane-a")
+        r1 = rq.collect("m")
+        a2 = rq.run("mesh", tmp_path / "in.png", m, agent="lane-a2")          # same bytes: only deletion time can separate A from A2
+        c = rq.run("render", m / "mesh.glb", queue_dir / "outputs" / "r", agent="lane-c")
+        r2 = rq.collect("m")                                                    # re-lists A with a later deleted_at
+        real_glob = Path.glob
+        def ordered(self, pattern):
+            found = sorted(real_glob(self, pattern))
+            return iter(found if order == "forward" else list(reversed(found)))
+        monkeypatch.setattr(Path, "glob", ordered)
+
+        g = lin.lineage(queue_dir, c)
+        inp = g["subject"]["inputs"][0]
+        assert inp["producer"] == a2 and inp["ambiguous"] is False
+        ac = [cnd for cnd in inp["candidates"] if cnd["job_id"] == a][0]
+        assert ac["accepted"] is False and "deleted" in ac["reason"] and r1["epoch"] in ac["reason"]
+        na = lin.lineage(queue_dir, a)["subject"]
+        assert na["deleted_by_epoch"] == r1["epoch"] and na["deleted_at"] == r1["deleted_at"]
+        assert sorted(na["deleted_by_epochs"]) == sorted([r1["epoch"], r2["epoch"]])
+
+    def test_a_producer_with_a_torn_record_file_is_not_credited(self, queue_dir):
+        ids = chain(queue_dir)
+        (queue_dir / "done" / ids["a"] / "receipt.json").write_text("{")     # torn write: exists, does not parse
+        g = lin.lineage(queue_dir, ids["b"])
+        inp = g["subject"]["inputs"][0]
+        assert inp["producer"] is None
+        ac = [cnd for cnd in inp["candidates"] if cnd["job_id"] == ids["a"]][0]
+        assert ac["accepted"] is False and "unreadable" in ac["reason"] and "receipt.json" in ac["reason"]
+        assert lin.lineage(queue_dir, ids["a"])["subject"]["record_unreadable"] == ["receipt.json"]
+        assert "unreadable" in lin.render_text(lin.lineage(queue_dir, ids["a"]))
+
+    def test_a_job_torn_between_two_state_dirs_is_read_from_the_furthest_copy(self, queue_dir):
+        import shutil
+        ids = chain(queue_dir)
+        shutil.copytree(queue_dir / "done" / ids["a"], queue_dir / "running" / ids["a"])   # a move that never finished
+        st = json.loads((queue_dir / "running" / ids["a"] / "status.json").read_text()); st["status"] = "running"; st["finished_at"] = None
+        (queue_dir / "running" / ids["a"] / "status.json").write_text(json.dumps(st))
+        g = lin.lineage(queue_dir, ids["b"])
+        assert g["subject"]["inputs"][0]["producer"] == ids["a"]
+        na = lin.lineage(queue_dir, ids["a"])["subject"]
+        assert na["status"] == "done" and na["duplicate_records"] == ["running"]

@@ -19,7 +19,11 @@ started; a recorded input digest that contradicts the producer's recorded
 digest for the same path rejects that producer; when more than one producer
 remains, the input is marked ambiguous and every accepted candidate is
 shown. Per-job maps in a gc receipt are authoritative: a job missing from
-them recorded nothing. Relative
+them recorded nothing. Records are read through ``gpu_queue.records``: a
+job listed by several gc receipts takes its earliest confirmed deletion, a
+record file that exists but does not parse marks the job unreadable and it
+is never credited, and a job id torn across two state directories is read
+from the copy furthest along. Relative
 recorded paths are never resolved. Deleting bytes does not delete what the
 receipts recorded, and lineage shows exactly what they recorded, no more.
 """
@@ -31,6 +35,8 @@ import json
 import os
 import re
 from pathlib import Path
+
+from gpu_queue import records as rec
 
 SCHEMA = "gpu-greenroom.lineage.v1"
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
@@ -103,77 +109,57 @@ class Records:
             "started_at": None, "finished_at": None, "exit_code": None, "failure_phase": None,
             "output_dir": None, "output_dir_relative": False, "artifacts": [], "inputs": [], "inputs_attribution": "job",
             "record_source": "job-record", "deleted": False, "deletion": None, "deleted_by_epoch": None, "deleted_at": None,
+            "deleted_by_epochs": [], "record_unreadable": [], "duplicate_records": [],
         }
         base.update(over)
         return base
 
     def _load_jobs(self) -> None:
-        for status in ("done", "failed", "cancelled", "running", "pending"):
-            status_dir = self.queue_dir / status
-            if not status_dir.is_dir():
-                continue
-            for job_dir in status_dir.iterdir():
-                if not job_dir.is_dir():
-                    continue
-                request = _load_json(job_dir / "request.json") or {}
-                state = _load_json(job_dir / "status.json") or {}
-                receipt = _load_json(job_dir / "receipt.json") or {}
-                worker = receipt.get("worker") or {}
-                commit = worker.get("commit") or ((worker.get("source") or {}).get("commit"))   # flat is what the worker writes
-                source_root = worker.get("source_root") or ((worker.get("source") or {}).get("root"))
-                output_dir, out_rel = _abs(receipt.get("output_dir") or state.get("output_dir") or request.get("output_dir"))
-                input_path, in_rel = _abs(receipt.get("input_path") or state.get("input_path") or request.get("input_path"))
-                input_artifact = receipt.get("input_artifact") if isinstance(receipt.get("input_artifact"), dict) else None
-                artifacts = [{"path": m.get("path"), "sha256": m["sha256"], "size_bytes": m.get("size_bytes"), "attribution": "job"}
-                             for m in (receipt.get("artifact_manifest") or []) if isinstance(m, dict) and m.get("sha256")]
-                inputs = []
-                if input_path:
-                    inputs.append({"path": input_path, "relative": in_rel, "sha256": input_artifact.get("sha256") if input_artifact else None,
-                                   "digest_recorded": bool(input_artifact and input_artifact.get("sha256")), "basis": "job",
-                                   "producer": None, "producer_basis": None, "candidates": [], "ambiguous": False})
-                self.jobs[job_dir.name] = self._blank(
-                    job_dir.name,
-                    status=status if status in ("done", "failed", "cancelled") else (state.get("status") or status),
-                    job_type=receipt.get("job_type") or state.get("job_type") or request.get("job_type"),
-                    agent_id=request.get("agent_id"),
-                    requested_route=receipt.get("requested_route") or request.get("route_identity"),
-                    effective_route=receipt.get("effective_route") or state.get("effective_route"),
-                    effective_argv=receipt.get("effective_argv"), worker_commit=commit, worker_source_root=source_root,
-                    started_at=_num(receipt.get("started_at") or state.get("started_at")),
-                    finished_at=_num(receipt.get("finished_at") or state.get("finished_at")),
-                    exit_code=receipt.get("exit_code", state.get("exit_code")),
-                    failure_phase=receipt.get("failure_phase") or state.get("failure_phase"),
-                    output_dir=output_dir, output_dir_relative=out_rel, artifacts=artifacts, inputs=inputs,
-                )
+        for job_id, r in rec.load_job_records(self.queue_dir).items():
+            request, state, receipt = r.request, r.state, r.receipt
+            worker = receipt.get("worker") or {}
+            commit = worker.get("commit") or ((worker.get("source") or {}).get("commit"))   # flat is what the worker writes
+            source_root = worker.get("source_root") or ((worker.get("source") or {}).get("root"))
+            output_dir, out_rel = _abs(r.output_dir)
+            input_path, in_rel = _abs(r.input_path)
+            input_artifact = receipt.get("input_artifact") if isinstance(receipt.get("input_artifact"), dict) else None
+            artifacts = [{"path": m.get("path"), "sha256": m["sha256"], "size_bytes": m.get("size_bytes"), "attribution": "job"}
+                         for m in (receipt.get("artifact_manifest") or []) if isinstance(m, dict) and m.get("sha256")]
+            inputs = []
+            if input_path:
+                inputs.append({"path": input_path, "relative": in_rel, "sha256": input_artifact.get("sha256") if input_artifact else None,
+                               "digest_recorded": bool(input_artifact and input_artifact.get("sha256")), "basis": "job",
+                               "producer": None, "producer_basis": None, "candidates": [], "ambiguous": False})
+            self.jobs[job_id] = self._blank(
+                job_id,
+                status=r.status, job_type=r.job_type, agent_id=r.agent_id,
+                requested_route=receipt.get("requested_route") or request.get("route_identity"),
+                effective_route=receipt.get("effective_route") or state.get("effective_route"),
+                effective_argv=receipt.get("effective_argv"), worker_commit=commit, worker_source_root=source_root,
+                started_at=r.started_at, finished_at=r.finished_at,
+                exit_code=receipt.get("exit_code", state.get("exit_code")),
+                failure_phase=receipt.get("failure_phase") or state.get("failure_phase"),
+                output_dir=output_dir, output_dir_relative=out_rel, artifacts=artifacts, inputs=inputs,
+                record_unreadable=list(r.unreadable), duplicate_records=list(r.duplicates),
+            )
 
     def _load_gc_receipts(self) -> None:
-        receipts_dir = self.queue_dir / "gc-receipts"
-        if not receipts_dir.is_dir():
-            return
-        for path in receipts_dir.glob("*/*.json"):
-            if path.name.startswith("_"):
-                continue
-            doc = _load_json(path)
-            if not isinstance(doc, dict) or doc.get("schema") != "gpu-greenroom.gc-receipt.v1":
-                continue
-            deletion = "confirmed" if doc.get("deleted_at") else ("partial" if doc.get("partial") else "unconfirmed")
-            job_ids = [j for j in (doc.get("job_ids") or []) if isinstance(j, str)]
-            has_maps = isinstance(doc.get("artifact_manifest_by_job"), dict) or isinstance(doc.get("input_artifacts_by_job"), dict)
-            by_job = doc.get("artifact_manifest_by_job") if isinstance(doc.get("artifact_manifest_by_job"), dict) else {}
-            inputs_by_job = doc.get("input_artifacts_by_job") if isinstance(doc.get("input_artifacts_by_job"), dict) else {}
-            flat = [m for m in (doc.get("artifact_manifest") or []) if isinstance(m, dict) and m.get("sha256")]
-            flat_inputs = [i for i in (doc.get("input_artifacts") or []) if isinstance(i, dict) and i.get("path")]
+        receipts, self.unreadable_receipts = rec.load_gc_receipts(self.queue_dir)
+        for r in receipts:
+            doc = {"epoch": r.epoch, "name": r.name}
+            job_ids = r.job_ids
+            has_maps = r.has_maps
+            by_job = r.artifact_manifest_by_job or {}
+            inputs_by_job = r.input_artifacts_by_job or {}
+            flat = r.artifact_manifest
+            flat_inputs = r.input_artifacts
             shared = len(job_ids) > 1
-            dir_path, dir_rel = _abs(doc.get("path"))
+            dir_path, dir_rel = _abs(r.path)
             for job_id in job_ids:
                 job = self.jobs.get(job_id)
                 if job is None:
-                    job = self.jobs[job_id] = self._blank(job_id, agent_id=doc.get("owner"), output_dir=dir_path, output_dir_relative=dir_rel,
+                    job = self.jobs[job_id] = self._blank(job_id, agent_id=r.owner, output_dir=dir_path, output_dir_relative=dir_rel,
                                                           record_source="gc-receipt")
-                job["deletion"] = deletion
-                job["deleted"] = deletion == "confirmed"
-                job["deleted_by_epoch"] = doc.get("epoch")
-                job["deleted_at"] = doc.get("deleted_at") if isinstance(doc.get("deleted_at"), (int, float)) else None
                 known = {a["sha256"] for a in job["artifacts"]}
                 if has_maps:
                     # the receipt says which job produced what; a job missing from the map produced nothing recorded
@@ -211,6 +197,15 @@ class Records:
                             p, rel = _abs(i.get("path"))
                             job["inputs"].append({"path": p, "relative": rel, "sha256": i.get("sha256"), "digest_recorded": bool(i.get("sha256")),
                                                   "basis": "gc-receipt-shared", "producer": None, "producer_basis": None, "candidates": [], "ambiguous": False})
+        for job_id, d in rec.deletions_by_job(receipts).items():
+            job = self.jobs.get(job_id)
+            if job is None:
+                continue
+            job["deletion"] = d.deletion
+            job["deleted"] = d.deletion == "confirmed"
+            job["deleted_by_epoch"] = d.epoch
+            job["deleted_at"] = d.deleted_at
+            job["deleted_by_epochs"] = list(d.epochs)
 
     def _index(self) -> None:
         self.by_digest: dict[str, set[str]] = {}
@@ -270,7 +265,9 @@ class Records:
             if digest and recorded_there and recorded_there != digest:
                 accepted, reason = False, "digest contradicts the producer's recorded digest for this path"
             pf, cs = producer.get("finished_at"), consumer.get("started_at")
-            if accepted and producer.get("status") in ("pending", "running") and producer.get("record_source") != "gc-receipt":
+            if accepted and producer.get("record_unreadable"):
+                accepted, reason = False, f"producer record unreadable ({', '.join(producer['record_unreadable'])}); nothing it says is trusted"
+            elif accepted and producer.get("status") in ("pending", "running") and producer.get("record_source") != "gc-receipt":
                 accepted, reason = False, f"producer has not finished (status {producer.get('status')})"
             elif accepted and producer.get("status") == "cancelled" and producer.get("started_at") is None and producer.get("record_source") != "gc-receipt":
                 # GPUQueue.cancel stamps finished_at on a job that never started; the missing started_at is the fact that matters
@@ -403,7 +400,8 @@ def lineage(queue_dir, subject: str) -> dict:
     return {
         "schema": SCHEMA, "queue_dir": str(queue_dir), "subject": subject_node, "subject_matched_by": match["matched_by"],
         "subject_ambiguous": match["ambiguous"], "subject_candidates": match["candidates"],
-        "nodes": nodes, "edges": unique, "limits": list(LIMITS),
+        "nodes": nodes, "edges": unique,
+        "limits": list(LIMITS) + ([f"gc receipt files that did not parse were skipped: {', '.join(records.unreadable_receipts)}"] if records.unreadable_receipts else []),
     }
 
 
@@ -435,7 +433,12 @@ def render_text(graph: dict) -> str:
                 prod = "external / not found" + (f"; rejected {len(rejected)}: " + "; ".join(f"{c['job_id']} ({c['reason']})" for c in rejected) if rejected else "")
             out.append(f"    input: {i.get('path')}  [{digest}]  {prod}")
         if n.get("deletion") == "confirmed":
-            out.append(f"    deleted by gc epoch {n.get('deleted_by_epoch')}" + (f" at {n['deleted_at']:.0f}" if n.get("deleted_at") is not None else ""))
+            out.append(f"    deleted by gc epoch {n.get('deleted_by_epoch')}" + (f" at {n['deleted_at']:.0f}" if n.get("deleted_at") is not None else "")
+                       + (f" (also listed by {', '.join(e for e in n.get('deleted_by_epochs', []) if e != n.get('deleted_by_epoch'))})" if len(n.get("deleted_by_epochs") or []) > 1 else ""))
+        if n.get("record_unreadable"):
+            out.append(f"    record unreadable: {', '.join(n['record_unreadable'])} (not trusted as a producer)")
+        if n.get("duplicate_records"):
+            out.append(f"    also found under {', '.join(n['duplicate_records'])}/ (torn move; the {n.get('status')} copy is read)")
         elif n.get("deletion"):
             out.append(f"    deletion {n['deletion']} (gc epoch {n.get('deleted_by_epoch')})")
         if n.get("record_source") == "gc-receipt":

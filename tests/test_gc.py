@@ -787,3 +787,15 @@ class TestReceiptsKeepPerJobManifests:
         assert set(by_job) == set(receipt["job_ids"]) and by_job[second][0]["sha256"] == "cd" * 32
         assert receipt["input_artifacts_by_job"][second]["sha256"] == "ef" * 32
         assert len(receipt["artifact_manifest"]) == 2   # the flattened list stays for readers that expect it
+
+
+class TestSharedRecordReader:
+    def test_a_torn_terminal_record_is_counted_not_trusted_or_crashed_on(self, queue_dir):
+        make_output(queue_dir, "old-trace", job_type="trace", agent="lane-a", finished_days_ago=45)
+        jd = next((queue_dir / "done").iterdir())
+        (jd / "receipt.json").write_text("{")
+        rows = gc_mod.scan(queue_dir, load_job_types(queue_dir), now=NOW)
+        row = {r["name"]: r for r in rows}["old-trace"]
+        assert row["records_unreadable"] == 1 and row["candidate"]        # age still comes from the readable status.json
+        doc = gc_mod.write_candidates(queue_dir, rows, now=NOW)
+        assert doc["totals"]["unreadable_terminal_records"] == 1

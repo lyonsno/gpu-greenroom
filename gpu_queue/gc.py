@@ -37,6 +37,8 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
+from gpu_queue.records import load_job_records
+
 CANDIDATES_SCHEMA = "gpu-greenroom.gc-candidates.v1"
 RECEIPT_SCHEMA = "gpu-greenroom.gc-receipt.v1"
 APPLY_SCHEMA = "gpu-greenroom.gc-apply.v1"
@@ -184,34 +186,31 @@ def _top_level_name(candidate: str | None, outputs: Path) -> str | None:
 
 
 def _job_records(queue_dir: Path) -> dict[str, list[dict]]:
-    """Every terminal job that wrote under outputs/, keyed by top-level entry name."""
+    """Every terminal job that wrote under outputs/, keyed by top-level entry name (read through gpu_queue.records)."""
     outputs = (queue_dir / "outputs").resolve()
     records: dict[str, list[dict]] = {}
-    for status in ("done", "failed", "cancelled"):
-        status_dir = queue_dir / status
-        if not status_dir.is_dir():
+    for job_id, r in load_job_records(queue_dir).items():
+        if not r.terminal:
             continue
-        for job_dir in status_dir.iterdir():
-            request = _load_json(job_dir / "request.json") or {}
-            state = _load_json(job_dir / "status.json") or {}
-            receipt = _load_json(job_dir / "receipt.json") or {}
-            output_dir = state.get("output_dir") or request.get("output_dir") or receipt.get("output_dir")
-            name = _top_level_name(output_dir, outputs)
-            if name is None:
-                continue
-            finished = state.get("finished_at")
-            if not _is_number(finished):
-                finished = receipt.get("finished_at") if _is_number(receipt.get("finished_at")) else None
-            records.setdefault(name, []).append({
-                "job_id": job_dir.name,
-                "status": status,
-                "job_type": state.get("job_type") or request.get("job_type"),
-                "agent_id": request.get("agent_id"),
-                "finished_at": finished,
-                "declared_class": request.get("output_class"),
-                "artifact_manifest": receipt.get("artifact_manifest"),
-                "input_artifact": receipt.get("input_artifact"),
-            })
+        request, state, receipt = r.request, r.state, r.receipt
+        name = _top_level_name(state.get("output_dir") or request.get("output_dir") or receipt.get("output_dir"), outputs)
+        if name is None:
+            continue
+        finished = state.get("finished_at")
+        if not _is_number(finished):
+            finished = receipt.get("finished_at") if _is_number(receipt.get("finished_at")) else None
+        records.setdefault(name, []).append({
+            "job_id": job_id,
+            "status": r.state_dir,
+            "job_type": state.get("job_type") or request.get("job_type"),
+            "agent_id": request.get("agent_id"),
+            "finished_at": finished,
+            "declared_class": request.get("output_class"),
+            "artifact_manifest": receipt.get("artifact_manifest"),
+            "input_artifact": receipt.get("input_artifact"),
+            "unreadable": list(r.unreadable),
+            "duplicates": list(r.duplicates),
+        })
     return records
 
 
@@ -463,6 +462,7 @@ def scan(queue_dir, job_types: dict, *, now: float, ttl_days: dict | None = None
             "pinned": pinned,
             "active": is_active,
             "job_type_refs": sorted(type_refs.get(entry.name, [])),
+            "records_unreadable": sum(bool(r.get("unreadable")) for r in recs),
             "size_bytes": _dir_size(entry) if compute_size else None,
             "candidate": candidate,
             "reason": reason,
@@ -506,6 +506,7 @@ def write_candidates(queue_dir, rows: list[dict], *, now: float, grace_hours: fl
             "unreadable_records": ActiveRefs.load(queue_dir).unreadable_records,
             "registered_type_referenced_count": sum(bool(r.get("job_type_refs")) for r in rows),
             "referenced_hold_bytes": total(lambda r: r["reason"] == "referenced_by_registered_type"),
+            "unreadable_terminal_records": sum(r.get("records_unreadable") or 0 for r in rows),
             "pins_readable": all(r["reason"] != "pins_unreadable" for r in rows),
         },
         "rows": rows,
