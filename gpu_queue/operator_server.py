@@ -33,6 +33,8 @@ PAGE = r"""<!doctype html>
 <script>
 const hash=new URLSearchParams(location.hash.slice(1)),bootstrap=globalThis.__GREENROOM_BOOTSTRAP_TOKEN__||'';if(bootstrap){sessionStorage.setItem('greenroom-token',bootstrap)}else if(hash.get('token')){sessionStorage.setItem('greenroom-token',hash.get('token'));history.replaceState(null,'',location.pathname)}const token=sessionStorage.getItem('greenroom-token')||'';let filter='active',last=null;const statuses=['active','all','pending','running','done','failed','cancelled'];
 const smokeDrafts=new Map(),smokeSubmitting=new Set(),smokeAccepted=new Set();let smokeLoadGeneration=0,smokeHasLoaded=false,smokeRefreshUnavailable=false;
+const smokePhases={'waiting-gpu':'Waiting for GPU',running:'Running',preparing:'Preparing',blocked:'Blocked','operator-needed':'Waiting for you',responded:'Response returned',failed:'Failed',cancelled:'Cancelled',unknown:'Unverified'};
+function smokeProgress(item){const d=item.display||{},p=d.progress;return `<p class="smoke-progress"><strong>${esc(smokePhases[d.phase]||'Unverified')}</strong>${d.queue_position?' · Queue position '+esc(d.queue_position):''}${d.label?' · '+esc(d.label):''}</p>${p?.total?`<div class="smoke-progress"><progress value="${esc(p.completed)}" max="${esc(p.total)}"></progress> ${esc(p.completed)} / ${esc(p.total)} ${esc(p.unit)}</div>`:''}${d.error?`<p class="meta">${esc(d.error)}</p>`:''}`}
 function auth(){return {'Authorization':'Bearer '+token,'Content-Type':'application/json'}}async function request(path,options={}){const r=await fetch(path,options);if(r.status===401&&globalThis.__GREENROOM_LOCAL_OPERATOR__){if(!sessionStorage.getItem('greenroom-auth-reload')){sessionStorage.setItem('greenroom-auth-reload','1');location.reload();return new Promise(()=>{})}}else if(r.ok){sessionStorage.removeItem('greenroom-auth-reload')}return r}function err(e){const n=document.querySelector('#error');n.textContent=e;n.style.display='block';setTimeout(()=>n.style.display='none',6000)}function elapsed(j){const end=j.finished_at||Date.now()/1000,start=j.started_at||j.submitted_at;if(!start)return '—';const s=Math.max(0,end-start);if(s<60)return Math.round(s)+'s';if(s<3600)return Math.floor(s/60)+'m '+Math.round(s%60)+'s';return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'}function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 let busy=false;
 function duration(seconds){if(seconds==null)return 'not recorded';const s=Math.floor(seconds);return s>=3600?`${Math.floor(s/3600)}h ${Math.floor(s%3600/60)}m`:s>=60?`${Math.floor(s/60)}m ${s%60}s`:`${s}s`}
@@ -87,8 +89,8 @@ function renderSmoke(payload){
   host.innerHTML=items.map(item=>{
     const q=item.request||{},response=item.response||{};
     if(item.status!=='operator-needed'){smokeDrafts.delete(q.id);smokeAccepted.delete(q.id)}
-    const action=item.status==='operator-needed'?(document.body.dataset.readOnly==='true'?'<p class="meta">Read-only view; responses are unavailable.</p>':`<form class="smokeReply" data-id="${esc(q.id)}"><label for="reply-${esc(q.id)}">Your response</label><textarea class="smoke-response" id="reply-${esc(q.id)}" required></textarea><div class="smoke-actions"><button type="submit">Send response</button></div></form>`):`<p class="smoke-response-copy">${esc(response.text||'Response text not recorded.')}</p><p class="meta">Accepted through Greenroom; caller identity unverified.</p>`;
-    return `<article class="smoke-card"><h3>${esc(q.title||'Untitled smoke request')}</h3><p class="meta">Reported by (unverified): ${esc(q.source?.agent_id||'not recorded')} · ${esc(item.status||'unknown status')}</p><p>${esc(q.prompt||'No request prompt recorded.')}</p><p><a href="${esc(q.url||'#')}" target="_blank" rel="noopener noreferrer">Open smoke target</a> · ${esc(q.availability||'availability not recorded')}: ${esc(q.availability_note||'')}</p>${action}</article>`
+    const action=item.status==='operator-needed'?(document.body.dataset.readOnly==='true'?'<p class="meta">Read-only view; responses are unavailable.</p>':item.display?.phase==='operator-needed'?`<form class="smokeReply" data-id="${esc(q.id)}"><label for="reply-${esc(q.id)}">Your response</label><textarea class="smoke-response" id="reply-${esc(q.id)}" required></textarea><div class="smoke-actions"><button type="submit">Send response</button></div></form>`:''):`<p class="smoke-response-copy">${esc(response.text||'Response text not recorded.')}</p><p class="meta">Accepted through Greenroom; caller identity unverified.</p>`;
+    return `<article class="smoke-card" id="smoke-${esc(q.id)}"><h3>${esc(q.title||'Untitled smoke request')}</h3><p class="meta">Reported by (unverified): ${esc(q.source?.agent_id||'not recorded')}</p>${smokeProgress(item)}<p>${esc(q.prompt||'No request prompt recorded.')}</p><p><a href="${esc(q.url||'#')}" target="_blank" rel="noopener noreferrer">Open smoke target</a></p>${action}</article>`
   }).join('');
   host.querySelectorAll('form.smokeReply').forEach(form=>{
     const id=form.dataset.id,textarea=form.querySelector('textarea'),button=form.querySelector('button[type="submit"]');
@@ -352,8 +354,7 @@ def make_handler(queue: GPUQueue | Path, token: str, *, read_only: bool = False,
                 self._json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
                 return
             if path == "/api/smoke-requests":
-                records, errors = self._smoke_requests().scan()
-                self._json(HTTPStatus.OK, {"schema": "gpu-greenroom.smoke-request-list.v1", "items": records, "errors": errors})
+                self._json(HTTPStatus.OK, self._smoke_requests().snapshot())
                 return
             parts = path.strip("/").split("/")
             if len(parts) == 3 and parts[0:2] == ["api", "smoke-requests"]:

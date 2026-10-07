@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import tempfile
@@ -88,7 +89,27 @@ def validate_request(value: object) -> dict:
     job_id = value.get("job_id")
     if job_id is not None and (not isinstance(job_id, str) or not job_id.strip()):
         raise ValueError("job_id must be a non-empty string when supplied")
+    if job_id is not None and (not all(c.isalnum() or c in '_-' for c in job_id)):
+        raise ValueError("job_id must be a single safe queue identity")
     return deepcopy(value)
+
+
+def _progress(value):
+    if not isinstance(value, dict):
+        raise ValueError('progress must be an object')
+    if value.get('availability') not in {'prepared', 'preparation-needed', 'unavailable'}:
+        raise ValueError('invalid progress availability')
+    if not isinstance(value.get('label'), str) or not value['label'].strip():
+        raise ValueError('progress label must be nonblank')
+    metrics = ('completed', 'total', 'unit')
+    if any(key in value for key in metrics):
+        if not all(key in value for key in metrics):
+            raise ValueError('progress counts require completed, total and unit')
+        if (type(value['completed']) is not int or type(value['total']) is not int
+                or not 0 <= value['completed'] <= value['total'] or value['total'] <= 0
+                or not isinstance(value['unit'], str) or not value['unit'].strip()):
+            raise ValueError('invalid progress counts')
+    return {key: value[key] for key in ('availability', 'label', *metrics) if key in value}
 
 
 class SmokeRequests:
@@ -155,7 +176,87 @@ class SmokeRequests:
             if response.get("actor") != {"kind": "unverified-caller", "id": None}:
                 raise ValueError("response actor attribution must remain unverified")
             _timestamp(response.get("responded_at"), "responded_at")
+        if 'progress' in record:
+            _progress(record['progress'])
+            if type(record['progress'].get('revision')) is not int or record['progress']['revision'] < 1:
+                raise ValueError('invalid progress revision')
+            _timestamp(record['progress'].get('updated_at'), 'updated_at')
         return record
+
+    def update(self, identity, value):
+        payload = _progress(value)
+        revision = value.get('expected_revision')
+        if type(revision) is not int or revision < 0:
+            raise ValueError('expected_revision must be a nonnegative integer')
+        with self._locked(identity):
+            record = self.get(identity)
+            if record['status'] == 'responded':
+                raise SmokeRequestConflict('smoke already has a response')
+            previous = record.get('progress')
+            if previous and payload == _progress(previous):
+                return record
+            actual = previous['revision'] if previous else 0
+            if revision != actual:
+                raise SmokeRequestConflict('progress revision changed; reread before updating')
+            record['progress'] = {**payload, 'revision': actual + 1, 'updated_at': _now()}
+            return self._write(record)
+
+    def display(self, record):
+        request = record['request']
+        progress = record.get('progress')
+        availability = progress['availability'] if progress else request['availability']
+        result = {'phase': 'responded' if record['status'] == 'responded' else
+                  {'prepared': 'operator-needed', 'preparation-needed': 'preparing',
+                   'unavailable': 'blocked'}[availability],
+                  'label': progress['label'] if progress else request['availability_note'],
+                  'progress': progress, 'source_authority': 'caller-declared',
+                  'created_at': record['created_at'], 'job_id': request.get('job_id')}
+        if not request.get('job_id') or record['status'] == 'responded':
+            return result
+        try:
+            root, job_id = self.directory.parent, request['job_id']
+            matches = [root/state/job_id for state in ('pending','running','done','failed','cancelled')
+                       if (root/state/job_id).is_dir()]
+            if len(matches) != 1:
+                raise ValueError('linked job is missing or ambiguous')
+            path = matches[0]
+            state = json.loads((path/'status.json').read_text())
+            job = json.loads((path/'request.json').read_text())
+            if not isinstance(state, dict) or not isinstance(job, dict):
+                raise ValueError('linked job records are malformed')
+            if state.get('job_id') != job_id or state.get('status') != path.parent.name:
+                raise ValueError('linked job identity or state conflicts with containment')
+            if job.get('job_id') != job_id or job.get('agent_id') != request['source']['agent_id']:
+                raise ValueError('linked job owner or identity conflicts with smoke request')
+            stage = path.parent.name
+            if stage != 'done':
+                result['phase'] = {'pending':'waiting-gpu','running':'running',
+                                   'failed':'failed','cancelled':'cancelled'}[stage]
+            result['job_state'] = stage
+            result['started_at'] = state.get('started_at')
+            if stage == 'pending':
+                submitted = state.get('submitted_at')
+                position = 1
+                if type(submitted) not in (int,float) or not math.isfinite(submitted):
+                    raise ValueError('linked job submission time is unavailable')
+                for other in (root/'pending').iterdir():
+                    if other == path or not (other/'status.json').is_file():
+                        continue
+                    stamp = json.loads((other/'status.json').read_text()).get('submitted_at')
+                    if type(stamp) not in (int,float) or not math.isfinite(stamp):
+                        raise ValueError('queue order is unverified')
+                    position += stamp < submitted
+                result['queue_position'] = position
+        except (OSError, ValueError, TypeError, KeyError) as error:
+            result.update(phase='unknown', progress=None, error=str(error))
+        return result
+
+    def snapshot(self):
+        records, errors = self.scan()
+        return {'schema': 'gpu-greenroom.smoke-request-list.v1', 'observed_at': _now(),
+                'queue_dir': str(self.directory.parent.resolve()),
+                'items': [{**record, 'display': self.display(record)} for record in records],
+                'errors': errors}
 
     def submit(self, value: object) -> tuple[dict, bool]:
         request = validate_request(value)
@@ -188,6 +289,8 @@ class SmokeRequests:
                 if record["response"]["text"] != text:
                     raise SmokeRequestConflict("smoke request already has a different response")
                 return record
+            if self.display(record)['phase'] != 'operator-needed':
+                raise SmokeRequestConflict('smoke is not available for operator response')
             record["response"] = {
                 "request_digest": record["request_digest"],
                 "text": text,

@@ -110,8 +110,10 @@ def cmd_smoke_request(args):
     elif args.smoke_action == "get":
         print(json.dumps(store.get(args.request_id), indent=2))
     elif args.smoke_action == "list":
-        records, errors = store.scan()
-        print(json.dumps({"items": records, "errors": errors}, indent=2))
+        print(json.dumps(store.snapshot(), indent=2))
+    elif args.smoke_action == 'update':
+        payload = json.loads(Path(args.update_file).expanduser().read_text())
+        print(json.dumps(store.update(args.request_id, payload), indent=2))
 
 
 def _parse_env_assignments(assignments):
@@ -785,6 +787,10 @@ def main():
     p_smoke_get.set_defaults(func=cmd_smoke_request)
     p_smoke_list = smoke_sub.add_parser("list", help="List smoke requests and malformed-record diagnostics")
     p_smoke_list.set_defaults(func=cmd_smoke_request)
+    p_smoke_update = smoke_sub.add_parser('update', help='Publish phase and counted progress from JSON')
+    p_smoke_update.add_argument('request_id')
+    p_smoke_update.add_argument('update_file')
+    p_smoke_update.set_defaults(func=cmd_smoke_request)
 
     # operator console
     p_operator = sub.add_parser("operator", help="Run the authenticated localhost operator console")
