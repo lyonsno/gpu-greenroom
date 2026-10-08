@@ -252,8 +252,11 @@ class SmokeRequests:
         return result
 
     def snapshot(self):
+        if not self.directory.parent.is_dir():
+            raise ValueError('Greenroom queue root is unavailable')
         records, errors = self.scan()
         return {'schema': 'gpu-greenroom.smoke-request-list.v1', 'observed_at': _now(),
+                'reader_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                 'queue_dir': str(self.directory.parent.resolve()),
                 'items': [{**record, 'display': self.display(record)} for record in records],
                 'errors': errors}

@@ -92,6 +92,15 @@ def test_terminal_job_and_malformed_job_stay_explicit(tmp_path):
     assert store.snapshot()['items'][0]['display']['phase']=='unknown'
 
 
+def test_missing_queue_is_not_a_healthy_empty_smoke_source(tmp_path):
+    root = tmp_path/'absent-queue'
+    with pytest.raises(ValueError,match='queue'):
+        SmokeRequests(root/'smoke-requests').snapshot()
+    assert not root.exists()
+    root.mkdir()
+    assert SmokeRequests(root/'smoke-requests').snapshot()['items']==[]
+
+
 def test_completed_counts_do_not_replace_operator_response(tmp_path):
     store = SmokeRequests(tmp_path/'smoke-requests')
     value = request(tmp_path)
