@@ -147,6 +147,57 @@ def test_legacy_schema_cannot_silently_drop_preflight(tmp_path):
     assert not list((tmp_path / "queue" / "pending").iterdir())
 
 
+@pytest.mark.parametrize('flagged', [False, True])
+def test_interpreter_entry_script_is_bound_with_relative_path_or_flags(tmp_path, flagged):
+    queue = GPUQueue(tmp_path / 'queue')
+    path = tmp_path / 'live.py'
+    path.write_text("print('original')")
+    manifest = command(tmp_path)
+    manifest['argv'] = [sys.executable, '-u', str(path)] if flagged else [sys.executable, 'live.py']
+    plan = admission.prepare(queue, manifest)
+    path.write_text("print('changed')")
+    with pytest.raises(ValueError, match='changed'):
+        admission.submit_prepared(queue, plan)
+    assert not list((queue.queue_dir / 'pending').iterdir())
+
+
+def test_preflight_cooperative_combination_is_refused_before_save_or_gpu(tmp_path):
+    manifest = command(tmp_path)
+    manifest['cooperative_checkpoint'] = True
+    queue = GPUQueue(tmp_path / 'queue')
+    with pytest.raises(ValueError, match='successor'):
+        admission.prepare(queue, manifest)
+    assert not list((queue.queue_dir / 'pending').iterdir())
+
+
+def test_prepared_and_pending_validation_dependencies_are_retained(tmp_path):
+    from gpu_queue.gc import ActiveRefs
+    queue = GPUQueue(tmp_path / 'queue')
+    old = queue.queue_dir / 'outputs' / 'old-producer'
+    old.mkdir()
+    dependency = old / 'config.json'
+    dependency.write_text('{"requiredStages": ["stage-a"]}')
+    manifest = command(tmp_path)
+    spec = preflight(tmp_path)
+    spec['argv'][-1] = str(dependency)
+    spec['inputs'][-1] = str(dependency)
+    manifest['preflight'] = spec
+    store = SmokeRequests(queue.queue_dir / 'smoke-requests')
+    record, _ = store.submit(smoke(tmp_path, manifest))
+    assert ActiveRefs.load(queue.queue_dir).mentions('old-producer')
+    store.start(record['request']['id'], record['request_digest'])
+    assert ActiveRefs.load(queue.queue_dir).mentions('old-producer')
+
+
+def test_unreadable_prepared_or_validation_record_withholds_collection(tmp_path):
+    from gpu_queue.gc import ActiveRefs
+    queue = GPUQueue(tmp_path / 'queue')
+    store = SmokeRequests(queue.queue_dir / 'smoke-requests')
+    record, _ = store.submit(smoke(tmp_path, command(tmp_path)))
+    store.path(record['request']['id']).write_text('{')
+    assert ActiveRefs.load(queue.queue_dir).unreadable
+
+
 def test_waiting_operator_does_not_block_other_work_and_start_respects_pause(tmp_path):
     queue = GPUQueue(tmp_path / 'queue')
     store = SmokeRequests(queue.queue_dir / 'smoke-requests')

@@ -78,6 +78,19 @@ model checkpoint or runtime. Start/submission rechecks the bindings; dispatch
 rechecks again before running. Changed data fails validation-invalidated without
 a child, started_at or fairness turn. Runtime/backend checks still run at execution.
 New jobs require command-preflight.v1; old workers leave them unclaimed.
+Python direct-script forms support common flags such as -u and -B and relative
+paths resolved from command cwd. Node and shell direct scripts and inline source
+are supported; unfamiliar interpreter options/module loading are refused with
+the direct-script or inline-wrapper continuation. Imported code still requires
+explicit inputs. Command v3 with cooperative_checkpoint is refused before any
+save or execution until successor validation is supported; the separate v2
+checkpoint protocol is unchanged.
+
+Queue retention follows unconsumed prepared smoke plans and pending/running
+validation bindings; unreadable relevant records withhold collection. An external
+plan saved to an invoker-selected path is outside queue discovery: that invoker
+owns retaining its dependencies until submission or retirement. Creating such a
+file does not claim an automatic queue pin.
 
 ```sh
 gpu-greenroom --queue-dir /durable/queue prepare-command --manifest command-v3.json --output plan.json

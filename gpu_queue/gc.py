@@ -289,10 +289,35 @@ class ActiveRefs:
                 config = None
                 if job_types and isinstance(request, dict):
                     config = job_types.get(request.get("job_type") or "")
-                for doc in (request, state, config):
+                validation = None
+                validation_path = job_dir / 'validation.json'
+                needs_validation = isinstance(request, dict) and 'command-preflight.v1' in request.get('required_worker_capabilities', [])
+                if validation_path.exists() or needs_validation:
+                    validation = _load_json(validation_path)
+                    if (not isinstance(validation, dict) or validation.get('schema') != 'gpu-greenroom.command-validation.v1'
+                            or not isinstance(validation.get('bindings'), list)
+                            or not all(isinstance(row, dict) and isinstance(row.get('path'), str)
+                                       for row in validation.get('bindings', []))):
+                        unreadable.append(str(validation_path))
+                for doc in (request, state, config, validation):
                     for text in _strings_in(doc):
                         texts.append(text)
                         names |= _names_in_string(text, outputs, outputs_prefix)
+        smoke_directory = queue_dir / 'smoke-requests'
+        if smoke_directory.is_dir():
+            from .smoke_requests import SmokeRequests
+            store = SmokeRequests(smoke_directory)
+            for path in smoke_directory.glob('*.json'):
+                try:
+                    record = store.get(path.stem)
+                except (OSError, ValueError, TypeError, KeyError):
+                    unreadable.append(str(path))
+                    continue
+                if record['status'] == 'responded' or 'prepared' not in record:
+                    continue
+                for text in _strings_in(record['prepared']):
+                    texts.append(text)
+                    names |= _names_in_string(text, outputs, outputs_prefix)
         return cls(names, texts, unreadable)
 
     def mentions(self, name: str) -> bool:

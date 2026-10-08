@@ -8,6 +8,7 @@ import hashlib
 import json
 import math
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -64,6 +65,45 @@ def executable(argv, cwd, env):
     return resolved
 
 
+def entry_script(argv, cwd):
+    name = Path(argv[0]).name
+    python = re.fullmatch(r'python(?:\d+(?:\.\d+)*)?', name) is not None
+    node = name in {'node', 'nodejs'}
+    shell = name in {'sh', 'bash', 'zsh'}
+    if not (python or node or shell):
+        return []
+    index = 1
+    simple_flags = {'-u', '-B', '-E', '-I', '-O', '-OO', '-q', '-s', '-S', '-v', '-b', '-bb'} if python else {'--no-warnings'}
+    while index < len(argv):
+        value = argv[index]
+        if value in ({'-c'} if python or shell else {'-e', '--eval', '-p', '--print'}):
+            if index + 1 >= len(argv):
+                raise ValueError('inline interpreter invocation is missing its source')
+            return []
+        if python and value == '-m':
+            raise ValueError('prevalidated module entry is unsupported; use a direct script and declare imported inputs')
+        if value == '--':
+            index += 1
+            break
+        if value in simple_flags or node and value.startswith('--input-type='):
+            index += 1
+            continue
+        if python and value in {'-W', '-X'}:
+            index += 2
+            continue
+        if value.startswith('-'):
+            raise ValueError('unsupported prevalidated interpreter option; use a direct script or inline wrapper')
+        break
+    if index >= len(argv):
+        raise ValueError('prevalidated interpreter invocation requires a script or inline source')
+    path = Path(argv[index]).expanduser()
+    if not path.is_absolute():
+        path = Path(cwd) / path
+    if not path.is_file():
+        raise ValueError(f'entry script is missing: {path}')
+    return [str(path.absolute())]
+
+
 def normalize_manifest(value):
     if not isinstance(value, dict):
         raise ValueError('command manifest must be a JSON object')
@@ -83,6 +123,8 @@ def normalize_manifest(value):
     cooperative = payload.get('cooperative_checkpoint', False)
     if type(cooperative) is not bool or cooperative and schema == 'gpu-greenroom.command.v1':
         raise ValueError('cooperative_checkpoint requires command.v2 or v3 and a boolean')
+    if cooperative and schema == 'gpu-greenroom.command.v3':
+        raise ValueError('command.v3 cooperative continuation requires successor validation support; use the separate command.v2 checkpoint contract')
     owner = payload.get('agent_id')
     if owner is not None and (not isinstance(owner, str) or not owner.strip()):
         raise ValueError('agent_id must be a non-empty string when supplied')
@@ -171,12 +213,10 @@ def validate(queue, request, preflight):
               'gpu_execution_authority': False, 'bindings': [], 'report_path': str(directory / 'validation.json')}
     try:
         paths = [request.command_argv[0]]
-        if len(request.command_argv) > 1 and Path(request.command_argv[1]).is_absolute() and Path(request.command_argv[1]).is_file():
-            paths.append(request.command_argv[1])
+        paths += entry_script(request.command_argv, request.command_cwd)
         if preflight:
             paths += [preflight['argv'][0], *preflight['inputs']]
-            if len(preflight['argv']) > 1 and Path(preflight['argv'][1]).is_absolute() and Path(preflight['argv'][1]).is_file():
-                paths.append(preflight['argv'][1])
+            paths += entry_script(preflight['argv'], request.command_cwd)
         report['bindings'] = [file_binding(path) for path in dict.fromkeys(paths)]
         if preflight:
             report['phase'] = 'application-preflight'

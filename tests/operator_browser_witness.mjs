@@ -14,6 +14,7 @@ const profile = mkdtempSync(join(tmpdir(), 'greenroom-browser-witness-'));
 const browser = spawn(chromePath, [
   '--headless=new', '--no-first-run', '--no-default-browser-check',
   '--disable-gpu',
+  '--use-mock-keychain', '--password-store=basic',
   '--disable-background-networking', '--remote-allow-origins=*',
   '--remote-debugging-port=0', `--user-data-dir=${profile}`, 'about:blank',
 ], {detached: true, stdio: 'ignore'});
@@ -50,9 +51,10 @@ try {
   const browserVersion = await (await fetch(`http://127.0.0.1:${port}/json/version`)).json();
   browserIdentity = browserVersion.Browser;
   markPhase('target-creation');
-  const targetResponse = await fetch(`http://127.0.0.1:${port}/json/new?about:blank`, {method: 'PUT'});
+  const targetResponse = await fetch(`http://127.0.0.1:${port}/json/new?${base}/`, {method: 'PUT'});
   assert.equal(targetResponse.status, 200, 'Chrome must create an isolated page target');
   const target = await targetResponse.json();
+  writeFileSync(join(artifactDirectory, `${scenario}-target.json`), JSON.stringify(target));
   socket = new WebSocket(target.webSocketDebuggerUrl);
   markPhase('devtools-connection');
   await new Promise((resolve, reject) => {
@@ -85,8 +87,13 @@ try {
   await command('Page.enable');
   await command('Runtime.enable');
   markPhase('initial-render');
-  await command('Page.navigate', {url: `${base}/#token=secret`});
-  await eventually(() => evaluate(`Boolean(document.querySelector('#smokeRequestList .smoke-card'))`), Boolean, 'initial Greenroom request render');
+  await command('Page.navigate', {url: `${base}/`});
+  try {
+    await eventually(() => evaluate(`Boolean(document.querySelector('#smokeRequestList .smoke-card'))`), Boolean, 'initial Greenroom request render');
+  } catch (error) {
+    writeFileSync(join(artifactDirectory, `${scenario}-document.json`), await evaluate(`JSON.stringify({href:location.href,body:document.body?.innerText,html:document.documentElement.outerHTML})`));
+    throw error;
+  }
   markPhase('initial-screenshot');
   await command('Page.bringToFront');
   const initialFrame = await command('Page.captureScreenshot', {format: 'png', fromSurface: true});

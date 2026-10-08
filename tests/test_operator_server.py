@@ -58,7 +58,7 @@ def _run_operator_browser_witness(tmp_path, scenario, *, responded=False):
 
     queue_dir = tmp_path / "queue"
     queue_dir.mkdir()
-    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(queue_dir, "secret", admission_control=True))
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(queue_dir, "secret", admission_control=True, local_operator=True))
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     base = f"http://127.0.0.1:{server.server_address[1]}"
