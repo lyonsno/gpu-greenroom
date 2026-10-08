@@ -16,6 +16,7 @@ from .control import QueueControlError, QueueRegistry
 from .models import BumpStatus, JobRequest, JobStatus, LeaseStatus
 from . import gc as gc_mod
 from . import lineage as lineage_mod
+from . import admission
 from .smoke_requests import SmokeRequests
 from .queue import (
     GPUQueue,
@@ -23,6 +24,7 @@ from .queue import (
     STRUCTURED_COMMAND_CAPABILITY,
     effective_worker_capabilities,
     worker_identity,
+    _safe_substitute,
 )
 
 DEFAULT_QUEUE_DIR = os.environ.get("GPU_GREENROOM_DIR", os.path.expanduser("~/.local/state/gpu-greenroom"))
@@ -87,7 +89,25 @@ def cmd_submit(args):
         agent_id=_optional_agent_id(args.agent_id),
         service_class=getattr(args,'service_class',None),
     )
-    job_dir = queue.submit(request)
+    try:
+        definitions = _load_job_types(args.queue_dir, strict=True)
+        if request.job_type not in definitions:
+            raise ValueError(f'Unknown job type: {request.job_type}')
+        definition = definitions[request.job_type]
+        config = {'cmd': definition} if isinstance(definition, list) else definition
+        if not isinstance(config, dict) or not isinstance(config.get('cmd'), list):
+            raise ValueError('job type command definition is malformed')
+        cwd = request.params.get('cwd') or config.get('cwd') or os.getcwd()
+        if not Path(cwd).is_dir():
+            raise ValueError(f'job cwd is missing: {cwd}')
+        values = {**config.get('defaults', {}), **request.params,
+                  'input_path': request.input_path, 'output_dir': request.output_dir}
+        argv = [_safe_substitute(value, values) for value in config['cmd']]
+        admission.executable(argv, cwd, config.get('env') or {})
+        job_dir = queue.submit(request)
+    except (OSError, ValueError, TypeError, KeyError) as error:
+        print(json.dumps(_write_submission_failure(queue, args, error), indent=2), file=sys.stderr)
+        sys.exit(2)
     print(f"Submitted job {request.job_id}")
     print(f"  Type: {request.job_type}")
     print(f"  Input: {request.input_path}")
@@ -115,6 +135,35 @@ def cmd_smoke_request(args):
     elif args.smoke_action == 'update':
         payload = json.loads(Path(args.update_file).expanduser().read_text())
         print(json.dumps(store.update(args.request_id, payload), indent=2))
+    elif args.smoke_action == 'start':
+        print(json.dumps(store.start(args.request_id, args.request_digest), indent=2))
+
+
+def cmd_prepared_command(args):
+    queue = get_queue(args)
+    try:
+        if args.command == 'prepare-command':
+            plan = admission.prepare(queue, json.loads(Path(args.manifest).expanduser().read_text()))
+            output = Path(args.output).expanduser().absolute()
+            from .dispatch import atomic_write
+            atomic_write(output, plan)
+            print(json.dumps({'schema': admission.PLAN_SCHEMA, 'plan_path': str(output),
+                              'job_id': plan['job_request']['job_id'], 'status': 'validated-not-enqueued'}, indent=2))
+        else:
+            plan = json.loads(Path(args.plan).expanduser().read_text())
+            path = admission.submit_prepared(queue, plan)
+            print(json.dumps({'job_id': path.name, 'job_path': str(path),
+                              'effective_queue_dir': str(queue.queue_dir.resolve())}, indent=2))
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        from .dispatch import atomic_write
+        root = queue.queue_dir / 'submission-failures'
+        path = root / f'{time.time_ns()}-prepared-command.json'
+        report = {'schema': 'gpu-greenroom.prepared-command-failure.v1', 'status': 'failed',
+                  'failure_phase': 'submission-validation', 'error_message': str(error),
+                  'effective_queue_dir': str(queue.queue_dir.resolve()), 'report_path': str(path)}
+        atomic_write(path, report)
+        print(json.dumps(report, indent=2), file=sys.stderr)
+        sys.exit(2)
 
 
 def _parse_env_assignments(assignments):
@@ -170,58 +219,22 @@ def _command_payload(args):
             "cooperative_checkpoint": bool(getattr(args,'cooperative_checkpoint',False)),
         }
 
-    if not isinstance(payload, dict):
-        raise ValueError("command manifest must be a JSON object")
-    if payload.get("schema") not in {"gpu-greenroom.command.v1","gpu-greenroom.command.v2"}:
-        raise ValueError("command manifest schema must be gpu-greenroom.command.v1 or v2")
-    service_class=payload.get('service_class')
-    if service_class is not None and (payload['schema']!='gpu-greenroom.command.v2' or service_class not in {'normal','quick'}):
-        raise ValueError('service_class requires command.v2 and must be normal or quick')
-    cooperative_checkpoint=payload.get('cooperative_checkpoint',False)
-    if type(cooperative_checkpoint) is not bool or cooperative_checkpoint and payload['schema']!='gpu-greenroom.command.v2':
-        raise ValueError('cooperative_checkpoint requires command.v2 and a boolean')
-    agent_id = _optional_agent_id(payload.get("agent_id"))
-    argv = payload.get("argv")
-    if not isinstance(argv, list) or not argv or not all(isinstance(item, str) for item in argv):
-        raise ValueError("command manifest argv must be a non-empty list of strings")
-    for key in ("repo_root", "cwd", "route_identity"):
-        if not isinstance(payload.get(key), str) or not payload[key]:
-            raise ValueError(f"command manifest {key} must be a non-empty string")
-    repo_root = Path(payload["repo_root"]).expanduser().resolve()
-    cwd = Path(payload["cwd"]).expanduser().resolve()
-    if not repo_root.is_dir():
-        raise ValueError(f"command repo_root is not a directory: {repo_root}")
-    if not cwd.is_dir():
-        raise ValueError(f"command cwd is not a directory: {cwd}")
-    env = payload.get("env") or {}
-    if (
-        not isinstance(env, dict)
-        or not all(isinstance(key, str) and isinstance(value, str) for key, value in env.items())
-    ):
-        raise ValueError("command manifest env must map strings to strings")
-    timeout = payload.get("timeout")
-    if timeout is not None and (not isinstance(timeout, (int, float)) or timeout <= 0):
-        raise ValueError("command manifest timeout must be null or a positive number")
-    output_dir = payload.get("output_dir") or ""
-    if not isinstance(output_dir, str):
-        raise ValueError("command manifest output_dir must be a string")
-    output_class = payload.get("output_class")
-    if output_class is not None and output_class not in gc_mod.CLASSES:
-        raise ValueError(f"command manifest output_class must be one of {', '.join(gc_mod.CLASSES)} or absent")
+    payload = admission.normalize_manifest(payload)
     return {
-        "output_class": output_class,
+        "output_class": payload.get('output_class'),
         "manifest_path": str(manifest_path) if manifest_path else None,
-        "repo_root": str(repo_root),
-        "cwd": str(cwd),
-        "env": env,
-        "agent_id": agent_id,
-        "output_dir": output_dir,
+        "repo_root": payload['repo_root'],
+        "cwd": payload['cwd'],
+        "env": payload['env'],
+        "agent_id": payload.get('agent_id'),
+        "output_dir": payload['output_dir'],
         "route_identity": payload["route_identity"],
-        "argv": argv,
-        "timeout": timeout,
-        "service_class": service_class,
+        "argv": payload['argv'],
+        "timeout": payload['timeout'],
+        "service_class": payload['service_class'],
         "command_schema": payload['schema'],
-        "cooperative_checkpoint": cooperative_checkpoint,
+        "cooperative_checkpoint": payload['cooperative_checkpoint'],
+        "preflight": payload['preflight'],
     }
 
 
@@ -231,7 +244,7 @@ def _write_submission_failure(queue, args, error):
     report_path = failure_dir / f"{time.time_ns()}-command-submission.json"
     manifest_path = (
         str(Path(args.manifest).expanduser().resolve())
-        if args.manifest else None
+        if getattr(args, 'manifest', None) else None
     )
     report = {
         "schema": "gpu-greenroom.command-submission-failure.v1",
@@ -255,6 +268,19 @@ def cmd_submit_command(args):
         print(json.dumps(report, indent=2), file=sys.stderr)
         sys.exit(2)
 
+    if payload['command_schema'] == 'gpu-greenroom.command.v3':
+        try:
+            plan = admission.prepare(queue, {**payload, 'schema': payload['command_schema']})
+            job_dir = admission.submit_prepared(queue, plan)
+            request = JobRequest.from_json(json.dumps(plan['job_request']))
+        except (ValueError, OSError) as error:
+            print(json.dumps(_write_submission_failure(queue, args, error), indent=2), file=sys.stderr)
+            sys.exit(2)
+        print(json.dumps({'schema': 'gpu-greenroom.command-submission.v1', 'job_id': request.job_id,
+                          'status': 'submitted', 'effective_queue_dir': str(queue.queue_dir.resolve()),
+                          'request_path': str(job_dir / 'request.json'), 'output_dir': request.output_dir,
+                          'validation': plan['validation'], 'required_worker_capabilities': request.required_worker_capabilities}, indent=2))
+        return
     request = JobRequest(
         job_type="command",
         input_path="",
@@ -343,15 +369,19 @@ def cmd_operator(args):
     )
 
 
-def _load_job_types(queue_dir):
+def _load_job_types(queue_dir, *, strict=False):
     """Load job types from defaults + config file. Called per-job so new types are picked up live."""
     job_types = dict(DEFAULT_JOB_TYPES)
     config_path = Path(queue_dir) / "job_types.json"
     if config_path.exists():
         try:
             custom = json.loads(config_path.read_text())
+            if not isinstance(custom, dict):
+                raise ValueError('job_types.json must be an object')
             job_types.update(custom)
-        except (json.JSONDecodeError, OSError) as e:
+        except (ValueError, OSError) as e:
+            if strict:
+                raise ValueError(f'job type registry is unreadable: {e}') from e
             print(f"Warning: could not load job_types.json at {config_path}: {e}", file=sys.stderr)
     return job_types
 
@@ -803,6 +833,14 @@ def main():
     p_command.add_argument('--service-class',choices=['normal','quick'],default=None)
     p_command.add_argument('--cooperative-checkpoint',action='store_true',default=None)
 
+    p_prepare = sub.add_parser('prepare-command', help='Validate and preserve a command without enqueueing')
+    p_prepare.add_argument('--manifest', required=True)
+    p_prepare.add_argument('--output', required=True)
+    p_prepare.set_defaults(func=cmd_prepared_command)
+    p_prepared = sub.add_parser('submit-prepared', help='Recheck and enqueue a preserved command')
+    p_prepared.add_argument('plan')
+    p_prepared.set_defaults(func=cmd_prepared_command)
+
     p_dispatch=sub.add_parser('dispatch-policy',help='Inspect or configure optional normal/quick dispatch')
     p_dispatch.add_argument('--config',help='gpu-greenroom.dispatch-policy.v1 JSON file; omitted reads current policy')
     p_dispatch.add_argument('--owner',default='dispatch-cli')
@@ -827,6 +865,10 @@ def main():
     # Interactive-smoke requests are Greenroom-owned records, separate from GPU jobs.
     p_smoke = sub.add_parser("smoke-request", help="Create or inspect Greenroom-owned interactive-smoke requests")
     smoke_sub = p_smoke.add_subparsers(dest="smoke_action", required=True)
+    p_start = smoke_sub.add_parser('start', help='Activate one prepared operator command')
+    p_start.add_argument('request_id')
+    p_start.add_argument('--request-digest', required=True)
+    p_start.set_defaults(func=cmd_smoke_request)
     p_smoke_submit = smoke_sub.add_parser("submit", help="Submit an operator-needed smoke request from JSON")
     p_smoke_submit.add_argument("request_file", help="gpu-greenroom.interactive-smoke.v1 JSON file")
     p_smoke_submit.set_defaults(func=cmd_smoke_request)

@@ -14,7 +14,8 @@ from pathlib import Path
 import tempfile
 from urllib.parse import urlsplit
 from uuid import UUID
-from . import dispatch
+from . import admission, dispatch
+from .models import JobRequest
 
 
 SCHEMA = "gpu-greenroom.interactive-smoke.v1"
@@ -185,7 +186,69 @@ class SmokeRequests:
             if type(record['progress'].get('revision')) is not int or record['progress']['revision'] < 1:
                 raise ValueError('invalid progress revision')
             _timestamp(record['progress'].get('updated_at'), 'updated_at')
+        if 'operator_command' in request:
+            plan = record.get('prepared')
+            if not isinstance(plan, dict) or plan.get('schema') != admission.PLAN_SCHEMA:
+                raise ValueError('prepared operator command is missing')
+            if plan.get('manifest_digest') != admission.digest(request['operator_command']):
+                raise ValueError('prepared operator command manifest changed')
+            job = JobRequest.from_json(json.dumps(plan['job_request']))
+            validation = plan.get('validation')
+            if (job.agent_id != request['source']['agent_id'] or job.repo_root != str(Path(request['source']['repo_root']).resolve())
+                    or not isinstance(validation, dict) or validation.get('valid') is not True
+                    or validation.get('request_digest') != admission.request_identity(job)
+                    or job.params.get(admission.DIGEST_PARAM) != admission.digest(validation)):
+                raise ValueError('prepared command owner or validation identity conflicts')
         return record
+
+    @staticmethod
+    def public_record(record):
+        result = deepcopy(record)
+        plan = result.pop('prepared', None)
+        if 'operator_command' in result['request']:
+            command = result['request']['operator_command']
+            result['request']['operator_command'] = {'schema': command.get('schema'),
+                'route_identity': command.get('route_identity'), 'agent_id': command.get('agent_id')}
+            if plan:
+                result['prepared_job_id'] = plan['job_request']['job_id']
+        return result
+
+    def start(self, identity, request_digest):
+        from .queue import GPUQueue
+        with self._locked(identity):
+            record = self.get(identity)
+            if request_digest != record['request_digest']:
+                raise SmokeRequestConflict('smoke request changed; reread before starting')
+            if record['status'] == 'responded' or 'prepared' not in record:
+                raise SmokeRequestConflict('smoke has no pending operator-start command')
+            if record.get('activation'):
+                return record
+            plan = record['prepared']
+            planned = JobRequest.from_json(json.dumps(plan['job_request']))
+            queue = GPUQueue(self.directory.parent)
+            existing = [queue.queue_dir / state / planned.job_id
+                        for state in ('pending', 'running', 'done', 'failed', 'cancelled')
+                        if (queue.queue_dir / state / planned.job_id).is_dir()]
+            if existing:
+                if len(existing) != 1:
+                    raise SmokeRequestConflict('prepared job identity is ambiguous')
+                actual = JobRequest.from_json((existing[0] / 'request.json').read_text())
+                if not admission.same_request(actual, planned):
+                    raise SmokeRequestConflict('prepared job identity belongs to different work')
+                path = existing[0]
+            else:
+                try:
+                    path = admission.submit_prepared(queue, plan)
+                except (ValueError, OSError) as error:
+                    record['activation_error'] = {'phase': 'validation', 'error': str(error), 'observed_at': _now()}
+                    self._write(record)
+                    raise
+            record.pop('activation_error', None)
+            record['activation'] = {'schema': 'gpu-greenroom.operator-start.v1',
+                'request_digest': request_digest, 'job_id': planned.job_id,
+                'requested_at': _now(), 'job_path': str(path),
+                'actor': {'kind': 'unverified-caller', 'id': None}}
+            return self._write(record)
 
     def update(self, identity, value):
         payload = _progress(value)
@@ -215,6 +278,16 @@ class SmokeRequests:
                   'label': progress['label'] if progress else request['availability_note'],
                   'progress': progress, 'source_authority': 'caller-declared',
                   'created_at': record['created_at'], 'job_id': (progress or {}).get('current_job_id', request.get('job_id'))}
+        if 'prepared' in record:
+            if record.get('activation'):
+                result['job_id'] = record['activation']['job_id']
+                result['operator_start_at'] = record['activation']['requested_at']
+            elif record.get('activation_error'):
+                return {**result, 'phase': 'blocked', 'progress': None,
+                        'error': record['activation_error']['error'], 'job_id': None}
+            else:
+                return {**result, 'phase': 'awaiting-start', 'job_id': None,
+                        'label': 'Prepared; GPU not acquired'}
         if not result['job_id'] or record['status'] == 'responded':
             return result
         try:
@@ -251,7 +324,7 @@ class SmokeRequests:
         return {'schema': 'gpu-greenroom.smoke-request-list.v1', 'observed_at': _now(),
                 'reader_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                 'queue_dir': str(self.directory.parent.resolve()),
-                'items': [{**record, 'display': self.display(record)} for record in records],
+                'items': [{**self.public_record(record), 'display': self.display(record)} for record in records],
                 'errors': errors}
 
     def submit(self, value: object) -> tuple[dict, bool]:
@@ -273,6 +346,17 @@ class SmokeRequests:
                 "status": "operator-needed",
                 "response": None,
             }
+            if 'operator_command' in request:
+                if request.get('job_id'):
+                    raise ValueError('operator_command cannot also name an existing job')
+                from .queue import GPUQueue
+                plan = admission.prepare(GPUQueue(self.directory.parent), request['operator_command'])
+                job = JobRequest.from_json(json.dumps(plan['job_request']))
+                if (job.agent_id != request['source']['agent_id']
+                        or job.repo_root != str(Path(request['source']['repo_root']).resolve())):
+                    raise ValueError('operator command owner/repo must match the smoke source')
+                plan['manifest_digest'] = admission.digest(request['operator_command'])
+                record['prepared'] = plan
             return self._write(record), True
 
     def respond(self, identity: str, text: object) -> dict:

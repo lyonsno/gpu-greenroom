@@ -570,8 +570,9 @@ class TestSharedRecords:
         from gpu_queue.models import JobRequest
         m = queue_dir / "outputs" / "m"
         a = JobRequest(job_type="mesh", input_path=str(tmp_path / "in.png"), output_dir=str(m), agent_id="lane-a")
+        rq.q.submit(a)
         (queue_dir / "done" / a.job_id).mkdir()
-        rq.q.submit(a); assert rq.q.run_one(rq.job_types) is True
+        assert rq.q.run_one(rq.job_types) is True
         assert (queue_dir / "done" / a.job_id / a.job_id / "status.json").is_file()
         b = rq.run("render", m / "mesh.glb", queue_dir / "outputs" / "r", agent="lane-b")
         g = lin.lineage(queue_dir, b)

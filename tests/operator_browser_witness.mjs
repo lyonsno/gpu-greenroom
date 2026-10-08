@@ -13,6 +13,7 @@ if (!chromePath || !base || !scenario || !requestId || !sourceRevision || !artif
 const profile = mkdtempSync(join(tmpdir(), 'greenroom-browser-witness-'));
 const browser = spawn(chromePath, [
   '--headless=new', '--no-first-run', '--no-default-browser-check',
+  '--disable-gpu',
   '--disable-background-networking', '--remote-allow-origins=*',
   '--remote-debugging-port=0', `--user-data-dir=${profile}`, 'about:blank',
 ], {detached: true, stdio: 'ignore'});
@@ -20,6 +21,13 @@ let socket;
 let phase = 'chrome-startup';
 let browserIdentity = null;
 let screenshotArtifact = null;
+writeFileSync(join(artifactDirectory, `${scenario}-browser-owner.json`), JSON.stringify({
+  pid: browser.pid, profile, executable: chromePath, sourceRevision,
+}));
+function markPhase(value) {
+  phase = value;
+  writeFileSync(join(artifactDirectory, `${scenario}-phase.json`), JSON.stringify({phase, pid: browser.pid, profile}));
+}
 
 async function eventually(read, predicate, label) {
   const until = Date.now() + 8000;
@@ -41,12 +49,12 @@ try {
   const [port] = readFileSync(activePort, 'utf8').trim().split('\n');
   const browserVersion = await (await fetch(`http://127.0.0.1:${port}/json/version`)).json();
   browserIdentity = browserVersion.Browser;
-  phase = 'target-creation';
+  markPhase('target-creation');
   const targetResponse = await fetch(`http://127.0.0.1:${port}/json/new?about:blank`, {method: 'PUT'});
   assert.equal(targetResponse.status, 200, 'Chrome must create an isolated page target');
   const target = await targetResponse.json();
   socket = new WebSocket(target.webSocketDebuggerUrl);
-  phase = 'devtools-connection';
+  markPhase('devtools-connection');
   await new Promise((resolve, reject) => {
     socket.addEventListener('open', resolve, {once: true});
     socket.addEventListener('error', reject, {once: true});
@@ -63,6 +71,7 @@ try {
     else callbacks.resolve(message.result);
   });
   const command = (method, params = {}) => new Promise((resolve, reject) => {
+    writeFileSync(join(artifactDirectory, `${scenario}-last-command.json`), JSON.stringify({phase, method}));
     const id = ++nextId;
     pending.set(id, {resolve, reject});
     socket.send(JSON.stringify({id, method, params}));
@@ -75,16 +84,18 @@ try {
 
   await command('Page.enable');
   await command('Runtime.enable');
-  phase = 'initial-render';
+  markPhase('initial-render');
   await command('Page.navigate', {url: `${base}/#token=secret`});
   await eventually(() => evaluate(`Boolean(document.querySelector('#smokeRequestList .smoke-card'))`), Boolean, 'initial Greenroom request render');
+  markPhase('initial-screenshot');
+  await command('Page.bringToFront');
   const initialFrame = await command('Page.captureScreenshot', {format: 'png', fromSurface: true});
   const artifact = join(artifactDirectory, `${scenario}.png`);
   writeFileSync(artifact, Buffer.from(initialFrame.data, 'base64'));
   screenshotArtifact = artifact;
 
   if (scenario === 'stale-submit') {
-    phase = 'draft-and-stale-submit';
+    markPhase('draft-and-stale-submit');
     const typing = await evaluate(`(()=>{const t=document.querySelector('textarea.smoke-response');t.value='the draft survives';t.focus();t.setSelectionRange(4,10);return true})()`);
     assert.equal(typing, true);
     await evaluate('loadSmoke()');
@@ -112,7 +123,7 @@ try {
     assert.equal(observed.disabled, true, 'an accepted response must not re-enable a stale reply form');
     console.log(JSON.stringify({scenario, sourceRevision, effectiveRoute: base, effectiveMode: 'admission-control with disposable request fixture', apiBehavior: 'scenario-specific browser fetch interception', browser: browserVersion.Browser, artifact, assertions: ['draft/caret survives refresh', 'accepted response remains non-actionable after failed list refresh']}));
   } else if (scenario === 'malformed-list' || scenario === 'unreadable-list') {
-    phase = 'malformed-list-refresh';
+    markPhase('malformed-list-refresh');
     await evaluate(`(()=>{const realFetch=window.fetch.bind(window);window.fetch=(input,options={})=>{
       const url=new URL(typeof input==='string'?input:input.url,location.href);
       if(url.pathname==='/api/smoke-requests')return Promise.resolve(new Response(JSON.stringify(${scenario === 'malformed-list' ? "{schema:'gpu-greenroom.smoke-request-list.v1'}" : "{schema:'gpu-greenroom.smoke-request-list.v1',items:[],errors:['request record unreadable']}"}),{status:200,headers:{'Content-Type':'application/json'}}));
@@ -132,7 +143,9 @@ try {
     throw new Error(`unknown browser witness scenario: ${scenario}`);
   }
 } catch (error) {
-  console.error(JSON.stringify({scenario, sourceRevision, effectiveRoute: base, effectiveMode: 'admission-control with disposable request fixture', browser: browserIdentity, failurePhase: phase, lastTrustworthyEvidence: {screenshotArtifact}, error: String(error.stack || error)}));
+  const failure = {scenario, sourceRevision, effectiveRoute: base, effectiveMode: 'admission-control with disposable request fixture', browser: browserIdentity, failurePhase: phase, lastTrustworthyEvidence: {screenshotArtifact}, error: String(error.stack || error)};
+  writeFileSync(join(artifactDirectory, `${scenario}-failure.json`), JSON.stringify(failure));
+  console.error(JSON.stringify(failure));
   process.exitCode = 1;
 } finally {
   try { socket?.close(); } catch {}

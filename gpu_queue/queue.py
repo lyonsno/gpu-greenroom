@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from . import dispatch
+from . import admission, dispatch
 
 import ctypes
 import fcntl
@@ -17,6 +17,7 @@ import signal
 import subprocess
 import sys
 import time
+import tempfile
 import uuid
 from contextlib import contextmanager
 from functools import lru_cache
@@ -83,7 +84,7 @@ def _safe_substitute(template: str, mapping: dict) -> str:
 def effective_worker_capabilities() -> frozenset[str]:
     configured = os.environ.get("GPU_GREENROOM_WORKER_CAPABILITIES")
     if configured is None:
-        return DEFAULT_WORKER_CAPABILITIES | {dispatch.CAPABILITY,'structured-command.v2','checkpoint-continuation.v1'}
+        return DEFAULT_WORKER_CAPABILITIES | {dispatch.CAPABILITY,'structured-command.v2','checkpoint-continuation.v1',admission.CAPABILITY}
     return frozenset(
         capability.strip()
         for capability in configured.split(",")
@@ -1076,7 +1077,7 @@ class GPUQueue:
         return any(resolved == p or resolved.startswith(p + "/")
                     for p in self.VOLATILE_PREFIXES)
 
-    def submit(self, request: JobRequest, *, _staged=False) -> Path:
+    def submit(self, request: JobRequest, *, _staged=False, validation=None) -> Path:
         """Submit a job. Returns the job directory path.
 
         If output_dir is empty, auto-assigns a durable path under
@@ -1107,14 +1108,33 @@ class GPUQueue:
         if not request.output_dir:
             request.output_dir = str(self.queue_dir / "outputs" / request.job_id)
 
-        job_dir = self.queue_dir / ("continuation-staging" if _staged else "pending") / request.job_id
-        job_dir.mkdir(parents=True, exist_ok=not _staged)
+        if admission.CAPABILITY in request.required_worker_capabilities:
+            admission.assert_current(request, validation)
+
+        if not _staged:
+            with self._coordination_lock():
+                existing = [self.queue_dir / state / request.job_id
+                            for state in ('pending', 'running', 'done', 'failed', 'cancelled')
+                            if (self.queue_dir / state / request.job_id).exists()]
+                if existing:
+                    if len(existing) != 1:
+                        raise ValueError('job identity is ambiguous')
+                    previous = JobRequest.from_json((existing[0] / 'request.json').read_text())
+                    if not admission.same_request(previous, request):
+                        raise ValueError('job identity already belongs to a different request')
+                    return existing[0]
+
+        staging_root = self.queue_dir / 'submission-staging'
+        staging_root.mkdir(exist_ok=True)
+        job_dir = (self.queue_dir / 'continuation-staging' / request.job_id if _staged else
+                   Path(tempfile.mkdtemp(prefix=request.job_id + '-', dir=staging_root)))
+        if _staged:
+            job_dir.mkdir(parents=True, exist_ok=False)
 
         # Write request
-        if _staged:
-            dispatch.atomic_write(job_dir/'request.json',json.loads(request.to_json()))
-        else:
-            (job_dir / "request.json").write_text(request.to_json())
+        dispatch.atomic_write(job_dir/'request.json',json.loads(request.to_json()))
+        if validation is not None:
+            dispatch.atomic_write(job_dir/'validation.json',validation)
 
         warnings = []
         if self._is_volatile(request.output_dir):
@@ -1131,10 +1151,29 @@ class GPUQueue:
             submitted_at=request.submitted_at,
             warnings=warnings,
         )
-        if _staged:
-            dispatch.atomic_write(job_dir/'status.json',json.loads(state.to_json()))
-        else:
-            (job_dir / "status.json").write_text(state.to_json())
+        dispatch.atomic_write(job_dir/'status.json',json.loads(state.to_json()))
+        if not _staged:
+            destination = self.queue_dir / 'pending' / request.job_id
+            with self._coordination_lock():
+                existing = [self.queue_dir / bucket / request.job_id
+                            for bucket in ('pending', 'running', 'done', 'failed', 'cancelled')
+                            if (self.queue_dir / bucket / request.job_id).exists()]
+                if existing:
+                    if len(existing) != 1:
+                        raise ValueError('job identity is ambiguous')
+                    previous = JobRequest.from_json((existing[0] / 'request.json').read_text())
+                    if not admission.same_request(previous, request):
+                        raise ValueError('job identity already belongs to a different request')
+                    shutil.rmtree(job_dir)
+                    return existing[0]
+                job_dir.rename(destination)
+                for directory in (staging_root, destination.parent):
+                    directory_fd = os.open(directory, os.O_RDONLY)
+                    try:
+                        os.fsync(directory_fd)
+                    finally:
+                        os.close(directory_fd)
+            job_dir = destination
 
         return job_dir
 
@@ -1421,6 +1460,26 @@ class GPUQueue:
                     claimant_capabilities
                 ):
                     return False
+
+                if admission.CAPABILITY in request.required_worker_capabilities or (job_dir / 'validation.json').exists():
+                    try:
+                        validation = json.loads((job_dir / 'validation.json').read_text())
+                        admission.assert_current(request, validation)
+                    except (OSError, ValueError, TypeError, KeyError) as error:
+                        state = JobState.from_json((job_dir / 'status.json').read_text())
+                        state.status = JobStatus.FAILED
+                        state.finished_at = time.time()
+                        state.exit_code = -1
+                        state.failure_phase = 'validation-invalidated'
+                        state.error_message = str(error)
+                        dispatch.atomic_write(job_dir / 'status.json', json.loads(state.to_json()))
+                        dispatch.atomic_write(job_dir / 'receipt.json', {
+                            'job_id': request.job_id, 'status': 'failed', 'exit_code': -1,
+                            'failure_phase': state.failure_phase, 'error_message': str(error),
+                            'execution_started': False, 'worker': effective_claimant,
+                            'requested_route': request.route_identity, 'finished_at': state.finished_at})
+                        self._move_job(job_dir, 'failed')
+                        return True
 
                 # Pause creation shares this short-lived transition lock, so
                 # returning from pause means no later pending-to-running move

@@ -25,6 +25,16 @@ def queue_dir(tmp_path):
     return tmp_path / "cli_queue"
 
 
+@pytest.fixture
+def registered_cli_route(queue_dir):
+    queue_dir.mkdir(parents=True, exist_ok=True)
+    # Synthetic CLI identity fixture, not a TRELLIS backend conformance witness.
+    (queue_dir / 'job_types.json').write_text(json.dumps({
+        'trellis2mlx': {'cmd': [sys.executable, '-c', "print('CLI fixture')"]}
+    }))
+
+
+@pytest.mark.usefixtures('registered_cli_route')
 class TestCLISubmit:
     def test_submit_prints_job_id(self, queue_dir):
         rc, out, _ = run_cli("submit", "trellis2mlx", "/tmp/test.png", "/tmp/out", queue_dir=queue_dir)
@@ -71,6 +81,7 @@ class TestCLISubmit:
         assert not (queue_dir / "pending").exists()
 
 
+@pytest.mark.usefixtures('registered_cli_route')
 class TestCLIList:
     def test_list_empty(self, queue_dir):
         rc, out, _ = run_cli("list", queue_dir=queue_dir)
@@ -92,6 +103,7 @@ class TestCLIStatus:
         assert "not found" in out
 
 
+@pytest.mark.usefixtures('registered_cli_route')
 class TestCLICancel:
     def test_cancel_pending(self, queue_dir):
         run_cli("submit", "trellis2mlx", "/tmp/test.png", "/tmp/out", queue_dir=queue_dir)
@@ -166,6 +178,7 @@ class TestCLIPauseResume:
         assert rc == 0
 
 
+@pytest.mark.usefixtures('registered_cli_route')
 class TestCLISubmitDurableOutput:
     def test_submit_without_output_dir(self, queue_dir):
         """Submit without output_dir auto-assigns durable path."""

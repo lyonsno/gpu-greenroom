@@ -4,6 +4,7 @@ import hashlib
 import os
 from pathlib import Path
 import re
+import signal
 import shutil
 import socket
 import subprocess
@@ -48,10 +49,12 @@ def test_smoke_refresh_keeps_last_view_when_request_state_becomes_unavailable():
 
 
 def _run_operator_browser_witness(tmp_path, scenario, *, responded=False):
-    chrome = os.environ.get("GREENROOM_CHROME") or "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    chrome = os.environ.get("GREENROOM_CHROME")
     node = shutil.which("node")
-    if not Path(chrome).is_file() or not node:
-        pytest.skip("the browser witness requires local Chrome and Node.js")
+    if not chrome or not Path(chrome).is_file() or not node:
+        pytest.skip("the browser witness requires GREENROOM_CHROME pointing to an independent test browser and Node.js")
+    if '/Applications/Google Chrome.app/' in str(Path(chrome).resolve()):
+        pytest.fail('The installed GUI Chrome app must not be used for headless verification')
 
     queue_dir = tmp_path / "queue"
     queue_dir.mkdir()
@@ -85,10 +88,23 @@ def _run_operator_browser_witness(tmp_path, scenario, *, responded=False):
     source_fingerprint = hashlib.sha256(diff + b"\0" + witness.read_bytes()).hexdigest()[:12]
     source_identity = f"{revision}+candidate-{source_fingerprint}"
     try:
-        result = subprocess.run(
-            [node, str(witness), chrome, base, scenario, identity, source_identity, str(tmp_path)],
-            check=False, capture_output=True, text=True, timeout=35,
-        )
+        try:
+            result = subprocess.run(
+                [node, str(witness), chrome, base, scenario, identity, source_identity, str(tmp_path)],
+                check=False, capture_output=True, text=True, timeout=35,
+            )
+        except subprocess.TimeoutExpired as error:
+            owner_path = tmp_path / f'{scenario}-browser-owner.json'
+            owner = json.loads(owner_path.read_text()) if owner_path.exists() else None
+            if owner and owner.get('sourceRevision') == source_identity:
+                command = subprocess.run(['ps', '-p', str(owner['pid']), '-o', 'command='], capture_output=True, text=True).stdout
+                if owner['executable'] in command and '--user-data-dir=' + owner['profile'] in command and os.getpgid(owner['pid']) == owner['pid']:
+                    os.killpg(owner['pid'], signal.SIGTERM)
+            (tmp_path / f'{scenario}-failure.json').write_text(json.dumps({
+                'sourceRevision': source_identity, 'failurePhase': 'browser-witness-timeout',
+                'owner': owner, 'error': str(error), 'effectiveRoute': base,
+            }))
+            raise
         assert result.returncode == 0, f"browser witness failed:\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
         report = json.loads(result.stdout.strip().splitlines()[-1])
         assert report["effectiveRoute"] == base

@@ -76,8 +76,8 @@ class TestTornMovesTheWorkerLeaves:
         (tmp_path / "in.png").write_bytes(b"IN")
         from gpu_queue.models import JobRequest
         req = JobRequest(job_type="mesh", input_path=str(tmp_path / "in.png"), output_dir=str(queue_dir / "outputs" / "m"), agent_id="lane-a")
-        (queue_dir / "done" / req.job_id).mkdir()                    # a husk already sits where the worker will move the job
         rq.q.submit(req)
+        (queue_dir / "done" / req.job_id).mkdir()                    # a husk appears before the terminal move
         assert rq.q.run_one(rq.job_types) is True
         nested = queue_dir / "done" / req.job_id / req.job_id
         assert (nested / "status.json").is_file(), "the worker nested the record inside the husk; that is the shape this test is about"
