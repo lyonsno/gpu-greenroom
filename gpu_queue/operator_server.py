@@ -18,6 +18,7 @@ from urllib.parse import parse_qs, urlparse
 from .queue import GPUQueue
 from .admission_control import transition
 from .smoke_requests import SmokeRequestConflict, SmokeRequests
+from . import dispatch
 
 
 PAGE = r"""<!doctype html>
@@ -43,6 +44,7 @@ function render(s){
   last=s;
   const state=s.admission_state==='paused_running'?'Paused; work still running':s.paused?'Paused; no queued job running':'Queue starts enabled';
   document.querySelector('#queueState').textContent=state;
+  if(s.dispatch?.error)document.querySelector('#queueState').textContent+=' · Dispatch blocked: '+s.dispatch.error;
   document.querySelector('#dot').className='dot'+(s.paused?' paused':'');
   document.querySelector('#pause').disabled=busy||s.paused;
   document.querySelector('#resume').disabled=busy||!s.paused||(s.admission_control&&!s.pause_state?.epoch);
@@ -169,7 +171,7 @@ def queue_snapshot(queue: GPUQueue | Path, view: str = "all", *, read_only: bool
                         "status": "inconsistent",
                         "declared_status": None,
                         "containment_status": containment_status,
-                        "consistent": False,
+            "consistent": False,
                         "record_error": f"unreadable status: {second_error}",
                     })
                     continue
@@ -221,6 +223,10 @@ def queue_snapshot(queue: GPUQueue | Path, view: str = "all", *, read_only: bool
         paused, pause = queue.is_paused(), queue.pause_state()
     running_dir = queue_dir / 'running'
     running_ids = sorted(path.name for path in running_dir.iterdir()) if running_dir.is_dir() else []
+    try:
+        dispatch_state={'policy':dispatch.policy(queue_dir),'last_class':dispatch.last_class(queue_dir),'error':None}
+    except (ValueError,OSError) as error:
+        dispatch_state={'policy':None,'error':str(error)}
     if paused:
         admission_state = 'paused_running' if running_ids else 'paused'
     else:
@@ -236,6 +242,7 @@ def queue_snapshot(queue: GPUQueue | Path, view: str = "all", *, read_only: bool
         "running_job_ids": running_ids,
         "pause_state": pause,
         "lease": lease_payload,
+        "dispatch": dispatch_state,
         "jobs": jobs,
     }
 

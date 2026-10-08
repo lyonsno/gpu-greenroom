@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from . import dispatch
+
 import ctypes
 import fcntl
 import hashlib
@@ -81,7 +83,7 @@ def _safe_substitute(template: str, mapping: dict) -> str:
 def effective_worker_capabilities() -> frozenset[str]:
     configured = os.environ.get("GPU_GREENROOM_WORKER_CAPABILITIES")
     if configured is None:
-        return DEFAULT_WORKER_CAPABILITIES
+        return DEFAULT_WORKER_CAPABILITIES | {dispatch.CAPABILITY,'structured-command.v2','checkpoint-continuation.v1'}
     return frozenset(
         capability.strip()
         for capability in configured.split(",")
@@ -1081,6 +1083,16 @@ class GPUQueue:
         queue_dir/outputs/<job_id>/. If output_dir is under /tmp or
         /private/tmp, records a volatile_output warning.
         """
+        dispatch.classify(json.loads(request.to_json()), dispatch.policy(self.queue_dir))
+        if type(request.cooperative_checkpoint) is not bool:
+            raise ValueError('cooperative_checkpoint must be a boolean')
+        if request.cooperative_checkpoint:
+            if not request.command_argv or not isinstance(request.agent_id,str) or not request.agent_id.strip():
+                raise ValueError('checkpoint continuation requires a structured command and explicit owner')
+            if 'checkpoint-continuation.v1' not in request.required_worker_capabilities:
+                request.required_worker_capabilities.append('checkpoint-continuation.v1')
+        if request.service_class == 'quick' and dispatch.CAPABILITY not in request.required_worker_capabilities:
+            request.required_worker_capabilities.append(dispatch.CAPABILITY)
         if (
             request.command_argv is not None
             and STRUCTURED_COMMAND_CAPABILITY
@@ -1160,19 +1172,30 @@ class GPUQueue:
                 return JobState.from_json(status_file.read_text())
         return None
 
-    def _next_pending(self) -> Path | None:
+    def configure_dispatch(self, value, *, owner, reset_fairness=False):
+        value=dispatch.validate(value)
+        if not isinstance(owner,str) or not owner.strip():
+            raise ValueError('dispatch policy owner must be explicit')
+        with self._coordination_lock():
+            try:
+                current=dispatch.policy(self.queue_dir)
+            except (ValueError,OSError):
+                current={}
+            fields={key:item for key,item in current.items() if key not in {'epoch','owner','configured_at'}}
+            if value==fields and not reset_fairness:
+                return current
+            receipt={**value,'epoch':uuid.uuid4().hex,'owner':owner,'configured_at':time.time()}
+            dispatch.atomic_write(self.queue_dir/'dispatch-policy.json',receipt)
+            if reset_fairness:
+                dispatch.atomic_write(self.queue_dir/'dispatch-state.json',
+                    {'schema':'gpu-greenroom.dispatch-state.v1','last_class':'normal','reset_by':owner,'at':time.time()})
+            self._emit_event_locked('dispatch_policy_changed',receipt['epoch'],receipt)
+            return receipt
+
+    def _next_pending(self, config=None) -> Path | None:
         """Get the oldest pending job directory."""
-        pending = self.queue_dir / "pending"
-        jobs = []
-        for job_dir in pending.iterdir():
-            status_file = job_dir / "status.json"
-            if status_file.exists():
-                state = JobState.from_json(status_file.read_text())
-                jobs.append((state.submitted_at, job_dir))
-        if not jobs:
-            return None
-        jobs.sort(key=lambda x: x[0])
-        return jobs[0][1]
+        jobs=dispatch.pending_order(self.queue_dir,config)
+        return jobs[0] if jobs else None
 
     def _write_metadata_sidecar(self, request: JobRequest, state: JobState):
         """Write metadata.json into output_dir for asset browser consumption."""
@@ -1298,11 +1321,28 @@ class GPUQueue:
                 if any((self.queue_dir / "running").iterdir()):
                     return False
 
-                job_dir = self._next_pending()
+                effective_claimant = claimant or worker_identity()
+                try:
+                    dispatch_policy=dispatch.policy(self.queue_dir)
+                    if dispatch_policy['mode']=='two-class' and dispatch.CAPABILITY not in effective_claimant.get('capabilities',[]):
+                        return False
+                    job_dir = self._next_pending(dispatch_policy)
+                except (ValueError,KeyError,TypeError,OSError) as error:
+                    dispatch.atomic_write(self.queue_dir/'dispatch-error.json',
+                        {'schema':'gpu-greenroom.dispatch-error.v1','phase':'dispatch-policy','error':str(error),
+                         'observed_at':time.time(),'worker':effective_claimant})
+                    return False
                 if job_dir is None:
                     return False
 
                 request = JobRequest.from_json((job_dir / "request.json").read_text())
+                try:
+                    service_class,basis=dispatch.classify(json.loads(request.to_json()),dispatch_policy)
+                except ValueError as error:
+                    dispatch.atomic_write(self.queue_dir/'dispatch-error.json',
+                        {'schema':'gpu-greenroom.dispatch-error.v1','phase':'dispatch-policy','error':str(error),
+                         'observed_at':time.time(),'worker':effective_claimant})
+                    return False
                 effective_claimant = claimant or worker_identity()
                 claimant_capabilities = frozenset(
                     effective_claimant.get("capabilities", [])
@@ -1321,6 +1361,12 @@ class GPUQueue:
                 state.started_at = time.time()
                 state.pid = os.getpid()
                 state.worker_pid = os.getpid()
+                state.dispatch={'mode':dispatch_policy['mode'],'service_class':service_class,
+                                'policy_epoch':dispatch_policy.get('epoch'),'eligibility_basis':basis}
+                if dispatch_policy['mode']=='two-class':
+                    dispatch.atomic_write(self.queue_dir/'dispatch-state.json',
+                        {'schema':'gpu-greenroom.dispatch-state.v1','last_class':service_class,
+                         'job_id':state.job_id,'policy_epoch':dispatch_policy.get('epoch'),'claimed_at':state.started_at})
                 self._write_text_atomic(job_dir / "status.json", state.to_json())
 
             # Structured command jobs carry exact argv and bypass the global
@@ -1417,6 +1463,12 @@ class GPUQueue:
             run_env = None
             if job_env:
                 run_env = {**os.environ, **job_env}
+            if run_env is None:
+                run_env=dict(os.environ)
+            run_env.pop('GPU_GREENROOM_CONTEXT',None)
+            run_env.pop('GPU_GREENROOM_READY_FD',None)
+            if not request.cooperative_checkpoint:
+                run_env.pop('GPU_GREENROOM_RESUME_CHECKPOINT',None)
 
             # Evidence-custody preflight: attest the input source and probe the
             # runtime before anything touches output_dir.
@@ -1490,11 +1542,23 @@ class GPUQueue:
             proc = None
             shutdown_exception = None
             ownership_unresolved = False
+            ready_read=ready_write=None
 
             if state.status == JobStatus.RUNNING:
                 try:
                     os.makedirs(request.output_dir, exist_ok=True)
                     with open(stdout_path, "w") as out_f, open(stderr_path, "w") as err_f:
+                        child_options={}
+                        if request.cooperative_checkpoint:
+                            ready_read,ready_write=os.pipe()
+                            context_path=job_dir/'context.json'
+                            dispatch.atomic_write(context_path,{'schema':'gpu-greenroom.job-context.v1',
+                                'queue_dir':str(self.queue_dir.resolve()),'job_id':request.job_id,
+                                'request_sha256':hashlib.sha256((job_dir/'request.json').read_bytes()).hexdigest(),
+                                'ready_inode':os.fstat(ready_read).st_ino,'ready_device':os.fstat(ready_read).st_dev})
+                            run_env['GPU_GREENROOM_CONTEXT']=str(context_path.resolve())
+                            run_env['GPU_GREENROOM_READY_FD']=str(ready_read)
+                            child_options['pass_fds']=(ready_read,)
                         proc = subprocess.Popen(
                             cmd,
                             stdout=out_f,
@@ -1502,7 +1566,11 @@ class GPUQueue:
                             cwd=job_cwd,
                             env=run_env,
                             start_new_session=True,
+                            **child_options,
                         )
+                        if ready_read is not None:
+                            os.close(ready_read)
+                            ready_read=None
                         self._owned_child = proc
                         self._owned_process_group = os.getpgid(proc.pid)
                         if self._worker_shutdown_requested:
@@ -1514,6 +1582,13 @@ class GPUQueue:
                         if not state.child_start_identity:
                             raise RuntimeError("could not record child process start identity")
                         self._write_text_atomic(job_dir / "status.json", state.to_json())
+                        if ready_write is not None:
+                            try:
+                                os.write(ready_write,b'1')
+                            except BrokenPipeError:
+                                pass
+                            os.close(ready_write)
+                            ready_write=None
                         state.exit_code = proc.wait(timeout=job_timeout)
                         if self._worker_shutdown_requested:
                             raise KeyboardInterrupt
@@ -1640,6 +1715,10 @@ class GPUQueue:
 
             self._write_text_atomic(job_dir / "status.json", state.to_json())
 
+            for descriptor in (ready_read,ready_write):
+                if descriptor is not None:
+                    os.close(descriptor)
+
             # Write receipt with full route identity
             final_job_dir = (
                 job_dir
@@ -1649,6 +1728,7 @@ class GPUQueue:
             receipt = {
                 "job_id": state.job_id,
                 "job_type": state.job_type,
+                "dispatch": state.dispatch,
                 "status": (
                     "ownership_unknown" if ownership_unresolved else state.status.value
                 ),
@@ -1661,6 +1741,9 @@ class GPUQueue:
                 "effective_cwd": job_cwd,
                 "effective_env": job_env,
                 "environment_inheritance": "worker-plus-overlay",
+                "managed_context": run_env.get('GPU_GREENROOM_CONTEXT'),
+                "managed_context_record": str(final_job_dir/'context.json') if request.cooperative_checkpoint else None,
+                "reserved_environment_policy": "managed context overwritten; legacy context/ready/resume removed",
                 "effective_defaults": job_defaults,
                 "effective_timeout": job_timeout,
                 "worker_pid": state.worker_pid,

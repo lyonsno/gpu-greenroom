@@ -14,6 +14,7 @@ from pathlib import Path
 import tempfile
 from urllib.parse import urlsplit
 from uuid import UUID
+from . import dispatch
 
 
 SCHEMA = "gpu-greenroom.interactive-smoke.v1"
@@ -109,7 +110,10 @@ def _progress(value):
                 or not 0 <= value['completed'] <= value['total'] or value['total'] <= 0
                 or not isinstance(value['unit'], str) or not value['unit'].strip()):
             raise ValueError('invalid progress counts')
-    return {key: value[key] for key in ('availability', 'label', *metrics) if key in value}
+    if 'current_job_id' in value and (not isinstance(value['current_job_id'],str) or not value['current_job_id']
+            or not all(c.isalnum() or c in '_-' for c in value['current_job_id'])):
+        raise ValueError('current_job_id must be a single safe queue identity')
+    return {key: value[key] for key in ('availability', 'label', *metrics, 'current_job_id') if key in value}
 
 
 class SmokeRequests:
@@ -210,11 +214,11 @@ class SmokeRequests:
                    'unavailable': 'blocked'}[availability],
                   'label': progress['label'] if progress else request['availability_note'],
                   'progress': progress, 'source_authority': 'caller-declared',
-                  'created_at': record['created_at'], 'job_id': request.get('job_id')}
-        if not request.get('job_id') or record['status'] == 'responded':
+                  'created_at': record['created_at'], 'job_id': (progress or {}).get('current_job_id', request.get('job_id'))}
+        if not result['job_id'] or record['status'] == 'responded':
             return result
         try:
-            root, job_id = self.directory.parent, request['job_id']
+            root, job_id = self.directory.parent, result['job_id']
             matches = [root/state/job_id for state in ('pending','running','done','failed','cancelled')
                        if (root/state/job_id).is_dir()]
             if len(matches) != 1:
@@ -235,18 +239,7 @@ class SmokeRequests:
             result['job_state'] = stage
             result['started_at'] = state.get('started_at')
             if stage == 'pending':
-                submitted = state.get('submitted_at')
-                position = 1
-                if type(submitted) not in (int,float) or not math.isfinite(submitted):
-                    raise ValueError('linked job submission time is unavailable')
-                for other in (root/'pending').iterdir():
-                    if other == path or not (other/'status.json').is_file():
-                        continue
-                    stamp = json.loads((other/'status.json').read_text()).get('submitted_at')
-                    if type(stamp) not in (int,float) or not math.isfinite(stamp):
-                        raise ValueError('queue order is unverified')
-                    position += stamp < submitted
-                result['queue_position'] = position
+                result['queue_position'] = dispatch.pending_order(root).index(path)+1
         except (OSError, ValueError, TypeError, KeyError) as error:
             result.update(phase='unknown', progress=None, error=str(error))
         return result

@@ -105,7 +105,7 @@ def test_submit_command_manifest_preserves_exact_structured_identity(tmp_path):
         cwd=Path(__file__).resolve().parent.parent,
         text=True,
     ).strip()
-    assert receipt["worker"]["capabilities"] == ["structured-command.v1"]
+    assert "structured-command.v1" in receipt["worker"]["capabilities"]
 
 
 def test_command_launch_failure_is_durable_before_primary_output(tmp_path):

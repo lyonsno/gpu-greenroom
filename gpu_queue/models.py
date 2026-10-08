@@ -51,6 +51,8 @@ class JobRequest:
     # Retention class declared by the caller: final, witness, or intermediate.
     output_class: str | None = None
     required_worker_capabilities: list[str] = field(default_factory=list)
+    service_class: str | None = None
+    cooperative_checkpoint: bool = False
     job_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     submitted_at: float = field(default_factory=time.time)
 
@@ -84,6 +86,7 @@ class JobState:
     child_process_group: int | None = None
     child_start_identity: str | None = None
     warnings: list[str] = field(default_factory=list)
+    dispatch: dict | None = None
 
     def to_json(self) -> str:
         d = asdict(self)

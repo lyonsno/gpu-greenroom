@@ -22,6 +22,7 @@ def job(root, state, owner='example-owner'):
     path.mkdir(parents=True)
     (path/'request.json').write_text(json.dumps({'job_id': 'test-job', 'agent_id': owner}))
     (path/'status.json').write_text(json.dumps({'job_id': 'test-job', 'status': state,
+                                             'job_type':'command','input_path':'','output_dir':str(root/'outputs/test-job'),
                                              'submitted_at': 10, 'started_at': 20 if state!='pending' else None}))
     return path
 

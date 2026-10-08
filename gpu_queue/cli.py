@@ -85,6 +85,7 @@ def cmd_submit(args):
         output_dir=args.output_dir,
         params=params,
         agent_id=_optional_agent_id(args.agent_id),
+        service_class=getattr(args,'service_class',None),
     )
     job_dir = queue.submit(request)
     print(f"Submitted job {request.job_id}")
@@ -128,11 +129,26 @@ def _parse_env_assignments(assignments):
     return env
 
 
+def cmd_dispatch_policy(args):
+    from . import dispatch
+    queue=get_queue(args)
+    if args.config:
+        value=json.loads(Path(args.config).expanduser().read_text())
+        result=queue.configure_dispatch(value,owner=args.owner,reset_fairness=args.reset_fairness)
+    else:
+        result=dispatch.policy(queue.queue_dir)
+    print(json.dumps(result,indent=2))
+
+
 def _command_payload(args):
     manifest_path = None
     if args.manifest:
         if args.agent_id is not None:
             raise ValueError("--agent-id cannot be used with --manifest; declare agent_id in the manifest")
+        if getattr(args,'service_class',None) is not None:
+            raise ValueError('--service-class cannot override a manifest')
+        if getattr(args,'cooperative_checkpoint',None) is not None:
+            raise ValueError('--cooperative-checkpoint cannot override a manifest')
         manifest_path = Path(args.manifest).expanduser().resolve()
         payload = json.loads(manifest_path.read_text())
     else:
@@ -140,7 +156,7 @@ def _command_payload(args):
         if argv and argv[0] == "--":
             argv = argv[1:]
         payload = {
-            "schema": "gpu-greenroom.command.v1",
+            "schema": "gpu-greenroom.command.v2" if getattr(args,'service_class',None) is not None or getattr(args,'cooperative_checkpoint',None) else "gpu-greenroom.command.v1",
             "agent_id": args.agent_id,
             "repo_root": args.repo_root,
             "cwd": args.cwd,
@@ -150,12 +166,20 @@ def _command_payload(args):
             "output_class": args.output_class,
             "argv": argv,
             "timeout": args.timeout,
+            "service_class": getattr(args,'service_class',None),
+            "cooperative_checkpoint": bool(getattr(args,'cooperative_checkpoint',False)),
         }
 
     if not isinstance(payload, dict):
         raise ValueError("command manifest must be a JSON object")
-    if payload.get("schema") != "gpu-greenroom.command.v1":
-        raise ValueError("command manifest schema must be gpu-greenroom.command.v1")
+    if payload.get("schema") not in {"gpu-greenroom.command.v1","gpu-greenroom.command.v2"}:
+        raise ValueError("command manifest schema must be gpu-greenroom.command.v1 or v2")
+    service_class=payload.get('service_class')
+    if service_class is not None and (payload['schema']!='gpu-greenroom.command.v2' or service_class not in {'normal','quick'}):
+        raise ValueError('service_class requires command.v2 and must be normal or quick')
+    cooperative_checkpoint=payload.get('cooperative_checkpoint',False)
+    if type(cooperative_checkpoint) is not bool or cooperative_checkpoint and payload['schema']!='gpu-greenroom.command.v2':
+        raise ValueError('cooperative_checkpoint requires command.v2 and a boolean')
     agent_id = _optional_agent_id(payload.get("agent_id"))
     argv = payload.get("argv")
     if not isinstance(argv, list) or not argv or not all(isinstance(item, str) for item in argv):
@@ -195,6 +219,9 @@ def _command_payload(args):
         "route_identity": payload["route_identity"],
         "argv": argv,
         "timeout": timeout,
+        "service_class": service_class,
+        "command_schema": payload['schema'],
+        "cooperative_checkpoint": cooperative_checkpoint,
     }
 
 
@@ -241,8 +268,17 @@ def cmd_submit_command(args):
         command_timeout=payload["timeout"],
         output_class=payload["output_class"],
         required_worker_capabilities=[STRUCTURED_COMMAND_CAPABILITY],
+        service_class=payload['service_class'],
+        cooperative_checkpoint=payload['cooperative_checkpoint'],
     )
-    job_dir = queue.submit(request)
+    if payload['command_schema']=='gpu-greenroom.command.v2':
+        request.required_worker_capabilities.append('structured-command.v2')
+    try:
+        job_dir = queue.submit(request)
+    except (ValueError,OSError) as error:
+        report=_write_submission_failure(queue,args,error)
+        print(json.dumps(report,indent=2),file=sys.stderr)
+        sys.exit(2)
     response = {
         "schema": "gpu-greenroom.command-submission.v1",
         "job_id": request.job_id,
@@ -740,6 +776,7 @@ def main():
         help="Exact owning agent identity; omitted identity remains not recorded",
     )
     p_submit.set_defaults(func=cmd_submit)
+    p_submit.add_argument('--service-class',choices=['normal','quick'],default=None)
 
     # submit-command
     p_command = sub.add_parser(
@@ -760,6 +797,14 @@ def main():
     p_command.add_argument("--timeout", type=float)
     p_command.add_argument("argv", nargs=argparse.REMAINDER)
     p_command.set_defaults(func=cmd_submit_command)
+    p_command.add_argument('--service-class',choices=['normal','quick'],default=None)
+    p_command.add_argument('--cooperative-checkpoint',action='store_true',default=None)
+
+    p_dispatch=sub.add_parser('dispatch-policy',help='Inspect or configure optional normal/quick dispatch')
+    p_dispatch.add_argument('--config',help='gpu-greenroom.dispatch-policy.v1 JSON file; omitted reads current policy')
+    p_dispatch.add_argument('--owner',default='dispatch-cli')
+    p_dispatch.add_argument('--reset-fairness',action='store_true')
+    p_dispatch.set_defaults(func=cmd_dispatch_policy)
 
     # list
     p_list = sub.add_parser("list", help="List jobs")
