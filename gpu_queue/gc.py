@@ -294,10 +294,22 @@ class ActiveRefs:
                 needs_validation = isinstance(request, dict) and 'command-preflight.v1' in request.get('required_worker_capabilities', [])
                 if validation_path.exists() or needs_validation:
                     validation = _load_json(validation_path)
-                    if (not isinstance(validation, dict) or validation.get('schema') != 'gpu-greenroom.command-validation.v1'
-                            or not isinstance(validation.get('bindings'), list)
-                            or not all(isinstance(row, dict) and isinstance(row.get('path'), str)
-                                       for row in validation.get('bindings', []))):
+                    from . import admission
+                    from .models import JobRequest
+                    try:
+                        job = JobRequest.from_json(json.dumps(request))
+                        bindings = validation.get('bindings')
+                        valid = (validation.get('schema') == admission.SCHEMA
+                                 and validation.get('valid') is True
+                                 and isinstance(job.params, dict)
+                                 and job.params.get(admission.DIGEST_PARAM) == admission.digest(validation)
+                                 and validation.get('request_digest') == admission.request_identity(job)
+                                 and isinstance(bindings, list) and bool(bindings)
+                                 and all(isinstance(row, dict) and isinstance(row.get('path'), str)
+                                         and Path(row['path']).is_absolute() for row in bindings))
+                    except (AttributeError, KeyError, TypeError, ValueError):
+                        valid = False
+                    if not valid:
                         unreadable.append(str(validation_path))
                 for doc in (request, state, config, validation):
                     for text in _strings_in(doc):

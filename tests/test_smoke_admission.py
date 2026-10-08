@@ -198,6 +198,54 @@ def test_unreadable_prepared_or_validation_record_withholds_collection(tmp_path)
     assert ActiveRefs.load(queue.queue_dir).unreadable
 
 
+@pytest.mark.parametrize('mutation', ['empty-bindings', 'blank-path', 'removed-binding'])
+@pytest.mark.parametrize('bucket', ['pending', 'running'])
+def test_conflicting_validation_report_withholds_gc_for_declared_only_input(tmp_path, mutation, bucket):
+    from gpu_queue import gc
+    from tests.test_gc import make_output, NOW
+    queue = GPUQueue(tmp_path / 'queue')
+    definitions = {'trace': {'cmd': ['true'], 'output_class': 'intermediate'}}
+    old = make_output(queue.queue_dir, 'declared-only-dependency', job_type='trace',
+                      agent='fixture-owner', finished_days_ago=45)
+    manifest = command(tmp_path)
+    manifest['preflight'] = preflight(tmp_path)
+    manifest['preflight']['inputs'].append(str(old / 'blob.bin'))
+    plan = admission.prepare(queue, manifest)
+    job = admission.submit_prepared(queue, plan)
+    if bucket == 'running':
+        target = queue.queue_dir / bucket / job.name
+        job.rename(target)
+        job = target
+    intact = next(row for row in gc.scan(queue.queue_dir, definitions, now=NOW) if row['name'] == old.name)
+    assert intact['candidate'] is False and intact['reason'] == 'active'
+    report = deepcopy(plan['validation'])
+    if mutation == 'empty-bindings':
+        report['bindings'] = []
+    elif mutation == 'blank-path':
+        report['bindings'][-1]['path'] = ''
+    else:
+        report['bindings'].pop()
+    (job / 'validation.json').write_text(json.dumps(report))
+    row = next(row for row in gc.scan(queue.queue_dir, definitions, now=NOW) if row['name'] == old.name)
+    assert row['candidate'] is False and row['reason'] == 'active_unknown'
+
+
+def test_gc_report_identity_accepts_additive_request_fields_without_rehashing_inputs(tmp_path, monkeypatch):
+    from gpu_queue.gc import ActiveRefs
+    queue = GPUQueue(tmp_path / 'queue')
+    plan = admission.prepare(queue, command(tmp_path))
+    job = admission.submit_prepared(queue, plan)
+    request = json.loads((job / 'request.json').read_text())
+    request['diagnostic_note'] = 'Compatible, non-authority extension'
+    (job / 'request.json').write_text(json.dumps(request))
+
+    def unexpected_hash(*args):
+        raise AssertionError('GC should authenticate the report without hashing dependency bytes')
+
+    monkeypatch.setattr(admission, 'file_binding', unexpected_hash)
+    assert not ActiveRefs.load(queue.queue_dir).unreadable
+
+
 def test_waiting_operator_does_not_block_other_work_and_start_respects_pause(tmp_path):
     queue = GPUQueue(tmp_path / 'queue')
     store = SmokeRequests(queue.queue_dir / 'smoke-requests')
