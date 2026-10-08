@@ -104,7 +104,7 @@ function renderSmoke(payload){
       if(!target.disabled){target.focus({preventScroll:true});if(focusControl==='textarea'&&selectionStart!==null)target.setSelectionRange(selectionStart,selectionEnd,selectionDirection)}
     }
   });
-  if(!smokeArrivalHandled&&location.hash.startsWith('#smoke-')){const target=document.getElementById(location.hash.slice(1));if(target){target.style.scrollMarginTop='76px';target.scrollIntoView({block:'start'});target.tabIndex=-1;target.focus({preventScroll:true});smokeArrivalHandled=true}else{document.querySelector('#smokeStatus').textContent='Smoke request in link is not available'}}
+  if(!smokeArrivalHandled&&location.hash.startsWith('#smoke-')){const target=document.getElementById(location.hash.slice(1));if(target){target.style.scrollMarginTop=(document.querySelector('header').getBoundingClientRect().height+12)+'px';target.scrollIntoView({block:'start'});target.tabIndex=-1;target.focus({preventScroll:true});smokeArrivalHandled=true}else{document.querySelector('#smokeStatus').textContent='Smoke request in link is not available'}}
 }
 function keepLastSmokeView(message){
   smokeRefreshUnavailable=true;
