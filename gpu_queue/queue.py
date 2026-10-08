@@ -1188,7 +1188,11 @@ class GPUQueue:
                         raise ValueError('continuation commit must be an object')
                     if value.get('status')=='committed':
                         recovered.append(self.publish_continuation(stage).name)
-                except FileNotFoundError:
+                except FileNotFoundError as error:
+                    with self._coordination_lock():
+                        if stage.is_dir():
+                            dispatch.atomic_write(stage/'recovery-error.json',
+                                {'phase':'continuation-publication','error':str(error),'observed_at':time.time()})
                     continue
                 except (ValueError,TypeError,KeyError,OSError) as error:
                     dispatch.atomic_write(stage/'recovery-error.json',

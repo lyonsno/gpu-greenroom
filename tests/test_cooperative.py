@@ -170,3 +170,24 @@ yield_if_requested(save_checkpoint=lambda d:{'unit':1},quiesce=lambda:True,conti
     queue.resume(owner='fixture-operator')
     assert queue.run_one({})
     assert (queue.queue_dir/'done'/ids[0]/'stdout.log').read_text().strip()=='registered successor'
+
+
+@pytest.mark.parametrize('missing',['request.json','status.json'])
+def test_incomplete_committed_preparation_keeps_a_recovery_diagnostic(tmp_path,missing):
+    from gpu_queue.dispatch import atomic_write
+    from pathlib import Path
+    queue=GPUQueue(tmp_path/'queue')
+    import hashlib
+    request=JobRequest(job_type='command',input_path='',command_argv=[sys.executable,'-c','pass'],params={'continuation_of':'parent'})
+    stage=queue.submit(request,_staged=True)
+    atomic_write(stage/'checkpoint-handoff.json',{'schema':'gpu-greenroom.checkpoint-handoff.v2','status':'committed',
+        'job_id':'parent','next_job_id':request.job_id,
+        'next_request_sha256':hashlib.sha256((stage/'request.json').read_bytes()).hexdigest(),
+        'next_state_sha256':hashlib.sha256((stage/'status.json').read_bytes()).hexdigest()})
+    (stage/missing).unlink()
+    assert queue.recover_continuations()==[]
+    assert stage.exists()
+    error=json.loads((stage/'recovery-error.json').read_text())
+    assert error['phase']=='continuation-publication'
+    assert missing in error['error']
+    assert not list((queue.queue_dir/'pending').iterdir())
