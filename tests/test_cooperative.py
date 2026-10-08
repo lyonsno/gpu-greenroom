@@ -73,7 +73,7 @@ def test_checkpoint_hook_does_not_force_ordinary_processes_into_queue():
     assert result.returncode==0,result.stderr
 
 
-@pytest.mark.parametrize('case',['decline','wrong-owner','registration-failure','wrong-context'])
+@pytest.mark.parametrize('case',['decline','wrong-owner','registration-failure','wrong-context','registration-exit','registration-crash'])
 def test_checkpoint_negative_paths_preserve_ownership_and_do_not_run_successor(tmp_path,case):
     from pathlib import Path
     queue=GPUQueue(tmp_path/'queue')
@@ -98,6 +98,8 @@ def next_request(path):
         agent_id='wrong-owner' if case=='wrong-owner' else 'fixture-agent',cooperative_checkpoint=True)
 def registered(request):
     if case=='registration-failure': raise RuntimeError('fixture registration failed')
+    if case=='registration-exit': raise SystemExit(9)
+    if case=='registration-crash': os._exit(9)
 try:
     result=yield_if_requested(save_checkpoint=lambda d:{'unit':1},quiesce=lambda:case!='decline',
         continuation=next_request,on_submitted=registered)
@@ -112,11 +114,59 @@ pathlib.Path(sys.argv[2]).write_text(json.dumps(outcome))
                        command_env={'PYTHONPATH':str(Path(__file__).resolve().parent.parent)})
     queue.submit(request)
     assert queue.run_one({})
-    result=json.loads(marker.read_text())
-    if case=='decline':
-        assert result=={'result':False}
-    else:
-        assert 'error' in result
+    if case not in ('registration-exit','registration-crash'):
+        result=json.loads(marker.read_text())
+        if case=='decline':
+            assert result=={'result':False}
+        else:
+            assert 'error' in result
     assert not list((queue.queue_dir/'pending').iterdir())
     assert not list((queue.queue_dir/'running').iterdir())
-    assert len(list((queue.queue_dir/'cancelled').iterdir()))==(1 if case=='registration-failure' else 0)
+    assert not list((queue.queue_dir/'cancelled').iterdir())
+    stage=queue.queue_dir/'continuation-staging'
+    prepared=list(stage.iterdir()) if stage.exists() else []
+    assert len(prepared)==(1 if case in ('registration-failure','registration-exit','registration-crash') else 0)
+
+
+def test_fresh_cooperative_job_clears_inherited_resume_state(tmp_path,monkeypatch):
+    queue=GPUQueue(tmp_path/'queue')
+    monkeypatch.setenv('GPU_GREENROOM_RESUME_CHECKPOINT','/wrong/stale/checkpoint.json')
+    req=JobRequest(job_type='command',input_path='',agent_id='fixture-agent',cooperative_checkpoint=True,
+                   command_argv=[sys.executable,'-c',"import os; assert os.environ.get('GPU_GREENROOM_RESUME_CHECKPOINT') is None"])
+    queue.submit(req)
+    assert queue.run_one({})
+    assert (queue.queue_dir/'done'/req.job_id).is_dir()
+
+
+def test_committed_crash_recovers_publication_without_rerunning_parent(tmp_path):
+    from pathlib import Path
+    queue=GPUQueue(tmp_path/'queue')
+    code='''import os,sys
+from gpu_queue.cooperative import _context,yield_if_requested
+from gpu_queue.models import JobRequest
+from gpu_queue.queue import GPUQueue
+queue,job,request,state=_context()
+queue.pause(owner='fixture-operator')
+GPUQueue.publish_continuation=lambda *a,**k:os._exit(9)
+def successor(path):
+    return JobRequest(job_type='command',input_path='',agent_id=request.agent_id,
+        repo_root=request.repo_root,command_cwd=request.command_cwd,route_identity=request.route_identity,
+        command_argv=[sys.executable,'-c',"print('registered successor')"])
+yield_if_requested(save_checkpoint=lambda d:{'unit':1},quiesce=lambda:True,continuation=successor)
+'''
+    req=JobRequest(job_type='command',input_path='',agent_id='fixture-agent',cooperative_checkpoint=True,
+                   repo_root=str(tmp_path),command_cwd=str(tmp_path),route_identity='fixture/crash',
+                   command_argv=[sys.executable,'-c',code],command_env={'PYTHONPATH':str(Path(__file__).resolve().parent.parent)})
+    queue.submit(req)
+    assert queue.run_one({})
+    assert not list((queue.queue_dir/'pending').iterdir())
+    prepared=list((queue.queue_dir/'continuation-staging').iterdir())
+    assert len(prepared)==1
+    ids=queue.recover_continuations()
+    assert ids==[prepared[0].name]
+    assert queue.recover_continuations()==[]
+    assert queue.publish_continuation(prepared[0]).name==ids[0]
+    assert not queue.run_one({})
+    queue.resume(owner='fixture-operator')
+    assert queue.run_one({})
+    assert (queue.queue_dir/'done'/ids[0]/'stdout.log').read_text().strip()=='registered successor'

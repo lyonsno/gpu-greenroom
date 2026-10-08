@@ -90,3 +90,14 @@ def test_active_lease_and_ownership_unknown_cannot_be_bypassed_by_quick_jobs(tmp
     assert not queue.run_one(config)
     assert queue.lease_status().lifecycle_state.value=='ownership_unknown'
     assert not list((queue.queue_dir/'running').iterdir())
+
+
+@pytest.mark.parametrize('file,value',[('dispatch-policy.json',{'schema':'gpu-greenroom.dispatch-policy.v1','mode':[]}),
+                                       ('dispatch-state.json',{'schema':'gpu-greenroom.dispatch-state.v1','last_class':[]})])
+def test_malformed_dispatch_never_takes_down_operator_snapshot(tmp_path,file,value):
+    from gpu_queue.operator_server import queue_snapshot
+    queue=GPUQueue(tmp_path/'queue')
+    (queue.queue_dir/file).write_text(json.dumps(value))
+    snapshot=queue_snapshot(queue)
+    assert snapshot['dispatch']['error']
+    assert snapshot['jobs']==[]

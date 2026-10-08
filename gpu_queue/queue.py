@@ -1076,7 +1076,7 @@ class GPUQueue:
         return any(resolved == p or resolved.startswith(p + "/")
                     for p in self.VOLATILE_PREFIXES)
 
-    def submit(self, request: JobRequest) -> Path:
+    def submit(self, request: JobRequest, *, _staged=False) -> Path:
         """Submit a job. Returns the job directory path.
 
         If output_dir is empty, auto-assigns a durable path under
@@ -1091,6 +1091,9 @@ class GPUQueue:
                 raise ValueError('checkpoint continuation requires a structured command and explicit owner')
             if 'checkpoint-continuation.v1' not in request.required_worker_capabilities:
                 request.required_worker_capabilities.append('checkpoint-continuation.v1')
+            if (request.command_env or {}).get('GPU_GREENROOM_RESUME_CHECKPOINT') and (
+                    not request.params.get('continuation_of') or not request.params.get('checkpoint_sha256')):
+                raise ValueError('resume checkpoint must be bound to a declared continuation')
         if request.service_class == 'quick' and dispatch.CAPABILITY not in request.required_worker_capabilities:
             request.required_worker_capabilities.append(dispatch.CAPABILITY)
         if (
@@ -1104,11 +1107,14 @@ class GPUQueue:
         if not request.output_dir:
             request.output_dir = str(self.queue_dir / "outputs" / request.job_id)
 
-        job_dir = self.queue_dir / "pending" / request.job_id
-        job_dir.mkdir(parents=True, exist_ok=True)
+        job_dir = self.queue_dir / ("continuation-staging" if _staged else "pending") / request.job_id
+        job_dir.mkdir(parents=True, exist_ok=not _staged)
 
         # Write request
-        (job_dir / "request.json").write_text(request.to_json())
+        if _staged:
+            dispatch.atomic_write(job_dir/'request.json',json.loads(request.to_json()))
+        else:
+            (job_dir / "request.json").write_text(request.to_json())
 
         warnings = []
         if self._is_volatile(request.output_dir):
@@ -1125,9 +1131,69 @@ class GPUQueue:
             submitted_at=request.submitted_at,
             warnings=warnings,
         )
-        (job_dir / "status.json").write_text(state.to_json())
+        if _staged:
+            dispatch.atomic_write(job_dir/'status.json',json.loads(state.to_json()))
+        else:
+            (job_dir / "status.json").write_text(state.to_json())
 
         return job_dir
+
+    def publish_continuation(self, stage):
+        stage=Path(stage)
+        with self._coordination_lock():
+            if stage.parent.resolve()!=(self.queue_dir/'continuation-staging').resolve():
+                raise ValueError('continuation staging root differs from this queue')
+            if not stage.exists():
+                matches=[self.queue_dir/state/stage.name for state in ('pending','running','done','failed','cancelled')
+                         if (self.queue_dir/state/stage.name/'checkpoint-handoff.json').is_file()]
+                if len(matches)==1:
+                    stage=matches[0]
+                else:
+                    raise ValueError('continuation is neither staged nor uniquely admitted')
+            commit=json.loads((stage/'checkpoint-handoff.json').read_text())
+            request_bytes=(stage/'request.json').read_bytes()
+            request=JobRequest.from_json(request_bytes.decode())
+            state=JobState.from_json((stage/'status.json').read_text())
+            if (commit.get('schema')!='gpu-greenroom.checkpoint-handoff.v2' or commit.get('status')!='committed'
+                    or commit.get('next_job_id')!=stage.name or request.job_id!=stage.name
+                    or commit.get('next_request_sha256')!=hashlib.sha256(request_bytes).hexdigest()
+                    or request.params.get('continuation_of')!=commit.get('job_id')):
+                raise ValueError('continuation commit or request identity is unverified')
+            if stage.parent.name!='continuation-staging':
+                return stage
+            if state.status!=JobStatus.PENDING or state.job_id!=stage.name:
+                raise ValueError('prepared continuation state is unverified')
+            if commit.get('next_state_sha256')!=hashlib.sha256((stage/'status.json').read_bytes()).hexdigest():
+                raise ValueError('prepared continuation state changed after registration')
+            if self.get_job(request.job_id) is not None:
+                raise ValueError('continuation identity is already admitted')
+            destination=stage.rename(self.queue_dir/'pending'/request.job_id)
+            for directory in (destination.parent,self.queue_dir/'continuation-staging'):
+                fd=os.open(directory,os.O_RDONLY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            return destination
+
+    def recover_continuations(self):
+        directory=self.queue_dir/'continuation-staging'
+        recovered=[]
+        for stage in directory.iterdir() if directory.is_dir() else ():
+            commit=stage/'checkpoint-handoff.json'
+            if commit.is_file():
+                try:
+                    value=json.loads(commit.read_text())
+                    if not isinstance(value,dict):
+                        raise ValueError('continuation commit must be an object')
+                    if value.get('status')=='committed':
+                        recovered.append(self.publish_continuation(stage).name)
+                except FileNotFoundError:
+                    continue
+                except (ValueError,TypeError,KeyError,OSError) as error:
+                    dispatch.atomic_write(stage/'recovery-error.json',
+                        {'phase':'continuation-publication','error':str(error),'observed_at':time.time()})
+        return recovered
 
     def cancel(self, job_id: str) -> bool:
         """Cancel a pending job. Returns True if cancelled, False if not found/not pending.
@@ -1467,8 +1533,15 @@ class GPUQueue:
                 run_env=dict(os.environ)
             run_env.pop('GPU_GREENROOM_CONTEXT',None)
             run_env.pop('GPU_GREENROOM_READY_FD',None)
-            if not request.cooperative_checkpoint:
-                run_env.pop('GPU_GREENROOM_RESUME_CHECKPOINT',None)
+            run_env.pop('GPU_GREENROOM_RESUME_CHECKPOINT',None)
+            if request.cooperative_checkpoint and (job_env or {}).get('GPU_GREENROOM_RESUME_CHECKPOINT'):
+                if not request.params.get('continuation_of') or not request.params.get('checkpoint_sha256'):
+                    state.status=JobStatus.FAILED
+                    state.failure_phase='managed_context_preflight'
+                    state.error_message='resume checkpoint must be bound to a declared continuation'
+                    state.exit_code=-1
+                else:
+                    run_env['GPU_GREENROOM_RESUME_CHECKPOINT']=job_env['GPU_GREENROOM_RESUME_CHECKPOINT']
 
             # Evidence-custody preflight: attest the input source and probe the
             # runtime before anything touches output_dir.

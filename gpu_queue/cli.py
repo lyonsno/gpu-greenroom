@@ -374,6 +374,9 @@ def cmd_worker(args):
 
     # Recover stale jobs on startup
     recovered = queue.recover_stale()
+    recovered_continuations=queue.recover_continuations()
+    if recovered_continuations:
+        print(f"Published committed continuations: {', '.join(recovered_continuations)}")
     if recovered:
         print(f"  Recovered {len(recovered)} stale job(s): {', '.join(recovered)}")
 

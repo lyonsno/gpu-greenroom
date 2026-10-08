@@ -93,9 +93,13 @@ job ID and submission time put it back into normal queue competition. Its
 checkpoint hash is bound into the request and verified on load. The original
 environment overlay and command timeout are inherited when omitted; the timeout
 belongs to each explicit unit command, not an estimated whole-workload deadline.
-Pause leaves the continuation pending. Failed completion-registration callbacks
-cancel that newly submitted pending unit rather than silently running it.
-`checkpoint-handoff.json` links both job IDs and the checkpoint path.
+Pause leaves the continuation pending. Preparation lives in continuation-staging,
+outside execution discovery. Registration callbacks run before a durable handoff
+commit and atomic publication into pending. Callback exceptions, exits and crashes
+leave an uncommitted preparation which cannot execute. Worker startup publishes
+only verified committed preparations, without repeating the parent command.
+`checkpoint-handoff.json` links both job IDs and the checkpoint path; publication
+is idempotent. Registration targets the future job ID, not an already runnable job.
 
 Saved descriptors live under `outputs/<parent-job-id>/checkpoints`. The helper
 pins that output entry without expiry before saving, including on a declined or

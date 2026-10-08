@@ -110,14 +110,21 @@ def yield_if_requested(*,save_checkpoint,quiesce,continuation,on_submitted=None)
     with queue._coordination_lock():
         if queue.get_job(next_request.job_id) is not None:
             raise ValueError('continuation job identity is already in use')
-        queue.submit(next_request)
+        stage=queue.submit(next_request,_staged=True)
+    prepared_request_sha=hashlib.sha256((stage/'request.json').read_bytes()).hexdigest()
+    prepared_state_sha=hashlib.sha256((stage/'status.json').read_bytes()).hexdigest()
     try:
         if on_submitted:
             on_submitted(next_request)
-    except Exception:
-        queue.cancel(next_request.job_id)
+    except BaseException as error:
+        dispatch.atomic_write(stage/'registration-failure.json',{'status':'failed','error':repr(error),'at':time.time()})
         raise
-    dispatch.atomic_write(job/'checkpoint-handoff.json',{'schema':'gpu-greenroom.checkpoint-handoff.v1',
+    commit={'schema':'gpu-greenroom.checkpoint-handoff.v2','status':'committed',
         'job_id':request.job_id,'next_job_id':next_request.job_id,'checkpoint':str(checkpoint.resolve()),
-        'quiescence_authority':'producer-confirmed; worker verifies process-group exit','submitted_at':time.time()})
+        'next_request_sha256':prepared_request_sha,'next_state_sha256':prepared_state_sha,
+        'registration':'callback-returned' if on_submitted else 'not-requested',
+        'quiescence_authority':'producer-confirmed; worker verifies process-group exit','submitted_at':time.time()}
+    dispatch.atomic_write(stage/'checkpoint-handoff.json',commit)
+    dispatch.atomic_write(job/'checkpoint-handoff.json',commit)
+    queue.publish_continuation(stage)
     raise SystemExit(0)

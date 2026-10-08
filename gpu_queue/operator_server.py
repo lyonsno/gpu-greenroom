@@ -227,6 +227,8 @@ def queue_snapshot(queue: GPUQueue | Path, view: str = "all", *, read_only: bool
         dispatch_state={'policy':dispatch.policy(queue_dir),'last_class':dispatch.last_class(queue_dir),'error':None}
     except (ValueError,OSError) as error:
         dispatch_state={'policy':None,'error':str(error)}
+    prepared_root=queue_dir/'continuation-staging'
+    dispatch_state['unpublished_continuations']=sorted(path.name for path in prepared_root.iterdir()) if prepared_root.is_dir() else []
     if paused:
         admission_state = 'paused_running' if running_ids else 'paused'
     else:

@@ -31,7 +31,7 @@ def atomic_write(path, payload):
 
 
 def validate(value):
-    if not isinstance(value,dict) or value.get('schema')!=SCHEMA or value.get('mode') not in {'fifo','two-class'}:
+    if not isinstance(value,dict) or value.get('schema')!=SCHEMA or not isinstance(value.get('mode'),str) or value['mode'] not in {'fifo','two-class'}:
         raise ValueError('invalid dispatch policy schema or mode')
     for key in ('quick_job_types','quick_routes'):
         rules=value.get(key,{})
@@ -67,7 +67,7 @@ def last_class(root):
         value=json.loads((Path(root)/'dispatch-state.json').read_text())
     except FileNotFoundError:
         return 'normal'
-    if not isinstance(value,dict) or value.get('schema')!='gpu-greenroom.dispatch-state.v1' or value.get('last_class') not in {'normal','quick'}:
+    if not isinstance(value,dict) or value.get('schema')!='gpu-greenroom.dispatch-state.v1' or not isinstance(value.get('last_class'),str) or value['last_class'] not in {'normal','quick'}:
         raise ValueError('dispatch fairness state is unverified')
     return value['last_class']
 
