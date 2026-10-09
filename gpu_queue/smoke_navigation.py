@@ -53,6 +53,8 @@ def focus(identity):
     if result.returncode:
         raise ValueError(result.stderr.strip() or 'Shared terminal navigation failed')
     receipt = json.loads(result.stdout)
+    if not isinstance(receipt, dict):
+        raise ValueError('Navigator receipt is not an object; activation may have occurred')
     if receipt.get('pane_id') != identity['pane_id']:
         raise ValueError('Shared terminal navigation returned a different pane')
     return receipt

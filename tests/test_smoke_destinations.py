@@ -241,3 +241,38 @@ def test_host_witness_reports_source_setup_failure_without_launching(tmp_path):
                            capture_output=True, text=True, cwd=witness.parent.parent)
     assert again.returncode == 1
     assert json.loads((output / 'report.json').read_text()) == report
+
+
+@pytest.mark.parametrize('stdout', ['[]', 'null', '"unexpected"'])
+def test_focus_http_rejects_non_object_navigator_receipts(tmp_path, monkeypatch, stdout):
+    from http.server import ThreadingHTTPServer
+    import threading
+    from urllib.request import Request, urlopen
+    from urllib.error import HTTPError
+    from gpu_queue import smoke_navigation
+    from gpu_queue.operator_server import make_handler
+    store, value = terminal_store(tmp_path, monkeypatch)
+    record = store.publish_session(value['id'], {
+        'pane_id': 46, 'pid': 40433, 'phase': 'operator-needed', 'label': 'Fixture',
+    })
+    monkeypatch.setenv('GPU_GREENROOM_TERMINAL_NAVIGATOR', sys.executable)
+    monkeypatch.setattr(smoke_navigation.subprocess, 'run',
+                        lambda *args, **kwargs: subprocess.CompletedProcess([], 0, stdout, ''))
+    server = ThreadingHTTPServer(('127.0.0.1', 0), make_handler(tmp_path, 'secret', admission_control=True))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with pytest.raises(HTTPError) as error:
+            urlopen(Request(f'http://127.0.0.1:{server.server_port}/api/smoke-requests/{value["id"]}/focus',
+                            data=json.dumps({'request_digest': record['request_digest'],
+                                             'destination_digest': store.destination(record)['identity_digest']}).encode(),
+                            headers={'Authorization': 'Bearer secret'}))
+        assert error.value.code == 400
+        body = json.loads(error.value.read())
+        assert 'receipt is not an object' in body['error']
+        assert 'activation may have occurred' in body['error']
+        assert store.get(value['id']) == record
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
