@@ -353,6 +353,40 @@ prove that Noah or another named operator supplied it.
 These narrow endpoints are available in admission-control mode and do not
 admit or execute GPU jobs. A read-only console still rejects writes.
 
+The optional `target` identifies the application to exercise, rather than a
+coordination page. Browser targets use `{"kind":"browser","url":"http://127.0.0.1:9901/app"}`.
+Terminal targets use `{"kind":"terminal"}`; once the linked job is running,
+the producer publishes its observed pane and owning process through the local
+CLI. Neither HTTP creation nor Focus accepts a command or a caller-selected
+pane. Requests without a typed target retain a plainly labeled context link.
+
+```bash
+gpu-greenroom smoke-request configure REQUEST_ID /path/to/destination.json
+gpu-greenroom smoke-request session REQUEST_ID /path/to/session.json
+```
+
+Configuration accepts `target` and `purpose` (`operator` or `diagnostic`),
+preserving the original request and its digest. A session file contains
+`pane_id`, `pid`, `phase` (`loading`, `operator-needed`, or `interactive`), and
+`label`. Publication verifies the running job's owner, pane TTY and kernel
+process-start identity. Producers republish on application phase changes.
+The phase remains a producer declaration; terminal identity verification
+establishes navigation, not operator participation. Focus rechecks the live
+identity and uses the configured shared terminal activation command.
+Set `GPU_GREENROOM_TERMINAL_NAVIGATOR` to its absolute executable path. The
+command implements `focus-pane --pane-id N --expected-tty /dev/ttysNNN --json`,
+returning the activated `pane_id`. This is local configuration, not an HTTP
+command selection. Missing navigation fails explicitly.
+The view carries a destination identity digest in addition to the immutable
+request digest. Focus compares both, so a stale button cannot open a newly
+published pane or process; phase-only updates keep the destination identity.
+Switching to a browser target discards the previous terminal session.
+Unavailable or changed identities refuse focus.
+
+The active view excludes diagnostic, answered, failed and cancelled requests.
+History retains them, including native failure phase, error and exit code.
+Queued jobs are not described as interactive or as waiting for the operator.
+
 ## Registered queues and execution-start pause
 
 The queue registry stores only one-time adapter identity: name, queue

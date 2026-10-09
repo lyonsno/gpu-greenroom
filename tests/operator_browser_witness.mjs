@@ -72,14 +72,14 @@ try {
     if (message.error) callbacks.reject(new Error(message.error.message));
     else callbacks.resolve(message.result);
   });
-  const command = (method, params = {}) => new Promise((resolve, reject) => {
+  const command = (method, params = {}, sessionId = undefined) => new Promise((resolve, reject) => {
     writeFileSync(join(artifactDirectory, `${scenario}-last-command.json`), JSON.stringify({phase, method}));
     const id = ++nextId;
     pending.set(id, {resolve, reject});
-    socket.send(JSON.stringify({id, method, params}));
+    socket.send(JSON.stringify({id, method, params, sessionId}));
   });
-  const evaluate = async expression => {
-    const result = await command('Runtime.evaluate', {expression, awaitPromise: true, returnByValue: true});
+  const evaluate = async (expression, sessionId) => {
+    const result = await command('Runtime.evaluate', {expression, awaitPromise: true, returnByValue: true}, sessionId);
     if (result.exceptionDetails) throw new Error(result.exceptionDetails.text);
     return result.result.value;
   };
@@ -87,7 +87,7 @@ try {
   await command('Page.enable');
   await command('Runtime.enable');
   markPhase('initial-render');
-  await command('Page.navigate', {url: `${base}/`});
+  await command('Page.navigate', {url: `${base}/#smoke-${requestId}`});
   try {
     await eventually(() => evaluate(`Boolean(document.querySelector('#smokeRequestList .smoke-card'))`), Boolean, 'initial Greenroom request render');
   } catch (error) {
@@ -101,7 +101,37 @@ try {
   writeFileSync(artifact, Buffer.from(initialFrame.data, 'base64'));
   screenshotArtifact = artifact;
 
-  if (scenario === 'stale-submit') {
+  if (scenario === 'destinations') {
+    for (const [width, height] of [[1440,1000],[390,844]]) {
+      markPhase(`destinations-${width}`);
+      await command('Emulation.setDeviceMetricsOverride', {width,height,deviceScaleFactor:1,mobile:width===390});
+      await evaluate(`location.hash='';smokeFilter='active';renderSmoke(lastSmoke)`);
+      assert.equal(await evaluate(`document.querySelectorAll('.smoke-card').length`),2);
+      assert.equal(await evaluate(`document.documentElement.scrollWidth<=innerWidth`),true);
+      const frame=await command('Page.captureScreenshot',{format:'png',fromSurface:true});
+      writeFileSync(join(artifactDirectory,`active-${width}.png`),Buffer.from(frame.data,'base64'));
+      const expectedPane=await evaluate(`Number(document.querySelector('.smokeFocus').textContent.split('pane ')[1])`);
+      await evaluate(`(()=>{const realFetch=window.fetch.bind(window);window.fetch=async (...args)=>{const r=await realFetch(...args);if(String(args[0]).endsWith('/focus'))window.__focusReceipt={status:r.status,body:await r.clone().json()};return r};window.__focusReceipt=null;document.querySelector('.smokeFocus').click()})()`);
+      const focused=await eventually(()=>evaluate(`window.__focusReceipt`),Boolean,'real terminal focus receipt');
+      assert.equal(focused.status,200,JSON.stringify(focused));
+      assert.equal(focused.body.pane_id,expectedPane);
+      const bounds=await evaluate(`(()=>{const link=document.querySelector('a');link.scrollIntoView({block:'center'});const r=link.getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2}})()`);
+      await command('Input.dispatchMouseEvent',{type:'mousePressed',button:'left',clickCount:1,...bounds});
+      await command('Input.dispatchMouseEvent',{type:'mouseReleased',button:'left',clickCount:1,...bounds});
+      const targets=await eventually(()=>command('Target.getTargets'),value=>value.targetInfos.some(x=>x.url===base+'/actual-smoke'),'application popup');
+      const app=targets.targetInfos.find(x=>x.url===base+'/actual-smoke');
+      const {sessionId}=await command('Target.attachToTarget',{targetId:app.targetId,flatten:true});
+      const heading=await eventually(()=>evaluate(`document.querySelector('h1')?.textContent`,sessionId),x=>x==='Actual smoke application','actual application content');
+      assert.equal(heading,'Actual smoke application');
+      const appFrame=await command('Page.captureScreenshot',{format:'png'},sessionId);
+      writeFileSync(join(artifactDirectory,`application-${width}.png`),Buffer.from(appFrame.data,'base64'));
+      await command('Target.closeTarget',{targetId:app.targetId});
+      await evaluate(`document.querySelector('[data-smoke-filter="history"]').click()`);
+      assert.equal(await evaluate(`document.querySelectorAll('.smoke-card').length`),1);
+      assert.equal(await evaluate(`document.querySelector('.smoke-card h3').textContent`),'Synthetic diagnostic');
+    }
+    console.log(JSON.stringify({scenario,sourceRevision,effectiveRoute:base,browser:browserVersion.Browser,artifact,assertions:['actual browser destination opened','real observed terminal focused','active/history filters','desktop and mobile fit']}));
+  } else if (scenario === 'stale-submit') {
     markPhase('draft-and-stale-submit');
     const typing = await evaluate(`(()=>{const t=document.querySelector('textarea.smoke-response');t.value='the draft survives';t.focus();t.setSelectionRange(4,10);return true})()`);
     assert.equal(typing, true);

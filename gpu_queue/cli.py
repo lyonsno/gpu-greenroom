@@ -137,6 +137,10 @@ def cmd_smoke_request(args):
         print(json.dumps(store.update(args.request_id, payload), indent=2))
     elif args.smoke_action == 'start':
         print(json.dumps(store.start(args.request_id, args.request_digest), indent=2))
+    elif args.smoke_action in {'configure', 'session'}:
+        payload = json.loads(Path(args.update_file).expanduser().read_text())
+        method = store.configure if args.smoke_action == 'configure' else store.publish_session
+        print(json.dumps(method(args.request_id, payload), indent=2))
 
 
 def cmd_prepared_command(args):
@@ -881,6 +885,11 @@ def main():
     p_smoke_update.add_argument('request_id')
     p_smoke_update.add_argument('update_file')
     p_smoke_update.set_defaults(func=cmd_smoke_request)
+    for action in ('configure', 'session'):
+        p = smoke_sub.add_parser(action, help='Publish local smoke destination or observed terminal phase')
+        p.add_argument('request_id')
+        p.add_argument('update_file')
+        p.set_defaults(func=cmd_smoke_request)
 
     # operator console
     p_operator = sub.add_parser("operator", help="Run the authenticated localhost operator console")
