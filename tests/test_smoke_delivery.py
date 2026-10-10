@@ -30,6 +30,7 @@ def test_saved_feedback_has_honest_delivery_state_before_relay(tmp_path):
 def test_two_columns_keep_fast_work_out_of_operator_column():
     assert 'id="automaticQueue"' in PAGE, 'Automatic work needs its own column'
     assert 'id="operatorQueue"' in PAGE, 'Operator smokes need their own column'
+    assert 'id="quickQueue"' in PAGE, 'Quick automatic work needs its own optional visual column'
     assert "responded:'Response returned'" not in PAGE
 
 

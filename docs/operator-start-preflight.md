@@ -196,7 +196,8 @@ receiver disposition. Activating the adapter does not broadcast old saved
 responses or old sessions. Their records remain available for explicit return.
 
 Automatic work and operator smokes are separate monitor columns over the same
-native execution queue. Quick badges use native dispatch receipts when present,
+native execution queue. Quick automatic work gets a third visual column when
+present, not another execution queue. Quick badges use native dispatch receipts when present,
 otherwise current policy projection; pending positions use native selection
 order. An activated smoke is not duplicated as automatic work. These columns
 neither create a second GPU mutex nor reorder work. Start continues to wait for

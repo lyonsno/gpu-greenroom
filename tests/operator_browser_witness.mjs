@@ -139,23 +139,25 @@ try {
   } else if (scenario === 'columns' || scenario === 'installed-columns') {
     await evaluate(`location.hash='';smokeFilter='active';renderSmoke(lastSmoke);load()`);
     if(scenario==='columns'){
-      await eventually(()=>evaluate(`document.querySelectorAll('#jobs .job-item').length`),n=>n===1,'one automatic job; smoke excluded');
-      assert.equal(await evaluate(`document.querySelectorAll('#jobs .quick').length`),1,'quick class comes from policy');
+      await eventually(()=>evaluate(`document.querySelectorAll('#quickJobs .job-item').length`),n=>n===1,'one quick automatic job; smoke excluded');
+      assert.equal(await evaluate(`document.querySelectorAll('#quickJobs .quick').length`),1,'quick class comes from policy');
+      assert.equal(await evaluate(`document.querySelectorAll('#jobs .quick').length`),0,'quick automatic work is separate');
     }else{
       await evaluate(`load()`);
       assert.equal(await evaluate(`(()=>{const linked=new Set(lastSmoke.items.map(item=>item.display?.job_id).filter(Boolean));return [...document.querySelectorAll('#jobs .job-item')].some(row=>linked.has(row.dataset.jobId))})()`),false,'installed smoke jobs not duplicated');
     }
     for(const [width,height] of [[1440,1000],[390,844]]){
       await command('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:width===390});
-      const bounds=await evaluate(`(()=>{scrollTo(0,0);const a=document.querySelector('#automaticQueue').getBoundingClientRect(),b=document.querySelector('#operatorQueue').getBoundingClientRect();return {a:{x:a.x,y:a.y,right:a.right,bottom:a.bottom},b:{x:b.x,y:b.y}}})()`);
+      const bounds=await evaluate(`(()=>{scrollTo(0,0);const a=document.querySelector('#automaticQueue').getBoundingClientRect(),b=document.querySelector('#operatorQueue').getBoundingClientRect(),q=document.querySelector('#quickQueue'),c=q.getBoundingClientRect();return {a:{x:a.x,y:a.y,right:a.right,bottom:a.bottom},b:{x:b.x,y:b.y,right:b.right,bottom:b.bottom},quick:!q.hidden,c:{x:c.x,y:c.y}}})()`);
       if(width===1440){assert.ok(bounds.a.right<bounds.b.x);assert.ok(Math.abs(bounds.a.y-bounds.b.y)<2)}
       else assert.ok(bounds.b.y>=bounds.a.bottom);
+      if(bounds.quick){if(width===1440){assert.ok(bounds.b.right<bounds.c.x);assert.ok(Math.abs(bounds.b.y-bounds.c.y)<2)}else assert.ok(bounds.c.y>=bounds.b.bottom)}
       assert.equal(await evaluate(`document.documentElement.scrollWidth<=innerWidth`),true);
       const frame=await command('Page.captureScreenshot',{format:'png',fromSurface:true});
       writeFileSync(join(artifactDirectory,`columns-${width}.png`),Buffer.from(frame.data,'base64'));
     }
     console.log(JSON.stringify({scenario,sourceRevision,effectiveRoute:base,browser:browserVersion.Browser,artifact,
-      assertions:['separate automatic/operator columns','native quick badge','no duplicate smoke job','desktop/mobile fit']}));
+      assertions:['separate automatic/operator columns','conditional quick column','native quick badge','no duplicate smoke job','desktop/mobile fit']}));
   } else if (scenario === 'destinations') {
     for (const [width, height] of [[1440,1000],[390,844]]) {
       markPhase(`destinations-${width}`);
