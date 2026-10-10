@@ -67,24 +67,39 @@ class SmokeDelivery:
             value = json.loads(path.read_text())
         except FileNotFoundError:
             return {'event_id': event['event_id'], 'status': 'saved' if event['kind'] != 'usable' else 'not-notified'}
-        if {key: value.get('event', {}).get(key) for key in event if key != 'occurred_at'} != {key: item for key, item in event.items() if key != 'occurred_at'}:
+        if not isinstance(value, dict) or not isinstance(value.get('event'), dict) or value.get('event_id') != event['event_id']:
+            raise ValueError('smoke delivery receipt identity is missing or malformed')
+        if {key: value['event'].get(key) for key in event if key != 'occurred_at'} != {key: item for key, item in event.items() if key != 'occurred_at'}:
             raise ValueError('smoke delivery receipt identity conflicts')
+        allowed = {'sending', 'failed', 'uncertain'} | (
+            {'not-notified', 'notified', 'not-notified-before-activation'} if event['kind'] == 'usable'
+            else {'saved', 'queued', 'submitted', 'consumed', 'saved-before-activation'})
+        if value.get('status') not in allowed:
+            raise ValueError('smoke delivery receipt status is missing or unrecognized')
         return {key: value[key] for key in ('event_id', 'status', 'updated_at', 'error', 'receipt', 'explicit_retry') if key in value}
 
     def summary(self, record):
-        try:
-            return {event['kind']: self.receipt(event) for event in self.events(record)}
-        except (OSError, ValueError, KeyError, TypeError) as error:
-            return {'error': str(error)}
+        result = {}
+        for event in self.events(record):
+            try:
+                result[event['kind']] = self.receipt(event)
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                result[event['kind']] = {'event_id': event['event_id'], 'status': 'unverified', 'error': str(error)}
+        return result
 
     def _invoke(self, event, operation):
         if callable(self.adapter):
             return self.adapter(event, operation)
         executable = Path(self.adapter)
         if not executable.is_absolute() or not executable.is_file() or not os.access(executable, os.X_OK):
-            raise ValueError('smoke delivery adapter must be a configured absolute executable')
-        result = subprocess.run([str(executable)], input=json.dumps({'operation': operation, 'event': event}),
-                                text=True, capture_output=True, shell=False)
+            return {'event_id': event['event_id'], 'status': 'failed' if operation == 'deliver' else 'uncertain',
+                    'error': 'smoke delivery adapter must be a configured absolute executable'}
+        try:
+            result = subprocess.run([str(executable)], input=json.dumps({'operation': operation, 'event': event}),
+                                    text=True, capture_output=True, shell=False)
+        except OSError as error:
+            return {'event_id': event['event_id'], 'status': 'failed' if operation == 'deliver' else 'uncertain',
+                    'error': str(error)}
         if result.returncode:
             raise ValueError(f'adapter exited {result.returncode}: {result.stderr}')
         return json.loads(result.stdout)
@@ -99,7 +114,13 @@ class SmokeDelivery:
             for event in self.events(record):
                 with self.locked(event['event_id']):
                     path = self.directory / (event['event_id'] + '.json')
-                    prior = self.receipt(event)
+                    try:
+                        prior = self.receipt(event)
+                    except (OSError, ValueError, KeyError, TypeError) as error:
+                        atomic_write(self.directory / (event['event_id'] + '.error.json'),
+                            {'event_id': event['event_id'], 'status': 'unverified', 'error': str(error),
+                             'receipt_path': str(path), 'observed_at': _now()})
+                        continue
                     status = prior['status']
                     if status in {'consumed', 'notified', 'failed', 'saved-before-activation', 'not-notified-before-activation'}:
                         continue

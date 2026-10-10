@@ -136,10 +136,15 @@ try {
     console.log(JSON.stringify({scenario,sourceRevision,effectiveRoute:base,browser:browserVersion.Browser,artifact,
       assertions:['finished not live','actual retained run and audio metadata','audio element preserved through refresh','desktop and mobile fit',
         ...(scenario==='finished-session'?['repeat request without launch','missed-session response and draft continuity']:[])],operatorAudiblePlayback:'not claimed'}));
-  } else if (scenario === 'columns') {
+  } else if (scenario === 'columns' || scenario === 'installed-columns') {
     await evaluate(`location.hash='';smokeFilter='active';renderSmoke(lastSmoke);load()`);
-    await eventually(()=>evaluate(`document.querySelectorAll('#jobs .job-item').length`),n=>n===1,'one automatic job; smoke excluded');
-    assert.equal(await evaluate(`document.querySelectorAll('#jobs .quick').length`),1,'quick class comes from policy');
+    if(scenario==='columns'){
+      await eventually(()=>evaluate(`document.querySelectorAll('#jobs .job-item').length`),n=>n===1,'one automatic job; smoke excluded');
+      assert.equal(await evaluate(`document.querySelectorAll('#jobs .quick').length`),1,'quick class comes from policy');
+    }else{
+      await evaluate(`load()`);
+      assert.equal(await evaluate(`(()=>{const linked=new Set(lastSmoke.items.map(item=>item.display?.job_id).filter(Boolean));return [...document.querySelectorAll('#jobs .job-item')].some(row=>linked.has(row.dataset.jobId))})()`),false,'installed smoke jobs not duplicated');
+    }
     for(const [width,height] of [[1440,1000],[390,844]]){
       await command('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:width===390});
       const bounds=await evaluate(`(()=>{scrollTo(0,0);const a=document.querySelector('#automaticQueue').getBoundingClientRect(),b=document.querySelector('#operatorQueue').getBoundingClientRect();return {a:{x:a.x,y:a.y,right:a.right,bottom:a.bottom},b:{x:b.x,y:b.y}}})()`);

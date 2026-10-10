@@ -144,6 +144,83 @@ def test_loading_stale_and_prepared_sessions_cannot_generate_usable_notification
     assert not calls
 
 
+def test_missing_adapter_is_definitely_unsent_and_explicitly_retryable(tmp_path):
+    _, store, record = finished(tmp_path)
+    delivery = relay(store, str(tmp_path / 'missing-adapter'))
+    delivery.activate()
+    store.respond(record['request']['id'], 'Preserve this feedback.')
+    delivery.run_once()
+    event = delivery.events(store.get(record['request']['id']))[0]
+    assert delivery.summary(store.get(record['request']['id']))['response']['status'] == 'failed'
+    delivery.retry(store.get(record['request']['id']), 'response', event['event_id'])
+    calls = []
+    delivery.adapter = lambda value, op: calls.append(op) or {'event_id': value['event_id'], 'status': 'queued'}
+    delivery.run_once()
+    assert calls == ['deliver']
+
+
+@pytest.mark.parametrize('malformation', ['json', 'missing-status', 'wrong-event', 'unknown-status'])
+def test_bad_receipt_is_preserved_without_stalling_another_owner(tmp_path, malformation):
+    _, store, record = finished(tmp_path)
+    other = smoke(tmp_path, {**command(tmp_path), 'output_dir': str(tmp_path / 'other')})
+    other.pop('operator_command')
+    other['id'] = str(uuid4())
+    other['source']['agent_id'] = 'another-owner'
+    store.submit(other)
+    calls = []
+    delivery = relay(store, lambda event, op: calls.append(event['request_id']) or {'event_id': event['event_id'], 'status': 'queued'})
+    delivery.activate()
+    store.respond(record['request']['id'], 'First feedback.')
+    store.respond(other['id'], 'Second feedback.')
+    first = delivery.events(store.get(record['request']['id']))[0]
+    path = delivery.directory / (first['event_id'] + '.json')
+    value = {'event': first, 'event_id': first['event_id']}
+    if malformation == 'wrong-event':
+        value['event'] = {**first, 'request_digest': 'wrong'}
+        value['status'] = 'queued'
+    if malformation == 'unknown-status':
+        value['status'] = 'made-up'
+    raw = '{broken' if malformation == 'json' else json.dumps(value)
+    path.write_text(raw)
+    delivery.run_once()
+    delivery.run_once()
+    assert record['request']['id'] not in calls
+    assert other['id'] in calls
+    assert path.read_text() == raw
+    assert delivery.summary(store.get(record['request']['id']))['response']['status'] == 'unverified'
+    assert delivery.summary(store.get(other['id']))['response']['status'] == 'queued'
+    assert (delivery.directory / (first['event_id'] + '.error.json')).is_file()
+    with pytest.raises(ValueError):
+        delivery.retry(store.get(record['request']['id']), 'response', first['event_id'])
+
+
+@pytest.mark.parametrize('mode', ['full', 'admission', 'readonly'])
+@pytest.mark.parametrize('state,expected', [('pending', 'Cancel'), ('running', 'Force stop')])
+def test_linked_smoke_keeps_only_its_authorized_native_actions(tmp_path, mode, state, expected):
+    import re
+    script = re.search(r'<script>(.*?)</script>', PAGE, re.S).group(1)
+    script = script[:script.index("document.querySelector('#pause').onclick")]
+    fixture = """
+const nodes=new Map();
+function node(key){if(!nodes.has(key))nodes.set(key,{innerHTML:'',style:{},dataset:{},querySelectorAll:()=>[],before:()=>{}});return nodes.get(key)}
+global.document={body:{dataset:{readOnly:MODE==='readonly'?'true':'false'}},activeElement:null,querySelector:node,querySelectorAll:()=>[],createElement:()=>node('created'),getElementById:()=>null};
+global.location={href:'http://127.0.0.1:8766/',search:'',hash:'',origin:'http://127.0.0.1:8766',pathname:'/'};
+""".replace('MODE', json.dumps(mode))
+    action = """
+render({jobs:[{job_id:'owned-job',status:STATE,consistent:true,submitted_at:1}],paused:false,read_only:MODE==='readonly',admission_control:MODE==='admission'});
+renderSmoke({schema:'gpu-greenroom.smoke-request-list.v1',errors:[],items:[{request:{id:'smoke',source:{},title:'Owned smoke'},status:'operator-needed',display:{job_id:'owned-job',job_state:STATE,phase:'waiting-gpu'},destination:{kind:'context'}}]});
+console.log(JSON.stringify({automatic:node('#jobs').innerHTML,operator:node('#smokeRequestList').innerHTML}));
+""".replace('MODE', json.dumps(mode)).replace('STATE', json.dumps(state))
+    result = subprocess.run(['node', '-e', fixture + script + action], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    markup = json.loads(result.stdout)
+    assert 'owned-job' not in markup['automatic']
+    if mode == 'full':
+        assert expected in markup['operator']
+    else:
+        assert "act('" not in markup['operator']
+
+
 def test_terminal_notification_is_bound_and_not_duplicated_on_phase_changes(tmp_path, monkeypatch):
     _, store, record = finished(tmp_path)
     calls = []
