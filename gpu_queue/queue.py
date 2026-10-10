@@ -327,6 +327,12 @@ class GPUQueue:
             return True
         try:
             os.killpg(process_group, signal.SIGTERM)
+        except PermissionError:
+            # Denial is not quiescence. Retain the existing ownership-unknown
+            # hold unless a fresh group probe independently observes absence.
+            if proc is not None:
+                proc.poll()
+            return cls._process_group_alive(process_group) is False
         except ProcessLookupError:
             if proc is not None and proc.poll() is None:
                 proc.wait()

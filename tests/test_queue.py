@@ -342,6 +342,71 @@ class TestCancel:
 
 
 class TestRunningJobControl:
+    def test_denied_group_signal_preserves_unresolved_ownership(self, monkeypatch):
+        signals = []
+
+        def denied_signal(group, signal_number):
+            signals.append((group, signal_number))
+            if signal_number:
+                raise PermissionError("observed native SIGTERM denial")
+
+        monkeypatch.setattr(os, "killpg", denied_signal)
+        assert GPUQueue._quiesce_owned_child(None, 987654) is False
+        assert signals == [(987654, 0), (987654, signal.SIGTERM), (987654, 0)]
+
+    def test_denied_signal_can_close_only_after_group_absence(self, monkeypatch):
+        probes = 0
+
+        def vanished_group(_group, signal_number):
+            nonlocal probes
+            if signal_number:
+                raise PermissionError("signal raced with process-group exit")
+            probes += 1
+            if probes > 1:
+                raise ProcessLookupError("group no longer exists")
+
+        monkeypatch.setattr(os, "killpg", vanished_group)
+        assert GPUQueue._quiesce_owned_child(None, 987654) is True
+        assert probes == 2
+
+    @pytest.mark.parametrize("command_exit", [0, 7])
+    def test_denied_completion_signal_writes_hold_and_blocks_next_job(
+        self, queue, tmp_path, monkeypatch, command_exit
+    ):
+        request = make_request(output_dir=str(tmp_path / "first-out"))
+        second = make_request(output_dir=str(tmp_path / "second-out"))
+        queue.submit(request)
+        queue.submit(second)
+        job_types = {"echo": [sys.executable, "-c", f"raise SystemExit({command_exit})"]}
+
+        def denied_signal(_group, signal_number):
+            if signal_number:
+                raise PermissionError("observed native SIGTERM denial")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "killpg", denied_signal)
+            assert queue.run_one(job_types) is True
+            state = queue.get_job(request.job_id)
+            assert state.status == JobStatus.RUNNING
+            assert state.failure_phase == "completion_quiescence_unresolved"
+            assert state.exit_code == command_exit
+            assert state.finished_at is None
+            receipt = json.loads(
+                (queue.queue_dir / "running" / request.job_id / "receipt.json").read_text()
+            )
+            assert receipt["status"] == "ownership_unknown"
+            assert receipt["child_process_group"] == state.child_process_group
+            assert "ownership_unknown:process_group_live" in receipt["warnings"]
+            assert queue.run_one(job_types) is False
+            assert queue.get_job(second.job_id).status == JobStatus.PENDING
+            assert not (queue.queue_dir / "done" / request.job_id).exists()
+
+        # The actual tiny command is gone. Only an independently observed absence
+        # may clear the held queue record; recovery must not call it successful.
+        assert queue.recover_stale() == [request.job_id]
+        assert queue.get_job(request.job_id).status == JobStatus.FAILED
+        assert queue.get_job(request.job_id).failure_phase == "stale_recovery"
+
     @pytest.mark.parametrize("stop_signal", [signal.SIGINT, signal.SIGTERM])
     def test_worker_sigterm_quiesces_child_before_releasing_execution_lock(
         self, queue, tmp_path, stop_signal
