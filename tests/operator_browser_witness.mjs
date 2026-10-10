@@ -131,11 +131,26 @@ try {
       assert.equal(await evaluate(`document.querySelector('${selector} input[value="not-tried"]').checked`),true);
       assert.equal(await evaluate(`document.querySelector('${selector} textarea').value`),'Synthetic missed-session fixture');
       await evaluate(`document.querySelector('${selector} form').requestSubmit()`);
-      await eventually(()=>evaluate(`document.querySelector('${selector}').innerText`),s=>s.includes('Response returned')&&s.includes('Participation: not-tried'),'missed-session response');
+      await eventually(()=>evaluate(`document.querySelector('${selector}').innerText`),s=>s.includes('Feedback saved')&&s.includes('Participation: not-tried'),'missed-session response');
     }
     console.log(JSON.stringify({scenario,sourceRevision,effectiveRoute:base,browser:browserVersion.Browser,artifact,
       assertions:['finished not live','actual retained run and audio metadata','audio element preserved through refresh','desktop and mobile fit',
         ...(scenario==='finished-session'?['repeat request without launch','missed-session response and draft continuity']:[])],operatorAudiblePlayback:'not claimed'}));
+  } else if (scenario === 'columns') {
+    await evaluate(`location.hash='';smokeFilter='active';renderSmoke(lastSmoke);load()`);
+    await eventually(()=>evaluate(`document.querySelectorAll('#jobs .job-item').length`),n=>n===1,'one automatic job; smoke excluded');
+    assert.equal(await evaluate(`document.querySelectorAll('#jobs .quick').length`),1,'quick class comes from policy');
+    for(const [width,height] of [[1440,1000],[390,844]]){
+      await command('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:width===390});
+      const bounds=await evaluate(`(()=>{scrollTo(0,0);const a=document.querySelector('#automaticQueue').getBoundingClientRect(),b=document.querySelector('#operatorQueue').getBoundingClientRect();return {a:{x:a.x,y:a.y,right:a.right,bottom:a.bottom},b:{x:b.x,y:b.y}}})()`);
+      if(width===1440){assert.ok(bounds.a.right<bounds.b.x);assert.ok(Math.abs(bounds.a.y-bounds.b.y)<2)}
+      else assert.ok(bounds.b.y>=bounds.a.bottom);
+      assert.equal(await evaluate(`document.documentElement.scrollWidth<=innerWidth`),true);
+      const frame=await command('Page.captureScreenshot',{format:'png',fromSurface:true});
+      writeFileSync(join(artifactDirectory,`columns-${width}.png`),Buffer.from(frame.data,'base64'));
+    }
+    console.log(JSON.stringify({scenario,sourceRevision,effectiveRoute:base,browser:browserVersion.Browser,artifact,
+      assertions:['separate automatic/operator columns','native quick badge','no duplicate smoke job','desktop/mobile fit']}));
   } else if (scenario === 'destinations') {
     for (const [width, height] of [[1440,1000],[390,844]]) {
       markPhase(`destinations-${width}`);

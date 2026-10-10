@@ -8,6 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import html
 import json
 import math
+import os
 import secrets
 import shutil
 import signal
@@ -29,13 +30,15 @@ PAGE = r"""<!doctype html>
 <style>
 :root{color-scheme:dark;--bg:#111315;--panel:#191c1f;--line:#34393e;--text:#f1f3f4;--muted:#9fa7ad;--green:#4dd58b;--amber:#f2bd57;--red:#ff6b6b;--blue:#70b8ff}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:0;overflow-x:hidden}header{height:56px;display:flex;align-items:center;gap:14px;padding:0 18px;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--bg);z-index:2}h1{font:600 17px/1 system-ui;margin:0}.spacer{flex:1;min-width:0}.state{display:flex;align-items:center;gap:8px;color:var(--muted)}.dot{width:9px;height:9px;border-radius:50%;background:var(--green)}.dot.paused{background:var(--amber)}button{border:1px solid var(--line);background:#25292d;color:var(--text);height:34px;padding:0 11px;border-radius:5px;font:inherit;cursor:pointer}button:hover{border-color:#596169}button.danger{color:#ffd8d8;border-color:#6a3538}button:disabled{opacity:.4;cursor:default}.icon{width:36px;padding:0;font-size:17px}main{width:100%;max-width:100vw;padding:14px 18px 40px;overflow-x:auto}.toolbar{display:flex;gap:8px;align-items:center;margin-bottom:12px;overflow:auto}.filter.active{border-color:var(--blue);color:var(--blue)}table{width:100%;min-width:680px;border-collapse:collapse;table-layout:fixed}th{text-align:left;color:var(--muted);font-weight:500;border-bottom:1px solid var(--line);padding:9px 8px}td{border-bottom:1px solid #292d31;padding:9px 8px;vertical-align:top;overflow-wrap:anywhere}.id{width:150px;white-space:nowrap}.id .meta{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.status{width:94px}.age{width:94px}.actions{width:128px;text-align:right}.route{color:#d9e7f7}.meta{color:var(--muted);font-size:12px;margin-top:3px}.pill{display:inline-block;padding:2px 6px;border:1px solid var(--line);border-radius:4px}.running{color:var(--green)}.pending{color:var(--amber)}.failed{color:var(--red)}.empty{padding:40px 8px;color:var(--muted);text-align:center}.error{position:fixed;left:18px;right:18px;bottom:16px;background:#391f22;border:1px solid #7a3d43;padding:10px 12px;border-radius:5px;display:none}@media(max-width:760px){header{width:100vw;padding:0 10px;gap:4px}h1{font-size:14px}.state{gap:4px;font-size:12px}.spacer{display:none}.icon{width:32px}main{padding:10px}.age,.ageCell{display:none}.routeCol{width:44%}.actions{width:88px}button.text{font-size:0;width:36px}.text span{font-size:17px}}
 .smoke-card fieldset{border:0;padding:0;margin:12px 0;display:flex;flex-wrap:wrap;gap:10px}.smoke-card legend{margin-bottom:6px}.smoke-card fieldset label{display:flex;align-items:center;gap:5px}.smokeRun{margin:12px 0}.smokeRun summary{cursor:pointer;color:var(--blue);padding:6px 0}.smokeRun pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px}.smoke-audio audio{width:100%;max-width:480px}.smoke-actions{flex-wrap:wrap;gap:8px}
+.queue-columns{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:28px;margin-top:18px}.queue-column{min-width:0}.column-heading{display:flex;align-items:center;gap:12px;min-height:36px;margin-bottom:14px}.column-heading h2{font:600 17px/1.2 system-ui;margin:0}.column-heading .meta{margin:0}.job-item{border-top:1px solid var(--line);padding:14px 0;overflow-wrap:anywhere}.job-heading{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px}.job-heading strong{font-size:14px}.job-timing{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px 12px;margin:10px 0;color:var(--muted);font-size:12px}.quick{color:var(--blue);border-color:var(--blue)}.job-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:8px}.toolbar button{flex-shrink:0}.delivery-status{color:var(--muted);font-size:12px}.delivery-status.failed,.delivery-status.uncertain{color:var(--amber)}@media(max-width:900px){.queue-columns{grid-template-columns:minmax(0,1fr);gap:24px}.queue-column+ .queue-column{border-top:1px solid var(--line);padding-top:18px}.job-timing{grid-template-columns:minmax(0,1fr)}}
 </style>
 </head>
 <body><header><h1>GPU Greenroom</h1><div class="state"><span id="dot" class="dot"></span><span id="queueState">loading</span></div><div class="spacer"></div><button id="pause" title="Pause queue" class="icon">Ⅱ</button><button id="resume" title="Resume queue" class="icon">▶</button><button id="refresh" title="Refresh" class="icon">↻</button></header>
-<main><section id="smokeRequests" class="smoke-panel" aria-labelledby="smokeHeading"><div class="smoke-heading"><h2 id="smokeHeading">Smoke requests</h2><button id="refreshSmoke" type="button">Refresh</button><span id="smokeStatus" class="meta" aria-live="polite">Loading</span></div><div id="smokeRequestList"><div class="empty">Loading requests…</div></div></section><div id="pauseMeta" class="meta" hidden></div><div id="lease" class="meta" hidden></div><div class="toolbar" id="filters"></div><table><thead><tr><th class="id">Job</th><th class="status">State</th><th class="routeCol">Route</th><th class="age">Elapsed</th><th class="actions">Actions</th></tr></thead><tbody id="jobs"></tbody></table><div id="empty" class="empty" hidden>No jobs in this view.</div></main><div id="error" class="error"></div>
+<main><div id="pauseMeta" class="meta" hidden></div><div id="lease" class="meta" hidden></div><div class="queue-columns"><section id="automaticQueue" class="queue-column" aria-labelledby="automaticHeading"><div class="column-heading"><h2 id="automaticHeading">Automatic work</h2><span id="automaticCount" class="meta"></span></div><div class="toolbar" id="filters"></div><div id="jobs"></div><div id="empty" class="empty" hidden>No jobs in this view.</div></section><div id="operatorQueue" class="queue-column"><section id="smokeRequests" aria-labelledby="smokeHeading"><div class="column-heading smoke-heading"><h2 id="smokeHeading">Operator smokes</h2><button id="refreshSmoke" type="button" class="icon" title="Refresh operator smokes">↻</button><span id="smokeStatus" class="meta" aria-live="polite">Loading</span></div><div id="smokeRequestList"><div class="empty">Loading requests…</div></div></section></div></div></main><div id="error" class="error"></div>
 <script>
 const hash=new URLSearchParams(location.hash.slice(1)),bootstrap=globalThis.__GREENROOM_BOOTSTRAP_TOKEN__||'';if(bootstrap){sessionStorage.setItem('greenroom-token',bootstrap)}else if(hash.get('token')){sessionStorage.setItem('greenroom-token',hash.get('token'));history.replaceState(null,'',location.pathname)}const token=sessionStorage.getItem('greenroom-token')||'';let filter='active',last=null;const statuses=['active','all','pending','running','done','failed','cancelled'];
 const smokeDrafts=new Map(),smokeParticipation=new Map(),smokeRuns=new Map(),smokeRunVersions=new Map(),smokeRunLoads=new Set(),smokeRunOpen=new Set(),smokeAudio=new Map(),smokeAudioBindings=new Map(),smokeSubmitting=new Set(),smokeAccepted=new Set();let smokeLoadGeneration=0,smokeHasLoaded=false,smokeRefreshUnavailable=false,smokeArrivalHandled=false,smokeFilter='active',lastSmoke=null;
+const arrivalParams=new URLSearchParams(location.search||''),arrivalId=arrivalParams.get('smoke'),arrivalDigest=arrivalParams.get('destination');let arrivalOpened=false;if(arrivalId){history.replaceState(null,'',location.pathname+'#smoke-'+arrivalId)}
 function smokeRunVersion(item){return JSON.stringify([item?.request_digest,item?.display?.job_id,item?.presentation?.review_artifacts||[]])}
 function smokeAudioBinding(item,index){const artifact=item?.presentation?.review_artifacts?.[index];return artifact?JSON.stringify([item.request_digest,item.display?.job_id,artifact]):null}
 function reconcileSmokeRun(item){
@@ -43,7 +46,8 @@ function reconcileSmokeRun(item){
   if(run){if(!item.display?.run_available||smokeRunVersions.get(id)!==smokeRunVersion(item)){smokeRuns.delete(id);smokeRunVersions.delete(id)}else run.participation=item.response?.participation||'not-recorded'}
   for(const [key,player] of smokeAudio){if(key.startsWith(id+':')&&(!item.display?.run_available||smokeAudioBindings.get(key)!==smokeAudioBinding(item,key.slice(id.length+1)))){player.pause();URL.revokeObjectURL(player.src);smokeAudio.delete(key);smokeAudioBindings.delete(key)}}
 }
-const smokePhases={'awaiting-start':'Awaiting start','waiting-gpu':'Queued',running:'Executing; participation unverified',loading:'Loading',interactive:'Interactive (reported)',preparing:'Preparing',blocked:'Blocked','operator-needed':'Waiting for you','awaiting-response':'Waiting for response',responded:'Response returned',failed:'Failed',cancelled:'Cancelled',unknown:'Unverified'};
+const smokePhases={'awaiting-start':'Awaiting start','waiting-gpu':'Waiting for GPU',running:'Executing; participation unverified',loading:'Loading',interactive:'Interactive (reported)',preparing:'Preparing',blocked:'Blocked','operator-needed':'Waiting for you','awaiting-response':'Waiting for response',responded:'Feedback saved',failed:'Failed',cancelled:'Cancelled',unknown:'Unverified'};
+function smokeDelivery(item){const labels={saved:'Feedback saved locally',queued:'Queued for owner',submitted:'Submitted to owner conversation',consumed:'Owner marked consumed',notified:'Session notification dispatched',failed:'Delivery failed',uncertain:'Delivery uncertain; checking receipt','saved-before-activation':'Saved before automatic return was enabled','not-notified-before-activation':'Session predates notifications','not-notified':'Notification pending',sending:'Delivery in progress'};return Object.entries(item.delivery||{}).map(([kind,value])=>kind==='error'?`<p class="delivery-status failed">Delivery state unavailable: ${esc(value)}</p>`:`<p class="delivery-status ${esc(value.status)}">${kind==='repeat'?'New session request: ':kind==='usable'?'Notification: ':''}${esc(labels[value.status]||'Unverified')}${value.error?' · '+esc(value.error):''}${['failed','saved-before-activation','not-notified-before-activation'].includes(value.status)&&document.body.dataset.readOnly!=='true'?` <button type="button" class="smokeDeliveryRetry" data-id="${esc(item.request.id)}" data-kind="${esc(kind)}" data-event="${esc(value.event_id)}">Retry delivery</button>`:''}</p>`).join('')}
 function smokeProgress(item){const d=item.display||{},p=d.progress;return `<p class="smoke-progress"><strong>${esc(smokePhases[d.phase]||'Unverified')}</strong>${d.queue_position?' · Queue position '+esc(d.queue_position):''}${d.label?' · '+esc(d.label):''}</p>${p?.total?`<div class="smoke-progress"><progress value="${esc(p.completed)}" max="${esc(p.total)}"></progress> ${esc(p.completed)} / ${esc(p.total)} ${esc(p.unit)}</div>`:''}${d.failure_phase?`<p class="meta">Failure phase: ${esc(d.failure_phase)}${d.exit_code!=null?' · Exit '+esc(d.exit_code):''}</p>`:''}${d.error?`<p class="meta">${esc(d.error)}</p>`:''}`}
 function smokeRunView(item){
   const id=item.request.id,d=item.display||{},run=smokeRuns.get(id);
@@ -80,20 +84,24 @@ function render(s){
   lease.textContent=s.lease?`Recorded external owner: ${s.lease.owner} · ${s.lease.effective_route} · ${s.lease.lifecycle_state}`:'';
   document.querySelector('#filters').innerHTML=statuses.map(x=>`<button class="filter ${filter===x?'active':''}" data-filter="${x}">${x}</button>`).join('');
   document.querySelectorAll('[data-filter]').forEach(b=>b.onclick=()=>{filter=b.dataset.filter;load()});
-  const rows=s.jobs;document.querySelector('#empty').hidden=rows.length>0;
+  const smokeJobs=new Set((lastSmoke?.items||[]).map(item=>item.display?.job_id).filter(Boolean));
+  const rank=j=>j.status==='running'?0:j.status==='pending'?1:2;
+  const rows=s.jobs.filter(j=>!smokeJobs.has(j.job_id)).sort((a,b)=>rank(a)-rank(b)||(a.status==='pending'?(a.queue_position??Infinity)-(b.queue_position??Infinity):(b.submitted_at||0)-(a.submitted_at||0)));document.querySelector('#empty').hidden=rows.length>0;
+  document.querySelector('#automaticCount').textContent=rows.length+' job(s)';
   document.querySelector('#jobs').innerHTML=rows.map(j=>{
     let a='';
     if(j.consistent&&j.status==='pending')a=`<button class="danger text" title="Cancel pending job" onclick="act('cancel','${j.job_id}')"><span>×</span> Cancel</button>`;
     if(j.consistent&&j.status==='running')a=`<button class="danger text" title="Stop running job" onclick="act('terminate','${j.job_id}')"><span>■</span> Stop</button> <button class="danger icon" title="Force stop running job" onclick="act('kill','${j.job_id}')">!</button>`;
     const route=j.requested_route||j.effective_route||j.job_type;
     const conflict=j.consistent?'':`<div class="meta">containment: ${esc(j.containment_status)} · declared: ${esc(j.declared_status)}</div>`;
-    return `<tr><td class="id">${esc(j.job_id)}<div class="meta">${esc(j.job_type)}</div></td><td class="status"><span class="pill ${esc(j.status)}">${esc(j.status)}</span>${conflict}</td><td><div class="route">${esc(route)}</div><div class="meta">${esc(document.body.dataset.identityLabel||'Agent')}: ${esc(j.agent_id||'not recorded')}</div><div class="meta">${esc(j.repo_root||j.output_dir||j.record_error||'')}</div></td><td class="ageCell"><div>Submitted: ${j.submitted_at?esc(new Date(j.submitted_at*1000).toLocaleString()):'not recorded'}</div><div>Queue wait: ${duration(j.queue_wait_seconds)}</div><div>Execution wall time: ${duration(j.execution_wall_seconds)}</div><div class="meta">GPU hold time: not recorded</div></td><td class="actions">${a}</td></tr>`;
+    return `<article class="job-item" data-job-id="${esc(j.job_id)}"><div class="job-heading"><strong>${esc(j.job_id)}</strong><span class="pill ${esc(j.status)}">${esc(j.status)}</span>${j.dispatch_class==='quick'?`<span class="pill quick" title="${esc(j.dispatch_basis)}">Quick</span>`:''}${j.queue_position?`<span class="meta">Queue ${esc(j.queue_position)}</span>`:''}</div>${conflict}<div class="route">${esc(route)}</div><div class="meta">${esc(document.body.dataset.identityLabel||'Agent')}: ${esc(j.agent_id||'not recorded')} · ${esc(j.job_type)}</div><div class="meta">${esc(j.repo_root||j.output_dir||j.record_error||'')}</div>${j.dispatch_error?'<div class="meta failed">Dispatch classification: '+esc(j.dispatch_error)+'</div>':''}<div class="job-timing"><div>Submitted: ${j.submitted_at?esc(new Date(j.submitted_at*1000).toLocaleString()):'not recorded'}</div><div>Queue wait: ${duration(j.queue_wait_seconds)}</div><div>Execution wall time: ${duration(j.execution_wall_seconds)}</div><div>GPU hold time: not recorded</div></div><div class="job-actions actions">${a}</div></article>`;
   }).join('');
 }
 async function load(){try{const r=await request('/api/state?view='+encodeURIComponent(filter),{headers:auth()});if(!r.ok)throw new Error(await r.text());render(await r.json())}catch(e){document.querySelector('#queueState').textContent='State unavailable';document.querySelector('#pause').disabled=true;document.querySelector('#resume').disabled=true;err(e.message)}}
 function renderSmoke(payload){
   if(!payload||payload.schema!=='gpu-greenroom.smoke-request-list.v1'||!Array.isArray(payload.items)||!Array.isArray(payload.errors))throw new Error('Invalid smoke request list response');
   lastSmoke=payload;
+  if(last)render(last);
   if(!smokeArrivalHandled&&location.hash.startsWith('#smoke-'))smokeFilter='all';
   const host=document.querySelector('#smokeRequestList'),items=payload.items.filter(item=>smokeFilter==='all'||(item.display?.section||'active')===smokeFilter),focused=document.activeElement,
     focusedForm=focused?.closest('form.smokeReply'),focusId=focusedForm?.dataset.id,
@@ -131,7 +139,7 @@ function renderSmoke(payload){
     else if(target.kind==='terminal'&&!item.display?.run_available)destination=`<button type="button" class="smokeFocus" data-id="${esc(q.id)}" data-digest="${esc(item.request_digest)}" data-destination="${esc(target.identity_digest||'')}" ${item.display?.terminal_verified&&document.body.dataset.readOnly!=='true'?'':'disabled'}>Open terminal${target.pane_id!=null?' · pane '+esc(target.pane_id):''}</button>`;
     else if(target.url&&new URL(target.url,location.href).href!==location.origin+location.pathname)destination=`<a href="${esc(target.url)}" target="_blank" rel="noopener noreferrer">View linked page</a>`;
     const phase=item.display?.phase,instructions=item.display?.run_available?'':phase==='waiting-gpu'?'<p>Waiting for GPU dispatch; the session is not running yet.</p>':item.display?.job_state==='running'?`<p>${item.display.terminal_verified?'Open the terminal for the current session.':'Execution is underway; the application destination has not been verified.'}</p>`:`<p>${esc(q.prompt||'No request prompt recorded.')}</p>`;
-    return `<article class="smoke-card" id="smoke-${esc(q.id)}"><h3>${esc(q.title||'Untitled smoke request')}</h3><p class="meta">Reported by (unverified): ${esc(q.source?.agent_id||'not recorded')}</p>${smokeProgress(item)}${item.display?.phase_reported_at?'<p class="meta">Phase reported: '+esc(new Date(item.display.phase_reported_at).toLocaleString())+'</p>':''}${instructions}${destination?'<p>'+destination+'</p>':''}${smokeRunView(item)}${smokeNext(item)}${action}</article>`
+    return `<article class="smoke-card" id="smoke-${esc(q.id)}"><h3>${esc(q.title||'Untitled smoke request')}</h3><p class="meta">Reported by (unverified): ${esc(q.source?.agent_id||'not recorded')}</p><p class="meta">Submitted: ${esc(new Date(item.created_at).toLocaleString())}${item.display?.operator_start_at?' · Start selected: '+esc(new Date(item.display.operator_start_at).toLocaleString()):''}</p>${smokeProgress(item)}${item.display?.phase_reported_at?'<p class="meta">Phase reported: '+esc(new Date(item.display.phase_reported_at).toLocaleString())+'</p>':''}${instructions}${destination?'<p>'+destination+'</p>':''}${smokeRunView(item)}${smokeNext(item)}${action}${smokeDelivery(item)}</article>`
   }).join('');
   host.querySelectorAll('button.smokeStart').forEach(button=>{
     button.disabled=smokeRefreshUnavailable||smokeSubmitting.has(button.dataset.id);
@@ -139,6 +147,7 @@ function renderSmoke(payload){
   });
   host.querySelectorAll('button.smokeFocus').forEach(button=>{button.onclick=()=>focusSmoke(button)});
   host.querySelectorAll('button.smokeRepeat').forEach(button=>{button.disabled=smokeSubmitting.has(button.dataset.id);button.onclick=()=>repeatSmoke(button)});
+  host.querySelectorAll('button.smokeDeliveryRetry').forEach(button=>button.onclick=async()=>{button.disabled=true;try{const r=await request(`/api/smoke-requests/${encodeURIComponent(button.dataset.id)}/delivery-retry`,{method:'POST',headers:auth(),body:JSON.stringify({kind:button.dataset.kind,event_id:button.dataset.event})});if(!r.ok)throw new Error(await r.text());await loadSmoke()}catch(e){err(e.message)}});
   host.querySelectorAll('details.smokeRun').forEach(details=>details.ontoggle=()=>{const id=details.dataset.id;if(details.open){smokeRunOpen.add(id);if(!smokeRuns.has(id))loadSmokeRun(id)}else smokeRunOpen.delete(id)});
   host.querySelectorAll('details.smokeRun[open]').forEach(details=>{if(!smokeRuns.has(details.dataset.id))loadSmokeRun(details.dataset.id)});
   host.querySelectorAll('button.smokeAudio').forEach(button=>button.onclick=()=>loadSmokeAudio(button));
@@ -157,6 +166,7 @@ function renderSmoke(payload){
     }
   });
   if(!smokeArrivalHandled&&location.hash.startsWith('#smoke-')){const target=document.getElementById(location.hash.slice(1));if(target){if(!focusControl){target.style.scrollMarginTop=(document.querySelector('header').getBoundingClientRect().height+12)+'px';target.scrollIntoView({block:'start'});target.tabIndex=-1;target.focus({preventScroll:true})}smokeArrivalHandled=true}else{document.querySelector('#smokeStatus').textContent='Smoke request in link is not available'}}
+  if(arrivalId&&arrivalDigest&&!arrivalOpened){arrivalOpened=true;const item=payload.items.find(value=>value.request.id===arrivalId);if(item?.destination?.identity_digest===arrivalDigest&&!item.display?.run_available&&item.display?.job_state==='running'){if(item.display.terminal_verified){const button=host.querySelector(`button.smokeFocus[data-id="${CSS.escape(arrivalId)}"]`);if(button)focusSmoke(button)}else if(item.display.application_reported){location.assign(item.destination.url)}}else err('The linked session has ended or changed; showing its request instead.')}
 }
 function keepLastSmokeView(message){
   smokeRefreshUnavailable=true;
@@ -204,6 +214,12 @@ def queue_snapshot(queue: GPUQueue | Path, view: str = "all", *, read_only: bool
         raise ValueError(f"invalid view: {view}")
 
     jobs = []
+    try:
+        config = dispatch.policy(queue_dir)
+        positions = {path.name: index + 1 for index, path in enumerate(dispatch.pending_order(queue_dir, config))}
+        classification_error = None
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        config, positions, classification_error = None, {}, str(error)
     for containment_status in selected:
         status_dir = queue_dir / containment_status
         for job_dir in sorted(status_dir.iterdir()) if status_dir.is_dir() else ():
@@ -248,6 +264,19 @@ def queue_snapshot(queue: GPUQueue | Path, view: str = "all", *, read_only: bool
                 row["agent_id"] = request.get("agent_id")
                 row["requested_route"] = request.get("route_identity")
                 row["repo_root"] = request.get("repo_root")
+                try:
+                    if config is None:
+                        raise ValueError(classification_error)
+                    observed = row.get('dispatch')
+                    if isinstance(observed, dict) and observed.get('service_class') in {'quick', 'normal'}:
+                        row['dispatch_class'], row['dispatch_basis'] = observed['service_class'], observed.get('eligibility_basis')
+                        row['dispatch_source'] = 'native-dispatch-receipt'
+                    else:
+                        row['dispatch_class'], row['dispatch_basis'] = dispatch.classify(request, config)
+                        row['dispatch_source'] = 'current-policy-projection'
+                except ValueError as error:
+                    row['dispatch_error'] = str(error)
+            row['queue_position'] = positions.get(row['job_id'])
             now = time.time()
             submitted, started, finished = (row.get(key) for key in ('submitted_at', 'started_at', 'finished_at'))
             def difference(end, start):
@@ -388,6 +417,14 @@ def make_handler(queue: GPUQueue | Path, token: str, *, read_only: bool = False,
                 record = self._smoke_requests().request_repeat(parts[2], body['request_digest'])
                 self._json(HTTPStatus.OK, self._smoke_requests().public_record(record))
                 return True
+            if len(parts) == 4 and parts[0:2] == ['api', 'smoke-requests'] and parts[3] == 'delivery-retry':
+                from .smoke_delivery import SmokeDelivery
+                if set(body) != {'kind', 'event_id'}:
+                    raise ValueError('Retry accepts only the saved delivery identity')
+                store = self._smoke_requests()
+                SmokeDelivery(store).retry(store.get(parts[2]), body['kind'], body['event_id'])
+                self._json(HTTPStatus.OK, {'status': 'retry-requested'})
+                return True
             return False
 
         @staticmethod
@@ -396,7 +433,7 @@ def make_handler(queue: GPUQueue | Path, token: str, *, read_only: bool = False,
             return path == "/api/smoke-requests" or (
                 len(parts) == 4
                 and parts[0:2] == ["api", "smoke-requests"]
-                and parts[3] in {"response", "start", "focus", "repeat"}
+                and parts[3] in {"response", "start", "focus", "repeat", "delivery-retry"}
             )
 
         def do_GET(self):
@@ -578,6 +615,10 @@ def serve(queue_dir: str | Path, *, port: int = 8765, token: str | None = None, 
     queue = Path(queue_dir) if read_only or admission_control else GPUQueue(queue_dir)
     server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(queue, token, read_only=read_only, admission_control=admission_control, identity_label=identity_label, local_operator=local_operator))
     effective_port = server.server_address[1]
+    adapter = os.environ.get('GPU_GREENROOM_SMOKE_DELIVERY_ADAPTER')
+    if adapter and not read_only:
+        from .smoke_delivery import SmokeDelivery
+        SmokeDelivery(SmokeRequests(Path(queue_dir) / 'smoke-requests'), adapter).start()
     print(operator_url(effective_port, token, local_operator=local_operator), flush=True)
     server.serve_forever()
 

@@ -234,6 +234,15 @@ class SmokeRequests:
                     or not all(c.isalnum() or c in '_-' for c in session['job_id'])):
                 raise ValueError('invalid terminal session record')
             _timestamp(session.get('observed_at'), 'session observed_at')
+        if 'application_session' in record:
+            application = record['application_session']
+            if (not isinstance(application, dict) or application.get('request_digest') != record['request_digest']
+                    or application.get('phase') not in {'loading', 'operator-needed', 'interactive'}
+                    or not isinstance(application.get('job_id'), str) or not application['job_id']
+                    or not isinstance(application.get('label'), str) or not application['label'].strip()):
+                raise ValueError('invalid application session record')
+            _target({'kind': 'browser', 'url': application.get('url')})
+            _timestamp(application.get('observed_at'), 'application observed_at')
         if 'operator_command' in request:
             plan = record.get('prepared')
             if not isinstance(plan, dict) or plan.get('schema') != admission.PLAN_SCHEMA:
@@ -458,7 +467,26 @@ class SmokeRequests:
                 identity = {key: session[key] for key in ('request_digest', 'job_id', 'pane_id',
                             'pid', 'tty_name', 'process_start_identity')}
                 return {**target, 'pane_id': session['pane_id'], 'identity_digest': _digest(identity)}
+        if target['kind'] == 'browser' and record.get('application_session'):
+            session = record['application_session']
+            return {**target, 'identity_digest': _digest({key: session[key] for key in ('request_digest', 'job_id', 'url')})}
         return target
+
+    def publish_application(self, identity, payload):
+        if (not isinstance(payload, dict) or set(payload) != {'url', 'phase', 'label'}
+                or payload.get('phase') not in {'loading', 'operator-needed', 'interactive'}
+                or not isinstance(payload.get('label'), str) or not payload['label'].strip()):
+            raise ValueError('application publication needs URL, phase and label')
+        target = _target({'kind': 'browser', 'url': payload['url']})
+        with self._locked(identity):
+            record = self.get(identity)
+            if record['status'] == 'responded':
+                raise SmokeRequestConflict('smoke already has a response')
+            job_id = self._running_job(record)
+            record['application_session'] = {**payload, 'request_digest': record['request_digest'],
+                'job_id': job_id, 'observed_at': _now()}
+            record['presentation'] = {**record.get('presentation', {}), 'target': target}
+            return self._write(record)
 
     def _verify_session(self, record):
         from . import smoke_navigation
@@ -609,6 +637,14 @@ class SmokeRequests:
             if record['status'] != 'responded' and stage == 'done' and self.destination(record)['kind'] == 'terminal':
                 result.update(phase='awaiting-response', label='Last session ended; your experience has not been recorded', progress=None)
             result['started_at'] = state.get('started_at')
+            application = record.get('application_session')
+            if record['status'] != 'responded' and stage == 'running' and application:
+                if (application.get('request_digest') != record['request_digest'] or application.get('job_id') != job['job_id']
+                        or self.destination(record) != {**_target({'kind': 'browser', 'url': application['url']}),
+                            'identity_digest': _digest({key: application[key] for key in ('request_digest', 'job_id', 'url')})}):
+                    raise ValueError('application destination conflicts with running job')
+                result.update(phase=application['phase'], label=application['label'], application_reported=True,
+                              phase_reported_at=application['observed_at'])
             if stage == 'pending':
                 result['queue_position'] = dispatch.pending_order(root).index(path)+1
         except (OSError, ValueError, TypeError, KeyError) as error:
@@ -618,6 +654,7 @@ class SmokeRequests:
         return result
 
     def snapshot(self):
+        from .smoke_delivery import SmokeDelivery
         if not self.directory.parent.is_dir():
             raise ValueError('Greenroom queue root is unavailable')
         records, errors = self.scan()
@@ -625,7 +662,8 @@ class SmokeRequests:
                 'reader_sha256': READER_SHA256,
                 'queue_dir': str(self.directory.parent.resolve()),
                 'items': [{**self.public_record(record), 'display': self.display(record),
-                           'destination': self.destination(record)} for record in records],
+                           'destination': self.destination(record),
+                           'delivery': SmokeDelivery(self).summary(record)} for record in records],
                 'errors': errors}
 
     def submit(self, value: object) -> tuple[dict, bool]:
