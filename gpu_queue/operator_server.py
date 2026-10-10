@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import html
@@ -18,7 +17,7 @@ from urllib.parse import parse_qs, urlparse
 
 from .queue import GPUQueue
 from .admission_control import transition
-from .smoke_requests import SmokeRequestConflict, SmokeRequests
+from .smoke_requests import READER_SHA256, SmokeRequestConflict, SmokeRequests
 from . import dispatch
 
 
@@ -36,7 +35,14 @@ PAGE = r"""<!doctype html>
 <main><section id="smokeRequests" class="smoke-panel" aria-labelledby="smokeHeading"><div class="smoke-heading"><h2 id="smokeHeading">Smoke requests</h2><button id="refreshSmoke" type="button">Refresh</button><span id="smokeStatus" class="meta" aria-live="polite">Loading</span></div><div id="smokeRequestList"><div class="empty">Loading requests…</div></div></section><div id="pauseMeta" class="meta" hidden></div><div id="lease" class="meta" hidden></div><div class="toolbar" id="filters"></div><table><thead><tr><th class="id">Job</th><th class="status">State</th><th class="routeCol">Route</th><th class="age">Elapsed</th><th class="actions">Actions</th></tr></thead><tbody id="jobs"></tbody></table><div id="empty" class="empty" hidden>No jobs in this view.</div></main><div id="error" class="error"></div>
 <script>
 const hash=new URLSearchParams(location.hash.slice(1)),bootstrap=globalThis.__GREENROOM_BOOTSTRAP_TOKEN__||'';if(bootstrap){sessionStorage.setItem('greenroom-token',bootstrap)}else if(hash.get('token')){sessionStorage.setItem('greenroom-token',hash.get('token'));history.replaceState(null,'',location.pathname)}const token=sessionStorage.getItem('greenroom-token')||'';let filter='active',last=null;const statuses=['active','all','pending','running','done','failed','cancelled'];
-const smokeDrafts=new Map(),smokeParticipation=new Map(),smokeRuns=new Map(),smokeRunOpen=new Set(),smokeAudio=new Map(),smokeSubmitting=new Set(),smokeAccepted=new Set();let smokeLoadGeneration=0,smokeHasLoaded=false,smokeRefreshUnavailable=false,smokeArrivalHandled=false,smokeFilter='active',lastSmoke=null;
+const smokeDrafts=new Map(),smokeParticipation=new Map(),smokeRuns=new Map(),smokeRunVersions=new Map(),smokeRunLoads=new Set(),smokeRunOpen=new Set(),smokeAudio=new Map(),smokeAudioBindings=new Map(),smokeSubmitting=new Set(),smokeAccepted=new Set();let smokeLoadGeneration=0,smokeHasLoaded=false,smokeRefreshUnavailable=false,smokeArrivalHandled=false,smokeFilter='active',lastSmoke=null;
+function smokeRunVersion(item){return JSON.stringify([item?.request_digest,item?.display?.job_id,item?.presentation?.review_artifacts||[]])}
+function smokeAudioBinding(item,index){const artifact=item?.presentation?.review_artifacts?.[index];return artifact?JSON.stringify([item.request_digest,item.display?.job_id,artifact]):null}
+function reconcileSmokeRun(item){
+  const id=item.request.id,run=smokeRuns.get(id);
+  if(run){if(!item.display?.run_available||smokeRunVersions.get(id)!==smokeRunVersion(item)){smokeRuns.delete(id);smokeRunVersions.delete(id)}else run.participation=item.response?.participation||'not-recorded'}
+  for(const [key,player] of smokeAudio){if(key.startsWith(id+':')&&(!item.display?.run_available||smokeAudioBindings.get(key)!==smokeAudioBinding(item,key.slice(id.length+1)))){player.pause();URL.revokeObjectURL(player.src);smokeAudio.delete(key);smokeAudioBindings.delete(key)}}
+}
 const smokePhases={'awaiting-start':'Awaiting start','waiting-gpu':'Queued',running:'Executing; participation unverified',loading:'Loading',interactive:'Interactive (reported)',preparing:'Preparing',blocked:'Blocked','operator-needed':'Waiting for you','awaiting-response':'Waiting for response',responded:'Response returned',failed:'Failed',cancelled:'Cancelled',unknown:'Unverified'};
 function smokeProgress(item){const d=item.display||{},p=d.progress;return `<p class="smoke-progress"><strong>${esc(smokePhases[d.phase]||'Unverified')}</strong>${d.queue_position?' · Queue position '+esc(d.queue_position):''}${d.label?' · '+esc(d.label):''}</p>${p?.total?`<div class="smoke-progress"><progress value="${esc(p.completed)}" max="${esc(p.total)}"></progress> ${esc(p.completed)} / ${esc(p.total)} ${esc(p.unit)}</div>`:''}${d.failure_phase?`<p class="meta">Failure phase: ${esc(d.failure_phase)}${d.exit_code!=null?' · Exit '+esc(d.exit_code):''}</p>`:''}${d.error?`<p class="meta">${esc(d.error)}</p>`:''}`}
 function smokeRunView(item){
@@ -107,6 +113,7 @@ function renderSmoke(payload){
     return;
   }
   smokeRefreshUnavailable=false;smokeHasLoaded=true;
+  payload.items.forEach(reconcileSmokeRun);
   document.querySelector('#smokeStatus').textContent=payload.errors?.length?`${payload.errors.length} unreadable record(s)`:items.length?`${items.length} request(s)`:'No requests';
   let views=document.querySelector('#smokeViews');if(!views){views=document.createElement('div');views.id='smokeViews';views.className='toolbar';host.before(views)}
   const active=payload.items.filter(item=>(item.display?.section||'active')==='active').length;
@@ -133,6 +140,7 @@ function renderSmoke(payload){
   host.querySelectorAll('button.smokeFocus').forEach(button=>{button.onclick=()=>focusSmoke(button)});
   host.querySelectorAll('button.smokeRepeat').forEach(button=>{button.disabled=smokeSubmitting.has(button.dataset.id);button.onclick=()=>repeatSmoke(button)});
   host.querySelectorAll('details.smokeRun').forEach(details=>details.ontoggle=()=>{const id=details.dataset.id;if(details.open){smokeRunOpen.add(id);if(!smokeRuns.has(id))loadSmokeRun(id)}else smokeRunOpen.delete(id)});
+  host.querySelectorAll('details.smokeRun[open]').forEach(details=>{if(!smokeRuns.has(details.dataset.id))loadSmokeRun(details.dataset.id)});
   host.querySelectorAll('button.smokeAudio').forEach(button=>button.onclick=()=>loadSmokeAudio(button));
   host.querySelectorAll('[data-smoke-player]').forEach(holder=>holder.append(smokeAudio.get(holder.dataset.smokePlayer)));
   host.querySelectorAll('a.smokeNext').forEach(link=>link.onclick=()=>{smokeFilter='all';smokeArrivalHandled=false;setTimeout(()=>renderSmoke(lastSmoke),0)});
@@ -174,8 +182,8 @@ async function loadSmoke(){
 async function startSmoke(button){const id=button.dataset.id;if(smokeSubmitting.has(id))return;smokeSubmitting.add(id);button.disabled=true;try{const r=await request(`/api/smoke-requests/${encodeURIComponent(id)}/start`,{method:'POST',headers:auth(),body:JSON.stringify({request_digest:button.dataset.digest,request_id:crypto.randomUUID()})});if(!r.ok)throw new Error(await r.text());await loadSmoke();await load()}catch(e){err(e.message)}finally{smokeSubmitting.delete(id);const current=document.querySelector(`button.smokeStart[data-id="${CSS.escape(id)}"]`);if(current)current.disabled=smokeRefreshUnavailable}}
 async function focusSmoke(button){button.disabled=true;try{const r=await request(`/api/smoke-requests/${encodeURIComponent(button.dataset.id)}/focus`,{method:'POST',headers:auth(),body:JSON.stringify({request_digest:button.dataset.digest,destination_digest:button.dataset.destination})});if(!r.ok)throw new Error(await r.text())}catch(e){err(e.message)}finally{await loadSmoke()}}
 async function repeatSmoke(button){const id=button.dataset.id;if(smokeSubmitting.has(id))return;smokeSubmitting.add(id);button.disabled=true;try{const r=await request(`/api/smoke-requests/${encodeURIComponent(id)}/repeat`,{method:'POST',headers:auth(),body:JSON.stringify({request_digest:button.dataset.digest})});if(!r.ok)throw new Error(await r.text());await loadSmoke()}catch(e){err(e.message)}finally{smokeSubmitting.delete(id)}}
-async function loadSmokeRun(id){try{const r=await request(`/api/smoke-requests/${encodeURIComponent(id)}/run`,{headers:auth()});if(!r.ok)throw new Error(await r.text());const run=await r.json(),item=lastSmoke?.items.find(i=>i.request.id===id);if(run.schema!=='gpu-greenroom.smoke-run.v1'||run.request_digest!==item?.request_digest||run.job_id!==item?.display?.job_id)throw new Error('Last-run identity changed');smokeRuns.set(id,run);renderSmoke(lastSmoke)}catch(e){smokeRunOpen.delete(id);err(e.message)}}
-async function loadSmokeAudio(button){const id=button.dataset.id,index=button.dataset.index;button.disabled=true;try{const r=await request(`/api/smoke-requests/${encodeURIComponent(id)}/audio/${index}`,{headers:auth()});if(!r.ok)throw new Error(await r.text());const player=document.createElement('audio');player.controls=true;player.preload='metadata';player.src=URL.createObjectURL(await r.blob());smokeAudio.set(id+':'+index,player);renderSmoke(lastSmoke)}catch(e){err(e.message);button.disabled=false}}
+async function loadSmokeRun(id){if(smokeRunLoads.has(id))return;smokeRunLoads.add(id);const version=smokeRunVersion(lastSmoke?.items.find(i=>i.request.id===id));try{const r=await request(`/api/smoke-requests/${encodeURIComponent(id)}/run`,{headers:auth()});if(!r.ok)throw new Error(await r.text());const run=await r.json(),item=lastSmoke?.items.find(i=>i.request.id===id);if(version!==smokeRunVersion(item))return;if(run.schema!=='gpu-greenroom.smoke-run.v1'||run.request_digest!==item?.request_digest||run.job_id!==item?.display?.job_id)throw new Error('Last-run identity changed');run.participation=item.response?.participation||'not-recorded';smokeRuns.set(id,run);smokeRunVersions.set(id,version);renderSmoke(lastSmoke)}catch(e){smokeRunOpen.delete(id);err(e.message)}finally{smokeRunLoads.delete(id)}}
+async function loadSmokeAudio(button){const id=button.dataset.id,index=button.dataset.index,binding=smokeAudioBinding(lastSmoke?.items.find(i=>i.request.id===id),index);button.disabled=true;try{const r=await request(`/api/smoke-requests/${encodeURIComponent(id)}/audio/${index}`,{headers:auth()});if(!r.ok)throw new Error(await r.text());const blob=await r.blob();if(!binding||binding!==smokeAudioBinding(lastSmoke?.items.find(i=>i.request.id===id),index))return;const player=document.createElement('audio');player.controls=true;player.preload='metadata';player.src=URL.createObjectURL(blob);smokeAudio.set(id+':'+index,player);smokeAudioBindings.set(id+':'+index,binding);renderSmoke(lastSmoke)}catch(e){err(e.message);button.disabled=false}}
 async function sendSmokeResponse(event){event.preventDefault();const form=event.currentTarget,id=form.dataset.id,button=form.querySelector('button[type="submit"]'),participation=form.querySelector('input[name="participation"]:checked')?.value;let text=form.querySelector('textarea').value;if(participation==='not-tried'&&!text.trim())text="I didn't get to try this session.";if(smokeSubmitting.has(id)||smokeAccepted.has(id))return;smokeSubmitting.add(id);button.disabled=true;try{const r=await request(`/api/smoke-requests/${encodeURIComponent(id)}/response`,{method:'POST',headers:auth(),body:JSON.stringify({text,...(participation?{participation}:{})})});if(!r.ok)throw new Error(await r.text());smokeAccepted.add(id);smokeDrafts.delete(id);await loadSmoke()}catch(e){err(e.message)}finally{smokeSubmitting.delete(id);const current=document.querySelector(`form.smokeReply[data-id="${CSS.escape(id)}"] button[type="submit"]`);if(current)current.disabled=smokeRefreshUnavailable||smokeAccepted.has(id)}}
 async function post(path,body={}){if(busy)return;busy=true;if(last)render(last);try{const r=await request(path,{method:'POST',headers:auth(),body:JSON.stringify({...body,request_id:crypto.randomUUID()})});if(!r.ok)throw new Error(await r.text())}finally{busy=false;await load()}}
 async function act(kind,id){try{if(kind==='cancel')await post('/api/cancel',{job_id:id,requested_by:'operator-console',reason:'operator cancelled pending job'});else await post('/api/terminate',{job_id:id,requested_by:'operator-console',reason:'operator stopped running job',force:kind==='kill'})}catch(e){err(e.message)}}
@@ -400,7 +408,7 @@ def make_handler(queue: GPUQueue | Path, token: str, *, read_only: bool = False,
                 page = PAGE
                 root = queue if isinstance(queue, Path) else queue.queue_dir
                 source = {'schema':'gpu-greenroom.smoke-source.v1', 'queue_dir':str(root.resolve()),
-                          'reader_sha256':hashlib.sha256(Path(__file__).with_name('smoke_requests.py').read_bytes()).hexdigest()}
+                          'reader_sha256':READER_SHA256}
                 page = page.replace('<title>', '<meta name="greenroom-smoke-source" content="'+html.escape(json.dumps(source),quote=True)+'"><title>', 1)
                 if local_operator:
                     bootstrap = (

@@ -188,6 +188,53 @@ def test_successor_validation_is_rechecked_after_configuration(tmp_path):
     assert 'changed' in display['next_session_error']
 
 
+def test_reader_identity_describes_loaded_code_not_later_source_edits(tmp_path, monkeypatch):
+    store = SmokeRequests(tmp_path / 'smoke-requests')
+    original = store.snapshot()['reader_sha256']
+    monkeypatch.setattr(Path, 'read_bytes', lambda path: b'later source not loaded by this process')
+    assert store.snapshot()['reader_sha256'] == original
+
+
+@pytest.mark.parametrize('change', ['replace', 'withdraw', 'participation'])
+def test_loaded_run_refresh_tracks_published_audio_and_participation(tmp_path, change):
+    _, store, record = finished(tmp_path)
+    identity = record['request']['id']
+    output = Path(record['prepared']['job_request']['output_dir'])
+    output.mkdir(exist_ok=True)
+    audio = output / 'playback.wav'
+    audio.write_bytes(b'RIFF first recording')
+    store.configure(identity, {'review_artifacts': [{'path': 'playback.wav', 'label': 'FIRST recording'}]})
+    old_item = store.snapshot()['items'][0]
+    old_run = store.run_details(identity)
+    if change == 'replace':
+        audio.write_bytes(b'RIFF replacement recording')
+        store.configure(identity, {'review_artifacts': [{'path': 'playback.wav', 'label': 'SECOND recording'}]})
+    elif change == 'withdraw':
+        store.configure(identity, {'review_artifacts': []})
+    store.respond(identity, 'I tried it', participation='tried')
+    script = PAGE.split('<script>')[-1].split('</script>')[0].split('async function loadSmoke')[0]
+    harness = r'''
+const host={innerHTML:'',querySelectorAll:()=>[],before:()=>{}};
+const views={innerHTML:'',querySelectorAll:()=>[]};
+globalThis.location={hash:'',href:'http://127.0.0.1:8766/',origin:'http://127.0.0.1:8766',pathname:'/'};
+globalThis.sessionStorage={getItem:()=>'',setItem:()=>{}};
+globalThis.document={body:{dataset:{}},activeElement:null,querySelector:s=>s==='#smokeRequestList'?host:s==='#smokeViews'?views:{textContent:''},querySelectorAll:()=>[]};
+const player={pause:()=>{},src:'blob:old'};
+'''
+    code = harness + script + 'smokeFilter="history";'
+    code += f'const identity={json.dumps(identity)},oldItem={json.dumps(old_item)};'
+    code += f'smokeRuns.set(identity,{json.dumps(old_run)});smokeAudio.set(identity+":0",player);'
+    code += 'if(typeof smokeRunVersions!=="undefined")smokeRunVersions.set(identity,smokeRunVersion(oldItem));'
+    code += 'if(typeof smokeAudioBindings!=="undefined")smokeAudioBindings.set(identity+":0",smokeAudioBinding(oldItem,0));'
+    code += f'renderSmoke({json.dumps(store.snapshot())});'
+    code += 'console.log(JSON.stringify({oldLabel:host.innerHTML.includes("FIRST recording"),oldParticipation:host.innerHTML.includes("Participation: not-recorded"),playerRetained:smokeAudio.get(identity+":0")===player}));'
+    result = subprocess.run(['node', '-e', code], capture_output=True, text=True, check=True)
+    actual = json.loads(result.stdout)
+    assert actual['oldParticipation'] is False
+    assert actual['oldLabel'] is (change == 'participation')
+    assert actual['playerRetained'] is (change == 'participation')
+
+
 def test_finished_ui_has_no_live_directions_or_dead_terminal_action():
     # Execute the actual page renderer; synthetic data tests presentation, not host identity.
     script = PAGE.split('<script>')[-1].split('</script>')[0].split('async function loadSmoke')[0]

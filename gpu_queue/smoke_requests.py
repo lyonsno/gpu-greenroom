@@ -20,6 +20,7 @@ from .models import JobRequest
 
 SCHEMA = "gpu-greenroom.interactive-smoke.v1"
 AUDIO_TYPES = {'.wav': 'audio/wav', '.m4a': 'audio/mp4', '.mp3': 'audio/mpeg', '.ogg': 'audio/ogg'}
+READER_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 
 class SmokeRequestConflict(ValueError):
@@ -617,7 +618,7 @@ class SmokeRequests:
             raise ValueError('Greenroom queue root is unavailable')
         records, errors = self.scan()
         return {'schema': 'gpu-greenroom.smoke-request-list.v1', 'observed_at': _now(),
-                'reader_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                'reader_sha256': READER_SHA256,
                 'queue_dir': str(self.directory.parent.resolve()),
                 'items': [{**self.public_record(record), 'display': self.display(record),
                            'destination': self.destination(record)} for record in records],

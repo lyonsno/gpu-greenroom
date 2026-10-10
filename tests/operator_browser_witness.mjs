@@ -118,7 +118,7 @@ try {
     for(const [width,height] of [[1440,1000],[390,844]]){
       markPhase(`finished-${width}`);
       await command('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:width===390});
-      await evaluate(`document.querySelector('${selector}').scrollIntoView({block:'start'})`);
+      await evaluate(`(()=>{const card=document.querySelector('${selector}');card.style.scrollMarginTop=(document.querySelector('header').getBoundingClientRect().height+12)+'px';card.scrollIntoView({block:'start'})})()`);
       assert.equal(await evaluate(`document.documentElement.scrollWidth<=innerWidth`),true);
       const frame=await command('Page.captureScreenshot',{format:'png',fromSurface:true});
       writeFileSync(join(artifactDirectory,`finished-${width}.png`),Buffer.from(frame.data,'base64'));
