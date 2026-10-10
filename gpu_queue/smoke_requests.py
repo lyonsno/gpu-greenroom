@@ -340,13 +340,15 @@ class SmokeRequests:
         binding = admission.file_binding(self._artifact_path(job, item))
         return {key: binding[key] for key in ('sha256', 'size')}
 
-    def review_artifact(self, identity, index):
+    def review_artifact(self, identity, index, expected_sha256=None):
         record = self.get(identity)
         _, _, _, job = self._terminal_job(record)
         items = record.get('presentation', {}).get('review_artifacts', [])
         if type(index) is not int or not 0 <= index < len(items):
             raise ValueError('review artifact is not published')
         item = items[index]
+        if expected_sha256 is not None and expected_sha256 != item['sha256']:
+            raise ValueError('recording publication changed; refresh before loading')
         if self._artifact_binding(job, item) != {key: item[key] for key in ('sha256', 'size')}:
             raise ValueError('retained audio bytes changed; producer must republish')
         path = self._artifact_path(job, item)
@@ -357,6 +359,7 @@ class SmokeRequests:
         stage, path, state, _ = self._terminal_job(record)
         result = {'schema': 'gpu-greenroom.smoke-run.v1', 'request_digest': record['request_digest'],
                   'job_id': path.name, 'native_state': stage,
+                  'review_digest': _digest(record.get('presentation', {}).get('review_artifacts', [])),
                   'participation': (record.get('response') or {}).get('participation', 'not-recorded'),
                   **{key: state.get(key) for key in ('started_at', 'finished_at', 'exit_code', 'failure_phase', 'error_message')},
                   'artifacts': [], 'errors': []}
@@ -593,7 +596,8 @@ class SmokeRequests:
                                    'failed':'failed','cancelled':'cancelled'}[stage]
             result['job_state'] = stage
             result.update(finished_at=state.get('finished_at'), exit_code=state.get('exit_code'),
-                          run_available=stage in {'done', 'failed', 'cancelled'})
+                          run_available=stage in {'done', 'failed', 'cancelled'},
+                          review_digest=_digest(record.get('presentation', {}).get('review_artifacts', [])))
             if stage in {'failed', 'cancelled'}:
                 result.update(section='history', error=state.get('error_message'),
                               failure_phase=state.get('failure_phase'), exit_code=state.get('exit_code'),

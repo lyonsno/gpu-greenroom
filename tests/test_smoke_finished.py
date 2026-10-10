@@ -235,6 +235,50 @@ const player={pause:()=>{},src:'blob:old'};
     assert actual['playerRetained'] is (change == 'participation')
 
 
+def test_run_fetch_rejects_republication_before_next_list_refresh(tmp_path):
+    _, store, record = finished(tmp_path)
+    identity = record['request']['id']
+    output = Path(record['prepared']['job_request']['output_dir'])
+    output.mkdir(exist_ok=True)
+    (output / 'playback.wav').write_bytes(b'RIFF first')
+    store.configure(identity, {'review_artifacts': [{'path': 'playback.wav', 'label': 'FIRST'}]})
+    old = store.snapshot()
+    (output / 'playback.wav').write_bytes(b'RIFF replacement')
+    store.configure(identity, {'review_artifacts': [{'path': 'playback.wav', 'label': 'SECOND'}]})
+    run = store.run_details(identity)
+    script = PAGE.split('<script>')[-1].split('</script>')[0].split('async function sendSmokeResponse')[0]
+    harness = "globalThis.location={hash:'',href:'http://127.0.0.1:8766/',origin:'http://127.0.0.1:8766',pathname:'/'};globalThis.sessionStorage={getItem:()=>'',setItem:()=>{}};"
+    code = harness + script + f'lastSmoke={json.dumps(old)};'
+    code += f'request=async()=>({{ok:true,json:async()=>({json.dumps(run)})}});'
+    code += 'err=()=>{};renderSmoke=()=>{};'
+    code += f'loadSmokeRun({json.dumps(identity)}).then(()=>console.log(JSON.stringify({{cached:smokeRuns.has({json.dumps(identity)})}})));'
+    result = subprocess.run(['node', '-e', code], capture_output=True, text=True, check=True)
+    assert json.loads(result.stdout)['cached'] is False
+
+
+def test_audio_http_rejects_binding_from_obsolete_list(tmp_path):
+    _, store, record = finished(tmp_path)
+    output = Path(record['prepared']['job_request']['output_dir'])
+    output.mkdir(exist_ok=True)
+    (output / 'playback.wav').write_bytes(b'RIFF current recording')
+    store.configure(record['request']['id'], {'review_artifacts': [{'path': 'playback.wav', 'label': 'Current'}]})
+    server = ThreadingHTTPServer(('127.0.0.1', 0), make_handler(store.directory.parent, 'secret', admission_control=True))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    url = f'http://127.0.0.1:{server.server_port}/api/smoke-requests/{record["request"]["id"]}/audio/0'
+    try:
+        with pytest.raises(HTTPError) as error:
+            urlopen(Request(url, headers={'Authorization': 'Bearer secret', 'X-Greenroom-Artifact-SHA256': '0' * 64}))
+        assert error.value.code == 400
+        sha = store.run_details(record['request']['id'])['artifacts'][0]['sha256']
+        response = urlopen(Request(url, headers={'Authorization': 'Bearer secret', 'X-Greenroom-Artifact-SHA256': sha}))
+        assert response.read() == b'RIFF current recording'
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
 def test_finished_ui_has_no_live_directions_or_dead_terminal_action():
     # Execute the actual page renderer; synthetic data tests presentation, not host identity.
     script = PAGE.split('<script>')[-1].split('</script>')[0].split('async function loadSmoke')[0]
