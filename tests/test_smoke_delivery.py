@@ -196,7 +196,8 @@ def test_bad_receipt_is_preserved_without_stalling_another_owner(tmp_path, malfo
 
 @pytest.mark.parametrize('mode', ['full', 'admission', 'readonly'])
 @pytest.mark.parametrize('state,expected', [('pending', 'Cancel'), ('running', 'Force stop')])
-def test_linked_smoke_keeps_only_its_authorized_native_actions(tmp_path, mode, state, expected):
+@pytest.mark.parametrize('consistent', [True, False])
+def test_linked_smoke_keeps_only_its_authorized_native_actions(tmp_path, mode, state, expected, consistent):
     import re
     script = re.search(r'<script>(.*?)</script>', PAGE, re.S).group(1)
     script = script[:script.index("document.querySelector('#pause').onclick")]
@@ -207,15 +208,15 @@ global.document={body:{dataset:{readOnly:MODE==='readonly'?'true':'false'}},acti
 global.location={href:'http://127.0.0.1:8766/',search:'',hash:'',origin:'http://127.0.0.1:8766',pathname:'/'};
 """.replace('MODE', json.dumps(mode))
     action = """
-render({jobs:[{job_id:'owned-job',status:STATE,consistent:true,submitted_at:1}],paused:false,read_only:MODE==='readonly',admission_control:MODE==='admission'});
+render({jobs:[{job_id:'owned-job',status:STATE,consistent:CONSISTENT,submitted_at:1}],paused:false,read_only:MODE==='readonly',admission_control:MODE==='admission'});
 renderSmoke({schema:'gpu-greenroom.smoke-request-list.v1',errors:[],items:[{request:{id:'smoke',source:{},title:'Owned smoke'},status:'operator-needed',display:{job_id:'owned-job',job_state:STATE,phase:'waiting-gpu'},destination:{kind:'context'}}]});
 console.log(JSON.stringify({automatic:node('#jobs').innerHTML,operator:node('#smokeRequestList').innerHTML}));
-""".replace('MODE', json.dumps(mode)).replace('STATE', json.dumps(state))
+""".replace('MODE', json.dumps(mode)).replace('STATE', json.dumps(state)).replace('CONSISTENT', json.dumps(consistent))
     result = subprocess.run(['node', '-e', fixture + script + action], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     markup = json.loads(result.stdout)
     assert 'owned-job' not in markup['automatic']
-    if mode == 'full':
+    if mode == 'full' and consistent:
         assert expected in markup['operator']
     else:
         assert "act('" not in markup['operator']

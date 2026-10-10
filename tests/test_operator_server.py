@@ -368,8 +368,6 @@ def test_read_only_api_rejects_mutation(tmp_path):
 def test_operator_page_renders_both_inconsistent_status_identities():
     assert "j.containment_status" in PAGE
     assert "j.declared_status" in PAGE
-    assert "j.consistent&&j.status==='pending'" in PAGE
-    assert "j.consistent&&j.status==='running'" in PAGE
 
 
 def test_operator_api_requires_token_and_cancels_pending(tmp_path):
