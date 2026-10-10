@@ -1,8 +1,11 @@
 import json
+import os
+from pathlib import Path
 from http.server import ThreadingHTTPServer
 import subprocess
 import sys
 import threading
+import wave
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from uuid import uuid4
@@ -211,3 +214,33 @@ globalThis.document={body:{dataset:{}},activeElement:null,querySelector:s=>s==='
     assert 'Did you get to try this session?' in result.stdout
     assert 'Request another session' in result.stdout
     assert 'Needs attention (1)' in result.stdout
+
+
+@pytest.mark.skipif(not os.environ.get('GREENROOM_CHROME'), reason='independent browser not configured')
+def test_browser_finished_session_actions_use_real_api_and_preserve_audio(tmp_path):
+    queue, store, record = finished(tmp_path)
+    output = Path(record['prepared']['job_request']['output_dir'])
+    output.mkdir(exist_ok=True)
+    with wave.open(str(output / 'playback.wav'), 'wb') as audio:
+        audio.setnchannels(1)
+        audio.setsampwidth(2)
+        audio.setframerate(24000)
+        audio.writeframes(b'\0\0' * 2400)
+    store.configure(record['request']['id'], {'review_artifacts': [{'path': 'playback.wav', 'label': 'Synthetic recorded audio'}]})
+    server = ThreadingHTTPServer(('127.0.0.1', 0), make_handler(queue.queue_dir, 'fixture-secret', admission_control=True, local_operator=True))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        result = subprocess.run(['node', str(Path(__file__).with_name('operator_browser_witness.mjs')),
+            os.environ['GREENROOM_CHROME'], f'http://127.0.0.1:{server.server_port}', 'finished-session',
+            record['request']['id'], 'working-source/CPU-native-fixture', str(tmp_path)], capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        final = store.get(record['request']['id'])
+        assert final['response']['participation'] == 'not-tried'
+        assert final['response']['text'] == 'Synthetic missed-session fixture'
+        assert final['repeat_request']['gpu_execution_authority'] is False
+        assert not list((queue.queue_dir / 'pending').iterdir())
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()

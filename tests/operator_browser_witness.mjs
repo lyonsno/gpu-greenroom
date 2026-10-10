@@ -91,7 +91,7 @@ try {
   try {
     await eventually(() => evaluate(`Boolean(document.querySelector('#smokeRequestList .smoke-card'))`), Boolean, 'initial Greenroom request render');
   } catch (error) {
-    writeFileSync(join(artifactDirectory, `${scenario}-document.json`), await evaluate(`JSON.stringify({href:location.href,body:document.body?.innerText,html:document.documentElement.outerHTML})`));
+    writeFileSync(join(artifactDirectory, `${scenario}-document.json`), await evaluate(`JSON.stringify({href:location.href,body:document.body?.innerText})`));
     throw error;
   }
   markPhase('initial-screenshot');
@@ -101,7 +101,42 @@ try {
   writeFileSync(artifact, Buffer.from(initialFrame.data, 'base64'));
   screenshotArtifact = artifact;
 
-  if (scenario === 'destinations') {
+  if (scenario === 'finished-session' || scenario === 'installed-finished') {
+    const selector=`#smoke-${requestId}`;
+    const card=await evaluate(`document.querySelector('${selector}').innerText`);
+    assert.ok(card.includes('Process completed')&&card.includes('Ended '),card);
+    assert.ok(!card.includes('Start session.')&&!card.includes('Open terminal'),card);
+    assert.ok(card.includes('Did you get to try this session?'),card);
+    await evaluate(`document.querySelector('${selector} details.smokeRun').open=true`);
+    await eventually(()=>evaluate(`document.querySelector('${selector} .smokeRun').innerText`),s=>s.includes('Process output')&&s.includes('Participation:'),'actual retained run');
+    const audioButton=await evaluate(`Boolean(document.querySelector('${selector} .smokeAudio'))`);
+    assert.equal(audioButton,true,'producer audio must be present for this witness');
+    await evaluate(`document.querySelector('${selector} .smokeAudio').click()`);
+    await eventually(()=>evaluate(`document.querySelector('${selector} audio')?.readyState`),s=>s>=1,'retained audio metadata');
+    await evaluate(`window.__retainedPlayer=document.querySelector('${selector} audio');window.__retainedPlayer.currentTime=0.02;loadSmoke()`);
+    assert.equal(await evaluate(`document.querySelector('${selector} audio')===window.__retainedPlayer`),true,'refresh must preserve the actual audio element');
+    for(const [width,height] of [[1440,1000],[390,844]]){
+      markPhase(`finished-${width}`);
+      await command('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:width===390});
+      await evaluate(`document.querySelector('${selector}').scrollIntoView({block:'start'})`);
+      assert.equal(await evaluate(`document.documentElement.scrollWidth<=innerWidth`),true);
+      const frame=await command('Page.captureScreenshot',{format:'png',fromSurface:true});
+      writeFileSync(join(artifactDirectory,`finished-${width}.png`),Buffer.from(frame.data,'base64'));
+    }
+    if(scenario==='finished-session'){
+      markPhase('repeat-without-launch');
+      await evaluate(`document.querySelector('${selector} .smokeRepeat').click()`);
+      await eventually(()=>evaluate(`document.querySelector('${selector}').innerText`),s=>s.includes('Another session requested'),'repeat request receipt');
+      await evaluate(`(()=>{const radio=document.querySelector('${selector} input[value="not-tried"]');radio.click();const t=document.querySelector('${selector} textarea');t.value='Synthetic missed-session fixture';t.dispatchEvent(new Event('input'));return loadSmoke()})()`);
+      assert.equal(await evaluate(`document.querySelector('${selector} input[value="not-tried"]').checked`),true);
+      assert.equal(await evaluate(`document.querySelector('${selector} textarea').value`),'Synthetic missed-session fixture');
+      await evaluate(`document.querySelector('${selector} form').requestSubmit()`);
+      await eventually(()=>evaluate(`document.querySelector('${selector}').innerText`),s=>s.includes('Response returned')&&s.includes('Participation: not-tried'),'missed-session response');
+    }
+    console.log(JSON.stringify({scenario,sourceRevision,effectiveRoute:base,browser:browserVersion.Browser,artifact,
+      assertions:['finished not live','actual retained run and audio metadata','audio element preserved through refresh','desktop and mobile fit',
+        ...(scenario==='finished-session'?['repeat request without launch','missed-session response and draft continuity']:[])],operatorAudiblePlayback:'not claimed'}));
+  } else if (scenario === 'destinations') {
     for (const [width, height] of [[1440,1000],[390,844]]) {
       markPhase(`destinations-${width}`);
       await command('Emulation.setDeviceMetricsOverride', {width,height,deviceScaleFactor:1,mobile:width===390});
