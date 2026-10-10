@@ -109,3 +109,40 @@ supported safe release boundary and return to CPU-side waiting. A field saying
 awaiting_operator does not authorize release of a loaded model. For RAON's
 current implementation, process exit and a fresh Start is the source-owned
 integration recommendation; deleting the session alone retains the model.
+
+## Finished Sessions
+
+Process completion does not record that the operator tried the application.
+Finished cards show the native end time and exit status, remove live directions
+and terminal navigation, and ask whether the operator tried or missed the session.
+Responses retain optional participation (`tried` or `not-tried`) separately from
+their text; legacy responses make no participation claim. Needs attention counts
+unresolved requests, not running applications.
+
+View last run reads the exact linked native job's complete stdout/stderr. Producers
+may add retained audio through the existing local configuration command:
+
+```json
+{"review_artifacts":[{"path":"conversation/playback.wav","label":"Recorded playback"}]}
+```
+
+Paths must be relative to that job's recorded output directory. Configuration
+binds the file bytes; missing, changed, empty or escaped files are unavailable,
+not playable evidence. Audio requires the same bearer credential as the API.
+HTTP accepts a published artifact index, never a caller-selected file path.
+
+Request another session records an idempotent `repeat_request` in the existing
+request. It grants no execution authority. The producer consumes this receipt,
+prepares a distinct request/job with an independent output directory, registers
+its completion delivery, and links it through local configuration:
+
+```json
+{"next_request_id":"<new prepared request UUID>"}
+```
+
+The finished card then offers Start new session against that new request's digest;
+after activation it offers View new session. Original request, finished job and
+retained output remain unchanged. Preparation itself never enqueues a GPU job.
+Missing or invalid successor preparation is explicit; the UI cannot guess argv,
+reuse a finished job, or silently restart a model. Producers own repeat-request
+consumption and publication of the successor, just as they own first preparation.

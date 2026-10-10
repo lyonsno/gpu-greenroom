@@ -19,6 +19,7 @@ from .models import JobRequest
 
 
 SCHEMA = "gpu-greenroom.interactive-smoke.v1"
+AUDIO_TYPES = {'.wav': 'audio/wav', '.m4a': 'audio/mp4', '.mp3': 'audio/mpeg', '.ogg': 'audio/ogg'}
 
 
 class SmokeRequestConflict(ValueError):
@@ -195,6 +196,14 @@ class SmokeRequests:
             if response.get("actor") != {"kind": "unverified-caller", "id": None}:
                 raise ValueError("response actor attribution must remain unverified")
             _timestamp(response.get("responded_at"), "responded_at")
+            if response.get('participation') not in {None, 'tried', 'not-tried'}:
+                raise ValueError('invalid operator participation')
+        if 'repeat_request' in record:
+            repeat = record['repeat_request']
+            if (not isinstance(repeat, dict) or repeat.get('request_digest') != record['request_digest']
+                    or repeat.get('gpu_execution_authority') is not False):
+                raise ValueError('invalid repeat request receipt')
+            _timestamp(repeat.get('requested_at'), 'repeat requested_at')
         if 'progress' in record:
             _progress(record['progress'])
             if type(record['progress'].get('revision')) is not int or record['progress']['revision'] < 1:
@@ -206,6 +215,10 @@ class SmokeRequests:
                 raise ValueError('invalid smoke presentation')
             if 'target' in presentation:
                 _target(presentation['target'])
+            if 'next_request_id' in presentation:
+                _canonical_id(presentation['next_request_id'])
+            if 'review_artifacts' in presentation:
+                self._artifact_list(presentation['review_artifacts'], bound=True)
         if 'session' in record:
             session = record['session']
             if (not isinstance(session, dict) or session.get('schema') != 'gpu-greenroom.smoke-session.v1'
@@ -236,18 +249,158 @@ class SmokeRequests:
         return record
 
     def configure(self, identity, payload):
-        if not isinstance(payload, dict) or not payload or set(payload) - {'target', 'purpose'}:
-            raise ValueError('configuration accepts target and purpose only')
+        if not isinstance(payload, dict) or not payload or set(payload) - {'target', 'purpose', 'next_request_id', 'review_artifacts'}:
+            raise ValueError('configuration accepts target, purpose, next_request_id and review_artifacts only')
         if 'target' in payload:
             _target(payload['target'])
         if 'purpose' in payload and payload['purpose'] not in {'operator', 'diagnostic'}:
             raise ValueError('purpose must be operator or diagnostic')
         with self._locked(identity):
             record = self.get(identity)
-            record['presentation'] = {**record.get('presentation', {}), **deepcopy(payload)}
+            changed = deepcopy(payload)
+            if 'next_request_id' in changed:
+                self._successor(record, changed['next_request_id'])
+            if 'review_artifacts' in changed:
+                _, _, _, job = self._terminal_job(record)
+                self._artifact_list(changed['review_artifacts'])
+                changed['review_artifacts'] = [{**item, **self._artifact_binding(job, item)}
+                                               for item in changed['review_artifacts']]
+            record['presentation'] = {**record.get('presentation', {}), **changed}
             if 'target' in payload and payload['target']['kind'] != 'terminal':
                 record.pop('session', None)
             return self._write(record)
+
+    def _linked_job(self, record):
+        job_id = (record.get('activation') or {}).get('job_id') or (record.get('progress') or {}).get('current_job_id') or record['request'].get('job_id')
+        if not isinstance(job_id, str) or not job_id or not all(c.isalnum() or c in '_-' for c in job_id):
+            raise ValueError('linked job identity is missing or invalid')
+        root = self.directory.parent
+        paths = [root / stage / job_id for stage in ('pending', 'running', 'done', 'failed', 'cancelled')
+                 if (root / stage / job_id).is_dir()]
+        if len(paths) != 1:
+            raise ValueError('linked job is missing or ambiguous')
+        path = paths[0]
+        if path.is_symlink() or path.resolve().parent != path.parent.resolve():
+            raise ValueError('linked job directory escaped its queue')
+        state = self._job_file(path, 'status.json', json_value=True)
+        job = self._job_file(path, 'request.json', json_value=True)
+        if (state.get('job_id') != job_id or state.get('status') != path.parent.name
+                or job.get('job_id') != job_id or job.get('agent_id') != record['request']['source']['agent_id']):
+            raise ValueError('linked job owner, identity or state conflicts')
+        return path.parent.name, path, state, job
+
+    @staticmethod
+    def _job_file(path, name, *, json_value=False):
+        source = path / name
+        if source.is_symlink() or source.resolve().parent != path.resolve():
+            raise ValueError('native run file escaped its job directory')
+        text = source.read_text(encoding='utf-8', errors='replace')
+        if not json_value:
+            return text
+        value = json.loads(text)
+        if not isinstance(value, dict):
+            raise ValueError('linked job record is malformed')
+        return value
+
+    def _terminal_job(self, record):
+        linked = self._linked_job(record)
+        if linked[0] not in {'done', 'failed', 'cancelled'}:
+            raise ValueError('last run has not ended')
+        return linked
+
+    @staticmethod
+    def _artifact_list(items, *, bound=False):
+        if not isinstance(items, list):
+            raise ValueError('review_artifacts must be a list')
+        for item in items:
+            keys = {'path', 'label', 'sha256', 'size'} if bound else {'path', 'label'}
+            if (not isinstance(item, dict) or set(item) != keys
+                    or not isinstance(item.get('label'), str) or not item['label'].strip()
+                    or not isinstance(item.get('path'), str) or not item['path']
+                    or Path(item['path']).is_absolute() or '..' in Path(item['path']).parts
+                    or Path(item['path']).suffix.lower() not in AUDIO_TYPES):
+                raise ValueError('review artifact needs a label and relative audio path')
+            if bound and (not isinstance(item['sha256'], str) or len(item['sha256']) != 64
+                          or type(item['size']) is not int or item['size'] <= 0):
+                raise ValueError('review artifact byte binding is invalid')
+
+    @staticmethod
+    def _artifact_path(job, item):
+        root_value = job.get('output_dir')
+        if not isinstance(root_value, str) or not Path(root_value).is_absolute():
+            raise ValueError('native output root is missing')
+        root = Path(root_value).resolve()
+        path = (root / item['path']).resolve()
+        if not path.is_relative_to(root) or not path.is_file() or path.stat().st_size == 0:
+            raise ValueError('review artifact is missing, empty or outside the native output root')
+        return path
+
+    def _artifact_binding(self, job, item):
+        binding = admission.file_binding(self._artifact_path(job, item))
+        return {key: binding[key] for key in ('sha256', 'size')}
+
+    def review_artifact(self, identity, index):
+        record = self.get(identity)
+        _, _, _, job = self._terminal_job(record)
+        items = record.get('presentation', {}).get('review_artifacts', [])
+        if type(index) is not int or not 0 <= index < len(items):
+            raise ValueError('review artifact is not published')
+        item = items[index]
+        if self._artifact_binding(job, item) != {key: item[key] for key in ('sha256', 'size')}:
+            raise ValueError('retained audio bytes changed; producer must republish')
+        path = self._artifact_path(job, item)
+        return path, AUDIO_TYPES[path.suffix.lower()]
+
+    def run_details(self, identity):
+        record = self.get(identity)
+        stage, path, state, _ = self._terminal_job(record)
+        result = {'schema': 'gpu-greenroom.smoke-run.v1', 'request_digest': record['request_digest'],
+                  'job_id': path.name, 'native_state': stage,
+                  'participation': (record.get('response') or {}).get('participation', 'not-recorded'),
+                  **{key: state.get(key) for key in ('started_at', 'finished_at', 'exit_code', 'failure_phase', 'error_message')},
+                  'artifacts': [], 'errors': []}
+        for key, name in (('stdout', 'stdout.log'), ('stderr', 'stderr.log')):
+            try:
+                result[key] = self._job_file(path, name)
+            except (OSError, ValueError) as error:
+                result[key] = None
+                result['errors'].append(f'{name}: {error}')
+        for index, item in enumerate(record.get('presentation', {}).get('review_artifacts', [])):
+            try:
+                self.review_artifact(identity, index)
+                result['artifacts'].append({'index': index, 'label': item['label'], 'sha256': item['sha256'], 'size': item['size']})
+            except (OSError, ValueError) as error:
+                result['errors'].append(f'{item["label"]}: {error}')
+        return result
+
+    def request_repeat(self, identity, request_digest):
+        with self._locked(identity):
+            record = self.get(identity)
+            if request_digest != record['request_digest']:
+                raise SmokeRequestConflict('smoke request changed; refresh before requesting another session')
+            _, path, _, _ = self._terminal_job(record)
+            if 'repeat_request' not in record:
+                record['repeat_request'] = {'request_digest': request_digest, 'job_id': path.name,
+                    'requested_at': _now(), 'gpu_execution_authority': False,
+                    'actor': {'kind': 'unverified-caller', 'id': None}}
+                self._write(record)
+            return record
+
+    def _successor(self, record, identity):
+        self._terminal_job(record)
+        if _canonical_id(identity) == record['request']['id']:
+            raise ValueError('next session must be a different request')
+        following = self.get(identity)
+        if following['request']['source'] != record['request']['source'] or 'prepared' not in following:
+            raise ValueError('next session needs a prepared command from the same owner and repo')
+        _, _, _, prior = self._terminal_job(record)
+        planned = JobRequest.from_json(json.dumps(following['prepared']['job_request']))
+        old_root, new_root = Path(prior.get('output_dir', '')).resolve(), Path(planned.output_dir).resolve()
+        if (planned.job_id == prior['job_id'] or new_root.is_relative_to(old_root) or old_root.is_relative_to(new_root)):
+            raise ValueError('next session must use a new job and independent output root')
+        if not following.get('activation'):
+            admission.assert_current(planned, following['prepared']['validation'])
+        return following
 
     def _running_job(self, record):
         job_id = (record.get('activation') or {}).get('job_id') or (record.get('progress') or {}).get('current_job_id') or record['request'].get('job_id')
@@ -407,6 +560,18 @@ class SmokeRequests:
                   'created_at': record['created_at'], 'job_id': (progress or {}).get('current_job_id', request.get('job_id'))}
         result['section'] = 'history' if (record['status'] == 'responded' or
             record.get('presentation', {}).get('purpose', request.get('purpose')) == 'diagnostic') else 'active'
+        if record.get('presentation', {}).get('next_request_id'):
+            try:
+                following = self._successor(record, record['presentation']['next_request_id'])
+                next_phase = 'responded' if following['status'] == 'responded' else 'awaiting-start'
+                if following.get('activation'):
+                    next_phase = self._linked_job(following)[0]
+                    if next_phase == 'pending':
+                        next_phase = 'waiting-gpu'
+                result['next_session'] = {'id': following['request']['id'], 'request_digest': following['request_digest'],
+                    'phase': next_phase}
+            except (OSError, ValueError, TypeError, KeyError) as error:
+                result['next_session_error'] = str(error)
         if 'prepared' in record:
             if record.get('activation'):
                 result['job_id'] = record['activation']['job_id']
@@ -417,43 +582,34 @@ class SmokeRequests:
             else:
                 return {**result, 'phase': 'awaiting-start', 'job_id': None,
                         'label': 'Prepared; GPU not acquired'}
-        if not result['job_id'] or record['status'] == 'responded':
+        if not result['job_id']:
             return result
         try:
-            root, job_id = self.directory.parent, result['job_id']
-            matches = [root/state/job_id for state in ('pending','running','done','failed','cancelled')
-                       if (root/state/job_id).is_dir()]
-            if len(matches) != 1:
-                raise ValueError('linked job is missing or ambiguous')
-            path = matches[0]
-            state = json.loads((path/'status.json').read_text())
-            job = json.loads((path/'request.json').read_text())
-            if not isinstance(state, dict) or not isinstance(job, dict):
-                raise ValueError('linked job records are malformed')
-            if state.get('job_id') != job_id or state.get('status') != path.parent.name:
-                raise ValueError('linked job identity or state conflicts with containment')
-            if job.get('job_id') != job_id or job.get('agent_id') != request['source']['agent_id']:
-                raise ValueError('linked job owner or identity conflicts with smoke request')
-            stage = path.parent.name
-            if stage != 'done':
+            stage, path, state, job = self._linked_job(record)
+            root = self.directory.parent
+            if stage != 'done' and record['status'] != 'responded':
                 result['phase'] = {'pending':'waiting-gpu','running':'running',
                                    'failed':'failed','cancelled':'cancelled'}[stage]
             result['job_state'] = stage
+            result.update(finished_at=state.get('finished_at'), exit_code=state.get('exit_code'),
+                          run_available=stage in {'done', 'failed', 'cancelled'})
             if stage in {'failed', 'cancelled'}:
                 result.update(section='history', error=state.get('error_message'),
                               failure_phase=state.get('failure_phase'), exit_code=state.get('exit_code'),
                               progress=None, label='Execution failed' if stage == 'failed' else 'Job cancelled')
-            if stage == 'running' and self.destination(record)['kind'] == 'terminal' and record.get('session'):
+            if record['status'] != 'responded' and stage == 'running' and self.destination(record)['kind'] == 'terminal' and record.get('session'):
                 session = self._verify_session(record)
                 result.update(phase=session['phase'], label=session['label'], terminal_verified=True,
                               phase_reported_at=session['observed_at'])
-            if stage == 'done' and self.destination(record)['kind'] == 'terminal':
-                result.update(phase='awaiting-response', label='Terminal session ended; awaiting your response', progress=None)
+            if record['status'] != 'responded' and stage == 'done' and self.destination(record)['kind'] == 'terminal':
+                result.update(phase='awaiting-response', label='Last session ended; your experience has not been recorded', progress=None)
             result['started_at'] = state.get('started_at')
             if stage == 'pending':
                 result['queue_position'] = dispatch.pending_order(root).index(path)+1
         except (OSError, ValueError, TypeError, KeyError) as error:
-            result.update(phase='unknown', progress=None, error=str(error))
+            result.update(phase='responded' if record['status'] == 'responded' else 'unknown', progress=None, error=str(error))
+        if record['status'] == 'responded':
+            result['phase'] = 'responded'
         return result
 
     def snapshot(self):
@@ -499,14 +655,16 @@ class SmokeRequests:
                 record['prepared'] = plan
             return self._write(record), True
 
-    def respond(self, identity: str, text: object) -> dict:
+    def respond(self, identity: str, text: object, *, participation=None) -> dict:
         request_id = _canonical_id(identity)
         if not isinstance(text, str) or not text.strip():
             raise ValueError("response text must be a non-empty string")
+        if participation not in {None, 'tried', 'not-tried'}:
+            raise ValueError('participation must be tried or not-tried')
         with self._locked(request_id):
             record = self.get(request_id)
             if record["status"] == "responded":
-                if record["response"]["text"] != text:
+                if record["response"]["text"] != text or record['response'].get('participation') != participation:
                     raise SmokeRequestConflict("smoke request already has a different response")
                 return record
             if self.display(record)['phase'] not in {'operator-needed', 'interactive', 'awaiting-response'}:
@@ -517,6 +675,8 @@ class SmokeRequests:
                 "actor": {"kind": "unverified-caller", "id": None},
                 "responded_at": _now(),
             }
+            if participation is not None:
+                record['response']['participation'] = participation
             record["status"] = "responded"
             return self._write(record)
 
