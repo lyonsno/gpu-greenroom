@@ -1077,6 +1077,23 @@ class GPUQueue:
         return any(resolved == p or resolved.startswith(p + "/")
                     for p in self.VOLATILE_PREFIXES)
 
+    def _submission_replay_locked(self, request):
+        existing = [self.queue_dir / state / request.job_id
+                    for state in ('pending', 'running', 'done', 'failed', 'cancelled')
+                    if (self.queue_dir / state / request.job_id).exists()]
+        if not existing:
+            return None
+        if len(existing) != 1:
+            raise ValueError('job identity is ambiguous')
+        raw, digest = dispatch.read_request(existing[0] / 'request.json')
+        previous = JobRequest.from_json(json.dumps(raw))
+        if not admission.same_request(previous, request):
+            raise ValueError('job identity already belongs to a different request')
+        override = dispatch.policy(self.queue_dir).get('job_overrides', {}).get(request.job_id)
+        if override and override['request_digest'] != digest:
+            raise ValueError('submitted replay request digest differs from operator override')
+        return existing[0]
+
     def submit(self, request: JobRequest, *, _staged=False, validation=None) -> Path:
         """Submit a job. Returns the job directory path.
 
@@ -1084,7 +1101,6 @@ class GPUQueue:
         queue_dir/outputs/<job_id>/. If output_dir is under /tmp or
         /private/tmp, records a volatile_output warning.
         """
-        dispatch.classify(json.loads(request.to_json()), dispatch.policy(self.queue_dir))
         if type(request.cooperative_checkpoint) is not bool:
             raise ValueError('cooperative_checkpoint must be a boolean')
         if request.cooperative_checkpoint:
@@ -1113,16 +1129,12 @@ class GPUQueue:
 
         if not _staged:
             with self._coordination_lock():
-                existing = [self.queue_dir / state / request.job_id
-                            for state in ('pending', 'running', 'done', 'failed', 'cancelled')
-                            if (self.queue_dir / state / request.job_id).exists()]
+                existing = self._submission_replay_locked(request)
                 if existing:
-                    if len(existing) != 1:
-                        raise ValueError('job identity is ambiguous')
-                    previous = JobRequest.from_json((existing[0] / 'request.json').read_text())
-                    if not admission.same_request(previous, request):
-                        raise ValueError('job identity already belongs to a different request')
-                    return existing[0]
+                    return existing
+                dispatch.classify(json.loads(request.to_json()), dispatch.policy(self.queue_dir))
+        else:
+            dispatch.classify(json.loads(request.to_json()), dispatch.policy(self.queue_dir))
 
         staging_root = self.queue_dir / 'submission-staging'
         staging_root.mkdir(exist_ok=True)
@@ -1155,17 +1167,10 @@ class GPUQueue:
         if not _staged:
             destination = self.queue_dir / 'pending' / request.job_id
             with self._coordination_lock():
-                existing = [self.queue_dir / bucket / request.job_id
-                            for bucket in ('pending', 'running', 'done', 'failed', 'cancelled')
-                            if (self.queue_dir / bucket / request.job_id).exists()]
+                existing = self._submission_replay_locked(request)
                 if existing:
-                    if len(existing) != 1:
-                        raise ValueError('job identity is ambiguous')
-                    previous = JobRequest.from_json((existing[0] / 'request.json').read_text())
-                    if not admission.same_request(previous, request):
-                        raise ValueError('job identity already belongs to a different request')
                     shutil.rmtree(job_dir)
-                    return existing[0]
+                    return existing
                 job_dir.rename(destination)
                 for directory in (staging_root, destination.parent):
                     directory_fd = os.open(directory, os.O_RDONLY)

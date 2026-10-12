@@ -74,13 +74,15 @@ function canMove(j){return queueAvailable&&!busy&&j?.consistent&&j.status==='pen
 function finishDrag(){draggedJob=null;document.querySelectorAll('.drop-target').forEach(n=>n.classList.remove('drop-target'));if(last)render(last)}
 async function moveJob(job,serviceClass){
   if(!canMove(job)||job.dispatch_class===serviceClass)return;
-  await post('/api/dispatch-class',{job_id:job.job_id,request_digest:job.request_digest,service_class:serviceClass});
+  try{await post('/api/dispatch-class',{job_id:job.job_id,request_digest:job.request_digest,service_class:serviceClass})}catch(e){err(e.message)}
 }
+function bindDropTargets(){
 for(const [id,serviceClass] of [['automaticQueue','normal'],['quickQueue','quick']]){
-  const target=document.getElementById(id);target.dataset.dropClass=serviceClass;
+  const target=document.querySelector('#'+id);target.dataset.dropClass=serviceClass;
   target.ondragover=e=>{if(draggedJob&&canMove(draggedJob)){e.preventDefault();e.dataTransfer.dropEffect='move';target.classList.add('drop-target')}};
   target.ondragleave=e=>{if(!target.contains(e.relatedTarget))target.classList.remove('drop-target')};
   target.ondrop=e=>{if(!draggedJob)return;e.preventDefault();const job=draggedJob;finishDrag();moveJob(job,serviceClass)};
+}
 }
 function duration(seconds){if(seconds==null)return 'not recorded';const s=Math.floor(seconds);return s>=3600?`${Math.floor(s/3600)}h ${Math.floor(s%3600/60)}m`:s>=60?`${Math.floor(s/60)}m ${s%60}s`:`${s}s`}
 function nativeActions(j){
@@ -232,7 +234,7 @@ async function loadSmokeAudio(button){const id=button.dataset.id,index=button.da
 async function sendSmokeResponse(event){event.preventDefault();const form=event.currentTarget,id=form.dataset.id,button=form.querySelector('button[type="submit"]'),participation=form.querySelector('input[name="participation"]:checked')?.value;let text=form.querySelector('textarea').value;if(participation==='not-tried'&&!text.trim())text="I didn't get to try this session.";if(smokeSubmitting.has(id)||smokeAccepted.has(id))return;smokeSubmitting.add(id);button.disabled=true;try{const r=await request(`/api/smoke-requests/${encodeURIComponent(id)}/response`,{method:'POST',headers:auth(),body:JSON.stringify({text,...(participation?{participation}:{})})});if(!r.ok)throw new Error(await r.text());smokeAccepted.add(id);smokeDrafts.delete(id);await loadSmoke()}catch(e){err(e.message)}finally{smokeSubmitting.delete(id);const current=document.querySelector(`form.smokeReply[data-id="${CSS.escape(id)}"] button[type="submit"]`);if(current)current.disabled=smokeRefreshUnavailable||smokeAccepted.has(id)}}
 async function post(path,body={}){if(busy)return;busy=true;if(last)render(last);try{const r=await request(path,{method:'POST',headers:auth(),body:JSON.stringify({...body,request_id:crypto.randomUUID()})});if(!r.ok)throw new Error(await r.text())}finally{busy=false;await load()}}
 async function act(kind,id){try{if(kind==='cancel')await post('/api/cancel',{job_id:id,requested_by:'operator-console',reason:'operator cancelled pending job'});else await post('/api/terminate',{job_id:id,requested_by:'operator-console',reason:'operator stopped running job',force:kind==='kill'})}catch(e){err(e.message)}}
-document.querySelector('#pause').onclick=()=>post('/api/pause',{requested_by:'operator-console'}).catch(e=>err(e.message));document.querySelector('#resume').onclick=()=>post('/api/resume',{requested_by:'operator-console',epoch:last?.pause_state?.epoch}).catch(e=>err(e.message));document.querySelector('#refresh').onclick=load;document.querySelector('#refreshSmoke').onclick=loadSmoke;load();loadSmoke();setInterval(()=>{if(filter==='active')load();loadSmoke()},5000);
+document.querySelector('#pause').onclick=()=>post('/api/pause',{requested_by:'operator-console'}).catch(e=>err(e.message));document.querySelector('#resume').onclick=()=>post('/api/resume',{requested_by:'operator-console',epoch:last?.pause_state?.epoch}).catch(e=>err(e.message));document.querySelector('#refresh').onclick=load;document.querySelector('#refreshSmoke').onclick=loadSmoke;bindDropTargets();load();loadSmoke();setInterval(()=>{if(filter==='active')load();loadSmoke()},5000);
 </script></body></html>"""
 
 

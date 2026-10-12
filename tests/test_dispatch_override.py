@@ -149,6 +149,25 @@ def test_duplicate_concurrent_drop_commits_one_action(tmp_path):
     assert len(dispatch.policy(tmp_path)['action_receipts']) == 1
 
 
+def test_submission_replay_after_move_preserves_pending_and_terminal_request(tmp_path):
+    queue = GPUQueue(tmp_path)
+    queue.configure_dispatch(policy(), owner='fixture')
+    request = JobRequest(job_type='long', input_path='fixture')
+    pending = queue.submit(request)
+    assert queue.submit(request) == pending
+    move(queue, request.job_id)
+    before = (pending / 'request.json').read_bytes()
+    assert queue.submit(request) == pending
+    assert (pending / 'request.json').read_bytes() == before
+    assert queue.run_one({'long': {'cmd': [sys.executable, '-c', 'pass']}})
+    terminal = tmp_path / 'done' / request.job_id
+    assert queue.submit(request) == terminal
+    assert (terminal / 'request.json').read_bytes() == before
+    (terminal / 'request.json').write_bytes(before + b'\n')
+    with pytest.raises(ValueError, match='digest'):
+        queue.submit(request)
+
+
 def test_pause_and_live_lease_still_block_manual_quick(tmp_path):
     import os
     queue = GPUQueue(tmp_path)

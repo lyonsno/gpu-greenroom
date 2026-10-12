@@ -180,12 +180,18 @@ try {
     // A fresh normal override also demonstrates another action remains independent.
     await evaluate(`moveJob(last.jobs.find(j=>j.job_id==='${positions.id}'),'quick')`);
     await evaluate(`moveJob(last.jobs.find(j=>j.job_id==='${positions.id}'),'normal')`);
+    markPhase('quick-drag-visible-rejection');
+    await evaluate(`(()=>{last.jobs.find(j=>j.job_id==='${positions.id}').request_digest='0'.repeat(64);render(last);const select=document.querySelector('[data-job-id="${positions.id}"] .dispatchClass');select.value='quick';select.dispatchEvent(new Event('change',{bubbles:true}))})()`);
+    await eventually(()=>evaluate(`window.__moves.length`),n=>n===5,'real stale UI move response');
+    assert.equal(await evaluate(`window.__moves[4].status`),409);
+    assert.equal(await evaluate(`document.querySelector('#error').style.display==='block'&&document.querySelector('#error').textContent.includes('digest')`),true,'rejected UI move must display its actual error');
+    assert.equal(await evaluate(`document.querySelector('[data-job-id="${positions.id}"] .dispatchClass').value`),'normal','failed move retains confirmed Automatic class');
     markPhase('quick-drag-refresh-outage');
     await evaluate(`window.fetch=(input,options)=>String(input).startsWith('/api/state')?Promise.reject(new Error('synthetic queue read outage')):window.__realFetch(input,options);load()`);
     assert.equal(await evaluate(`document.querySelectorAll('.job-item[draggable="true"]').length`),0);
     assert.equal(await evaluate(`[...document.querySelectorAll('.dispatchClass')].every(n=>n.disabled)`),true);
     console.log(JSON.stringify({scenario,sourceRevision,effectiveRoute:base,effectiveMode:'admission-control with disposable request fixture',apiBehavior:'real authenticated API; injected refresh outage only',browser:browserVersion.Browser,artifact,
-      assertions:['native mouse drag into empty Quick','real authenticated override','idempotent replay','refresh preserves active drag','mobile selector move-back','stale digest rejected','failed refresh disables moves','desktop/mobile fit']}));
+      assertions:['native mouse drag into empty Quick','real authenticated override','idempotent replay','refresh preserves active drag','mobile selector move-back','stale UI move displays error','stale digest rejected','failed refresh disables moves','desktop/mobile fit']}));
   } else if (scenario === 'columns' || scenario === 'installed-columns') {
     await evaluate(`location.hash='';smokeFilter='active';renderSmoke(lastSmoke);load()`);
     if(scenario==='columns'){

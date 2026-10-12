@@ -71,7 +71,8 @@ def yield_if_requested(*,save_checkpoint,quiesce,continuation,on_submitted=None)
         return False
     config=dispatch.policy(queue.queue_dir)
     pending=dispatch.pending_order(queue.queue_dir,config)
-    quick_waiting=bool(pending and dispatch.classify(json.loads((pending[0]/'request.json').read_text()),config)[0]=='quick')
+    pending_request, pending_digest = dispatch.read_request(pending[0]/'request.json') if pending else (None, None)
+    quick_waiting=bool(pending and dispatch.classify(pending_request,config,request_digest=pending_digest)[0]=='quick')
     if not queue.is_paused() and (state.get('dispatch',{}).get('service_class')!='normal' or not quick_waiting):
         return False
     directory=queue.queue_dir/'outputs'/request.job_id/'checkpoints'
