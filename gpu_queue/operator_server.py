@@ -32,6 +32,7 @@ PAGE = r"""<!doctype html>
 .smoke-card fieldset{border:0;padding:0;margin:12px 0;display:flex;flex-wrap:wrap;gap:10px}.smoke-card legend{margin-bottom:6px}.smoke-card fieldset label{display:flex;align-items:center;gap:5px}.smokeRun{margin:12px 0}.smokeRun summary{cursor:pointer;color:var(--blue);padding:6px 0}.smokeRun pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px}.smoke-audio audio{width:100%;max-width:480px}.smoke-actions{flex-wrap:wrap;gap:8px}
 .queue-columns{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:28px;margin-top:18px}.queue-column{min-width:0}.column-heading{display:flex;align-items:center;gap:12px;min-height:36px;margin-bottom:14px}.column-heading h2{font:600 17px/1.2 system-ui;margin:0}.column-heading .meta{margin:0}.job-item{border-top:1px solid var(--line);padding:14px 0;overflow-wrap:anywhere}.job-heading{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px}.job-heading strong{font-size:14px}.job-timing{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px 12px;margin:10px 0;color:var(--muted);font-size:12px}.quick{color:var(--blue);border-color:var(--blue)}.job-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:8px}.toolbar button{flex-shrink:0}.delivery-status{color:var(--muted);font-size:12px}.delivery-status.failed,.delivery-status.uncertain{color:var(--amber)}@media(max-width:900px){.queue-columns{grid-template-columns:minmax(0,1fr);gap:24px}.queue-column+ .queue-column{border-top:1px solid var(--line);padding-top:18px}.job-timing{grid-template-columns:minmax(0,1fr)}}
 .queue-columns[data-quick="true"]{grid-template-columns:repeat(3,minmax(0,1fr))}@media(max-width:900px){.queue-columns[data-quick="true"]{grid-template-columns:minmax(0,1fr)}}
+.queue-column.drop-target{outline:2px solid var(--blue);outline-offset:6px}.queue-column[data-drop-class]{min-height:200px}.job-item[draggable="true"]{cursor:grab}.job-item[draggable="true"]:active{cursor:grabbing}.queue-choice{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted);margin-top:10px}.queue-choice select{font:inherit;color:var(--text);background:#25292d;border:1px solid var(--line);border-radius:4px;padding:7px;min-height:34px}
 </style>
 </head>
 <body><header><h1>GPU Greenroom</h1><div class="state"><span id="dot" class="dot"></span><span id="queueState">loading</span></div><div class="spacer"></div><button id="pause" title="Pause queue" class="icon">Ⅱ</button><button id="resume" title="Resume queue" class="icon">▶</button><button id="refresh" title="Refresh" class="icon">↻</button></header>
@@ -68,7 +69,19 @@ function smokeReply(item){
   return `<form class="smokeReply" data-id="${esc(id)}">${ended?`<fieldset><legend>Did you get to try this session?</legend><label><input type="radio" name="participation" value="tried" ${choice==='tried'?'checked':''} required> I tried it</label><label><input type="radio" name="participation" value="not-tried" ${choice==='not-tried'?'checked':''} required> I didn't get to try it</label></fieldset>`:''}<label for="reply-${esc(id)}">${ended?'What happened?':'Your response'}</label><textarea class="smoke-response" id="reply-${esc(id)}" ${choice==='not-tried'?'':'required'}></textarea><div class="smoke-actions"><button type="submit">Send response</button></div></form>`;
 }
 function auth(){return {'Authorization':'Bearer '+token,'Content-Type':'application/json'}}async function request(path,options={}){const r=await fetch(path,options);if(r.status===401&&globalThis.__GREENROOM_LOCAL_OPERATOR__){if(!sessionStorage.getItem('greenroom-auth-reload')){sessionStorage.setItem('greenroom-auth-reload','1');location.reload();return new Promise(()=>{})}}else if(r.ok){sessionStorage.removeItem('greenroom-auth-reload')}return r}function err(e){const n=document.querySelector('#error');n.textContent=e;n.style.display='block';setTimeout(()=>n.style.display='none',6000)}function elapsed(j){const end=j.finished_at||Date.now()/1000,start=j.started_at||j.submitted_at;if(!start)return '—';const s=Math.max(0,end-start);if(s<60)return Math.round(s)+'s';if(s<3600)return Math.floor(s/60)+'m '+Math.round(s%60)+'s';return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'}function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-let busy=false;
+let busy=false,draggedJob=null,queueAvailable=false;
+function canMove(j){return queueAvailable&&!busy&&j?.consistent&&j.status==='pending'&&j.request_digest&&!j.dispatch_error&&!last?.dispatch?.error&&last?.dispatch?.policy?.mode==='two-class'&&document.body.dataset.readOnly!=='true'&&(!last?.read_only||last?.admission_control)}
+function finishDrag(){draggedJob=null;document.querySelectorAll('.drop-target').forEach(n=>n.classList.remove('drop-target'));if(last)render(last)}
+async function moveJob(job,serviceClass){
+  if(!canMove(job)||job.dispatch_class===serviceClass)return;
+  await post('/api/dispatch-class',{job_id:job.job_id,request_digest:job.request_digest,service_class:serviceClass});
+}
+for(const [id,serviceClass] of [['automaticQueue','normal'],['quickQueue','quick']]){
+  const target=document.getElementById(id);target.dataset.dropClass=serviceClass;
+  target.ondragover=e=>{if(draggedJob&&canMove(draggedJob)){e.preventDefault();e.dataTransfer.dropEffect='move';target.classList.add('drop-target')}};
+  target.ondragleave=e=>{if(!target.contains(e.relatedTarget))target.classList.remove('drop-target')};
+  target.ondrop=e=>{if(!draggedJob)return;e.preventDefault();const job=draggedJob;finishDrag();moveJob(job,serviceClass)};
+}
 function duration(seconds){if(seconds==null)return 'not recorded';const s=Math.floor(seconds);return s>=3600?`${Math.floor(s/3600)}h ${Math.floor(s%3600/60)}m`:s>=60?`${Math.floor(s/60)}m ${s%60}s`:`${s}s`}
 function nativeActions(j){
   if(!j?.consistent||last?.read_only||last?.admission_control||document.body.dataset.readOnly==='true')return '';
@@ -78,6 +91,7 @@ function nativeActions(j){
 }
 function render(s){
   last=s;
+  if(draggedJob)return;
   const state=s.admission_state==='paused_running'?'Paused; work still running':s.paused?'Paused; no queued job running':'Queue starts enabled';
   document.querySelector('#queueState').textContent=state;
   if(s.dispatch?.error)document.querySelector('#queueState').textContent+=' · Dispatch blocked: '+s.dispatch.error;
@@ -98,18 +112,26 @@ function render(s){
   document.querySelector('#empty').hidden=automatic.length>0;
   document.querySelector('#automaticCount').textContent=automatic.length+' job(s)';
   document.querySelector('#quickCount').textContent=quick.length+' job(s)';
-  document.querySelector('#quickQueue').hidden=!quick.length;
-  document.querySelector('.queue-columns').dataset.quick=String(quick.length>0);
+  const showQuick=quick.length>0||s.dispatch?.policy?.mode==='two-class';
+  document.querySelector('#quickQueue').hidden=!showQuick;
+  document.querySelector('.queue-columns').dataset.quick=String(showQuick);
   const jobMarkup=items=>items.map(j=>{
     const a=nativeActions(j);
     const route=j.requested_route||j.effective_route||j.job_type;
     const conflict=j.consistent?'':`<div class="meta">containment: ${esc(j.containment_status)} · declared: ${esc(j.declared_status)}</div>`;
-    return `<article class="job-item" data-job-id="${esc(j.job_id)}"><div class="job-heading"><strong>${esc(j.job_id)}</strong><span class="pill ${esc(j.status)}">${esc(j.status)}</span>${j.dispatch_class==='quick'?`<span class="pill quick" title="${esc(j.dispatch_basis)}">Quick</span>`:''}${j.queue_position?`<span class="meta">Queue ${esc(j.queue_position)}</span>`:''}</div>${conflict}<div class="route">${esc(route)}</div><div class="meta">${esc(document.body.dataset.identityLabel||'Agent')}: ${esc(j.agent_id||'not recorded')} · ${esc(j.job_type)}</div><div class="meta">${esc(j.repo_root||j.output_dir||j.record_error||'')}</div>${j.dispatch_error?'<div class="meta failed">Dispatch classification: '+esc(j.dispatch_error)+'</div>':''}<div class="job-timing"><div>Submitted: ${j.submitted_at?esc(new Date(j.submitted_at*1000).toLocaleString()):'not recorded'}</div><div>Queue wait: ${duration(j.queue_wait_seconds)}</div><div>Execution wall time: ${duration(j.execution_wall_seconds)}</div><div>GPU hold time: not recorded</div></div><div class="job-actions actions">${a}</div></article>`;
+    const manual=j.dispatch_override||j.dispatch?.operator_override;
+    const choice=canMove(j)?`<label class="queue-choice">Queue <select class="dispatchClass" aria-label="Queue for ${esc(j.job_id)}" data-job-id="${esc(j.job_id)}"><option value="normal" ${j.dispatch_class==='normal'?'selected':''}>Automatic</option><option value="quick" ${j.dispatch_class==='quick'?'selected':''}>Quick</option></select></label>`:'';
+    return `<article class="job-item" data-job-id="${esc(j.job_id)}" draggable="${canMove(j)}"><div class="job-heading"><strong>${esc(j.job_id)}</strong><span class="pill ${esc(j.status)}">${esc(j.status)}</span>${j.dispatch_class==='quick'?`<span class="pill quick" title="${esc(j.dispatch_basis)}">${manual?'Manual Quick':'Quick'}</span>`:manual?'<span class="meta">Manual Automatic</span>':''}${j.queue_position?`<span class="meta">Queue ${esc(j.queue_position)}</span>`:''}</div>${conflict}<div class="route">${esc(route)}</div><div class="meta">${esc(document.body.dataset.identityLabel||'Agent')}: ${esc(j.agent_id||'not recorded')} · ${esc(j.job_type)}</div><div class="meta">${esc(j.repo_root||j.output_dir||j.record_error||'')}</div>${j.dispatch_error?'<div class="meta failed">Dispatch classification: '+esc(j.dispatch_error)+'</div>':''}<div class="job-timing"><div>Submitted: ${j.submitted_at?esc(new Date(j.submitted_at*1000).toLocaleString()):'not recorded'}</div><div>Queue wait: ${duration(j.queue_wait_seconds)}</div><div>Execution wall time: ${duration(j.execution_wall_seconds)}</div><div>GPU hold time: not recorded</div></div>${choice}<div class="job-actions actions">${a}</div></article>`;
   }).join('');
   document.querySelector('#jobs').innerHTML=jobMarkup(automatic);
   document.querySelector('#quickJobs').innerHTML=jobMarkup(quick);
+  document.querySelectorAll('.job-item').forEach(item=>{
+    item.ondragstart=e=>{const job=s.jobs.find(j=>j.job_id===item.dataset.jobId);if(!canMove(job)||e.target.closest('select,button,a,input')){e.preventDefault();return}draggedJob={...job};e.dataTransfer.effectAllowed='move';e.dataTransfer.setData('text/plain',job.job_id)};
+    item.ondragend=finishDrag;
+  });
+  document.querySelectorAll('.dispatchClass').forEach(select=>select.onchange=()=>moveJob(s.jobs.find(j=>j.job_id===select.dataset.jobId),select.value));
 }
-async function load(){try{const r=await request('/api/state?view='+encodeURIComponent(filter),{headers:auth()});if(!r.ok)throw new Error(await r.text());render(await r.json())}catch(e){document.querySelector('#queueState').textContent='State unavailable';document.querySelector('#pause').disabled=true;document.querySelector('#resume').disabled=true;err(e.message)}}
+async function load(){try{const r=await request('/api/state?view='+encodeURIComponent(filter),{headers:auth()});if(!r.ok)throw new Error(await r.text());const s=await r.json();queueAvailable=true;render(s)}catch(e){queueAvailable=false;document.querySelectorAll('.job-item').forEach(n=>n.draggable=false);document.querySelectorAll('.dispatchClass').forEach(n=>n.disabled=true);document.querySelector('#queueState').textContent='State unavailable';document.querySelector('#pause').disabled=true;document.querySelector('#resume').disabled=true;err(e.message)}}
 function renderSmoke(payload){
   if(!payload||payload.schema!=='gpu-greenroom.smoke-request-list.v1'||!Array.isArray(payload.items)||!Array.isArray(payload.errors))throw new Error('Invalid smoke request list response');
   lastSmoke=payload;
@@ -260,7 +282,7 @@ def queue_snapshot(queue: GPUQueue | Path, view: str = "all", *, read_only: bool
                     })
                     continue
             declared_status = row.get("status")
-            consistent = declared_status == containment_status
+            consistent = declared_status == containment_status and row.get('job_id') == job_dir.name
             row["job_id"] = row.get("job_id") or job_dir.name
             row["declared_status"] = declared_status
             row["containment_status"] = containment_status
@@ -268,8 +290,9 @@ def queue_snapshot(queue: GPUQueue | Path, view: str = "all", *, read_only: bool
             row["status"] = containment_status if consistent else "inconsistent"
             request_path = job_dir / "request.json"
             if request_path.is_file():
+                digest = None
                 try:
-                    request = json.loads(request_path.read_text())
+                    request, digest = dispatch.read_request(request_path)
                 except (OSError, json.JSONDecodeError):
                     request = {}
                 if not isinstance(request, dict):
@@ -277,6 +300,8 @@ def queue_snapshot(queue: GPUQueue | Path, view: str = "all", *, read_only: bool
                 row["agent_id"] = request.get("agent_id")
                 row["requested_route"] = request.get("route_identity")
                 row["repo_root"] = request.get("repo_root")
+                if request.get('job_id') == job_dir.name:
+                    row['request_digest'] = digest
                 try:
                     if config is None:
                         raise ValueError(classification_error)
@@ -285,8 +310,9 @@ def queue_snapshot(queue: GPUQueue | Path, view: str = "all", *, read_only: bool
                         row['dispatch_class'], row['dispatch_basis'] = observed['service_class'], observed.get('eligibility_basis')
                         row['dispatch_source'] = 'native-dispatch-receipt'
                     else:
-                        row['dispatch_class'], row['dispatch_basis'] = dispatch.classify(request, config)
+                        row['dispatch_class'], row['dispatch_basis'] = dispatch.classify(request, config, request_digest=digest)
                         row['dispatch_source'] = 'current-policy-projection'
+                        row['dispatch_override'] = config.get('job_overrides', {}).get(row['job_id'])
                 except ValueError as error:
                     row['dispatch_error'] = str(error)
             row['queue_position'] = positions.get(row['job_id'])
@@ -551,6 +577,19 @@ def make_handler(queue: GPUQueue | Path, token: str, *, read_only: bool = False,
                 self._json(HTTPStatus.FORBIDDEN, {"error": "read_only_monitor"})
                 return
             smoke_route = self._is_smoke_post_path(path)
+            if path == '/api/dispatch-class':
+                try:
+                    body = self._body()
+                    root = queue if isinstance(queue, Path) else queue.queue_dir
+                    result = GPUQueue(root).override_dispatch(
+                        job_id=body.get('job_id'), service_class=body.get('service_class'),
+                        request_digest=body.get('request_digest'), request_id=body.get('request_id'),
+                        requested_by='operator-console')
+                except (ValueError, OSError, RuntimeError) as exc:
+                    self._json(HTTPStatus.CONFLICT, {'error': str(exc)})
+                    return
+                self._json(HTTPStatus.OK, result)
+                return
             if admission_control:
                 if path not in {'/api/pause', '/api/resume'} and not smoke_route:
                     self._json(HTTPStatus.FORBIDDEN, {'error': 'admission_controls_only'})

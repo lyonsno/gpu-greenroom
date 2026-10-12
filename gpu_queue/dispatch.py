@@ -1,6 +1,10 @@
 """Opt-in two-class selection around the queue's existing execution mutex."""
 
 import json
+import hashlib
+import math
+import re
+import uuid
 from collections import deque
 import os
 from pathlib import Path
@@ -9,6 +13,35 @@ from .models import JobState, JobStatus
 
 CAPABILITY = 'two-class-dispatch.v1'
 SCHEMA = 'gpu-greenroom.dispatch-policy.v1'
+OVERRIDE_SCHEMA = 'gpu-greenroom.dispatch-policy.v2'
+OVERRIDE_CAPABILITY = 'operator-dispatch-override.v1'
+
+
+def validate_override(value):
+    if not isinstance(value, dict) or value.get('schema') != 'gpu-greenroom.dispatch-override.v1':
+        raise ValueError('invalid dispatch override receipt')
+    if not isinstance(value.get('job_id'), str) or not re.fullmatch(r'[A-Za-z0-9_-]+', value['job_id']):
+        raise ValueError('invalid override job identity')
+    try:
+        uuid.UUID(value['request_id'])
+    except (KeyError, ValueError, TypeError, AttributeError):
+        raise ValueError('invalid override request identity') from None
+    if not isinstance(value.get('request_digest'), str) or not re.fullmatch(r'[a-f0-9]{64}', value['request_digest']):
+        raise ValueError('invalid override request digest')
+    if value.get('service_class') not in ('normal', 'quick'):
+        raise ValueError('invalid override service class')
+    if not isinstance(value.get('requested_by'), str) or not value['requested_by'].strip():
+        raise ValueError('override actor must be explicit')
+    if value.get('authority') != 'authenticated-console; caller identity unverified':
+        raise ValueError('invalid override authority')
+    if not isinstance(value.get('at'), (int, float)) or isinstance(value['at'], bool) or not math.isfinite(value['at']):
+        raise ValueError('invalid override timestamp')
+    return value
+
+
+def read_request(path):
+    raw = Path(path).read_bytes()
+    return json.loads(raw), hashlib.sha256(raw).hexdigest()
 
 
 def atomic_write(path, payload):
@@ -31,13 +64,24 @@ def atomic_write(path, payload):
 
 
 def validate(value):
-    if not isinstance(value,dict) or value.get('schema')!=SCHEMA or not isinstance(value.get('mode'),str) or value['mode'] not in {'fifo','two-class'}:
+    if not isinstance(value,dict) or value.get('schema') not in (SCHEMA, OVERRIDE_SCHEMA) or not isinstance(value.get('mode'),str) or value['mode'] not in {'fifo','two-class'}:
         raise ValueError('invalid dispatch policy schema or mode')
     for key in ('quick_job_types','quick_routes'):
         rules=value.get(key,{})
         if not isinstance(rules,dict) or any(not isinstance(name,str) or not name.strip()
                                            or not isinstance(basis,str) or not basis.strip() for name,basis in rules.items()):
             raise ValueError('quick eligibility needs exact names and nonblank evidence references')
+    overrides, receipts = value.get('job_overrides', {}), value.get('action_receipts', {})
+    if value['schema'] == SCHEMA and (overrides or receipts):
+        raise ValueError('dispatch overrides require v2 policy and worker capability')
+    if not isinstance(overrides, dict) or not isinstance(receipts, dict):
+        raise ValueError('invalid dispatch override maps')
+    for identity, receipt in receipts.items():
+        if validate_override(receipt)['request_id'] != identity:
+            raise ValueError('dispatch action identity mismatch')
+    for identity, receipt in overrides.items():
+        if validate_override(receipt)['job_id'] != identity or receipts.get(receipt['request_id']) != receipt:
+            raise ValueError('dispatch override identity or receipt mismatch')
     return {**value,'quick_job_types':value.get('quick_job_types',{}),'quick_routes':value.get('quick_routes',{})}
 
 
@@ -48,12 +92,17 @@ def policy(root):
         return {'schema':SCHEMA,'mode':'fifo','quick_job_types':{},'quick_routes':{}}
 
 
-def classify(request, config):
+def classify(request, config, *, request_digest=None):
     if not isinstance(request,dict):
         raise ValueError('job request must be an object')
     declared=request.get('service_class')
     if declared not in (None,'normal','quick'):
         raise ValueError('service_class must be normal or quick')
+    override = config.get('job_overrides', {}).get(request.get('job_id'))
+    if override and config['mode'] == 'two-class':
+        if override['request_digest'] != request_digest:
+            raise ValueError('dispatch override request digest mismatch')
+        return override['service_class'], 'per-job operator override: ' + override['request_id']
     basis = (config['quick_routes'].get(request.get('route_identity')) if request.get('command_argv') is not None
              else config['quick_job_types'].get(request.get('job_type')))
     eligible=config['mode']=='two-class' and bool(basis)
@@ -88,8 +137,10 @@ def pending_order(root, config=None):
         return [path for _,path in rows]
     normal,quick=deque(),deque()
     for _,path in rows:
-        request=json.loads((path/'request.json').read_text())
-        (quick if classify(request,config)[0]=='quick' else normal).append(path)
+        request, digest = read_request(path/'request.json')
+        if not isinstance(request, dict) or request.get('job_id') != path.name:
+            raise ValueError('pending request identity is unverified')
+        (quick if classify(request,config,request_digest=digest)[0]=='quick' else normal).append(path)
     result=[]
     previous=last_class(root)
     while normal or quick:

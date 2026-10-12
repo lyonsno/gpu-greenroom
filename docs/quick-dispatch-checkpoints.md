@@ -44,6 +44,38 @@ enqueueing. These flags and `--cooperative-checkpoint` use command manifest v2.
 Older CLIs reject v2 rather than discarding the options; older claimants cannot
 dispatch the recorded required capabilities. Existing v1 commands still work.
 
+## Operator Per-Job Moves
+
+In the monitor, drag a pending automatic job into Quick work, or back into
+Automatic work. The per-job Queue selector provides the same operation for
+keyboard and touch. The Quick column remains visible when empty in two-class
+mode. Only the confirmed server classification moves the row. A stale request,
+a job already claimed, or an unavailable queue rejects or disables the move.
+Running work and operator-start smoke sessions are not draggable.
+
+This is a manual scheduling choice for one job, not a claim that its route is
+measured fast. It does not whitelist the route for later submissions, alter
+request bytes or validation, interrupt running work, bypass pauses/leases, or
+change the alternating class fairness rule. Execution receipts include the
+effective class and the exact per-job action. Actor provenance is authenticated
+console access, not verified human identity.
+
+The authenticated same-origin `POST /api/dispatch-class` takes `job_id`,
+`request_digest` (SHA-256 of the exact submitted request bytes), `service_class`
+(`normal` or `quick`), and an idempotent UUID `request_id`. Classification and
+the action receipt commit together under the existing claim lock in
+`dispatch-policy.json`. Repeating the same action returns its original receipt,
+even after execution; reusing the UUID for different inputs rejects. Later
+policy configuration preserves these receipts and overrides.
+
+The first move upgrades the policy to `gpu-greenroom.dispatch-policy.v2`.
+Before exposing the controls, update the queue worker to support
+`operator-dispatch-override.v1`, the canonical submission CLI, and policy-reading
+monitors. Older policy readers deliberately reject v2 rather than silently
+misclassify work. An old claimant cannot advance a v2 queue. Do not roll back to
+a v1 worker after manual moves without reconciling that state. No automatic
+deletion or expiry is applied to overrides or their action receipts.
+
 ## Managed Work Unit Continuations
 
 Quick selection cannot shorten a job already running. A cooperating workload

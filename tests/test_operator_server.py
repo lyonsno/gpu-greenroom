@@ -76,6 +76,12 @@ def _run_operator_browser_witness(tmp_path, scenario, *, responded=False):
     }
     smoke_requests = SmokeRequests(queue_dir / "smoke-requests")
     smoke_requests.submit(request)
+    if scenario == 'quick-drag':
+        from tests.test_quick_dispatch import policy, submit
+        queue = GPUQueue(queue_dir)
+        queue.configure_dispatch(policy(), owner='synthetic-console-witness')
+        submit(queue, 'long', 1)
+        submit(queue, 'long', 2)
     if responded:
         smoke_requests.respond(identity, "The local browser witness has a durable response.")
     witness = Path(__file__).with_name("operator_browser_witness.mjs")
@@ -83,7 +89,7 @@ def _run_operator_browser_witness(tmp_path, scenario, *, responded=False):
         ["git", "rev-parse", "HEAD"], check=True, capture_output=True, text=True,
     ).stdout.strip()
     diff = subprocess.run(
-        ["git", "diff", "--binary", "HEAD", "--", "gpu_queue/operator_server.py", "tests/test_operator_server.py"], check=True, capture_output=True,
+        ["git", "diff", "--binary", "HEAD", "--", "gpu_queue", "tests"], check=True, capture_output=True,
     ).stdout
     source_fingerprint = hashlib.sha256(diff + b"\0" + witness.read_bytes()).hexdigest()[:12]
     source_identity = f"{revision}+candidate-{source_fingerprint}"
@@ -109,15 +115,24 @@ def _run_operator_browser_witness(tmp_path, scenario, *, responded=False):
         report = json.loads(result.stdout.strip().splitlines()[-1])
         assert report["effectiveRoute"] == base
         assert report["effectiveMode"] == "admission-control with disposable request fixture"
-        assert report["apiBehavior"] == "scenario-specific browser fetch interception"
+        assert report["apiBehavior"] == ("real authenticated API; injected refresh outage only" if scenario == 'quick-drag' else "scenario-specific browser fetch interception")
         assert report["sourceRevision"] == source_identity
         assert report["browser"].startswith("Chrome/")
         assert Path(report["artifact"]).is_file() and Path(report["artifact"]).stat().st_size > 0
         print("GREENROOM_BROWSER_WITNESS " + json.dumps(report, sort_keys=True))
+        if scenario == 'quick-drag':
+            from gpu_queue import dispatch
+            config = dispatch.policy(queue_dir)
+            assert len(config['action_receipts']) == 4
+            assert all(item['service_class'] == 'normal' for item in config['job_overrides'].values())
     finally:
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+def test_browser_drag_and_touch_choice_change_actual_pending_dispatch(tmp_path):
+    _run_operator_browser_witness(tmp_path, 'quick-drag')
 
 
 def test_browser_keeps_accepted_smoke_reply_disabled_after_refresh_failure(tmp_path):

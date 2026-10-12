@@ -136,6 +136,56 @@ try {
     console.log(JSON.stringify({scenario,sourceRevision,effectiveRoute:base,browser:browserVersion.Browser,artifact,
       assertions:['finished not live','actual retained run and audio metadata','audio element preserved through refresh','desktop and mobile fit',
         ...(scenario==='finished-session'?['repeat request without launch','missed-session response and draft continuity']:[])],operatorAudiblePlayback:'not claimed'}));
+  } else if (scenario === 'quick-drag') {
+    markPhase('quick-drag-native-input');
+    await command('Emulation.setDeviceMetricsOverride',{width:1440,height:1000,deviceScaleFactor:1,mobile:false});
+    await evaluate(`location.hash='';smokeFilter='active';renderSmoke(lastSmoke);load()`);
+    await eventually(()=>evaluate(`document.querySelectorAll('#jobs [draggable="true"]').length`),n=>n===2,'two draggable pending jobs');
+    assert.equal(await evaluate(`document.querySelector('#quickQueue').hidden`),false,'empty Quick must remain a drop target');
+    assert.equal(await evaluate(`document.querySelectorAll('#quickJobs .job-item').length`),0);
+    await evaluate(`window.__moves=[];window.__realFetch=window.fetch.bind(window);window.fetch=async(input,options)=>{const response=await window.__realFetch(input,options);if(String(input)==='/api/dispatch-class')window.__moves.push({status:response.status,body:await response.clone().json(),input:JSON.parse(options.body)});return response}`);
+    const positions=await evaluate(`(()=>{scrollTo(0,0);const item=document.querySelector('#jobs .job-item'),a=item.querySelector('strong').getBoundingClientRect(),b=document.querySelector('#quickQueue').getBoundingClientRect();window.__dragNode=item;return {id:item.dataset.jobId,a:{x:a.x+a.width/2,y:a.y+a.height/2},b:{x:b.x+b.width/2,y:b.y+100}}})()`);
+    await command('Input.dispatchMouseEvent',{type:'mouseMoved',...positions.a});
+    await command('Input.dispatchMouseEvent',{type:'mousePressed',button:'left',buttons:1,clickCount:1,...positions.a});
+    await command('Input.dispatchMouseEvent',{type:'mouseMoved',button:'left',buttons:1,x:positions.a.x+15,y:positions.a.y+15});
+    await command('Input.dispatchMouseEvent',{type:'mouseMoved',button:'left',buttons:1,x:positions.a.x+25,y:positions.a.y+20});
+    await eventually(()=>evaluate(`draggedJob?.job_id`),id=>id===positions.id,'native dragstart');
+    await evaluate(`load()`);
+    assert.equal(await evaluate(`window.__dragNode===document.querySelector('[data-job-id="${positions.id}"]')`),true,'refresh must not replace a dragged row');
+    await command('Input.dispatchMouseEvent',{type:'mouseMoved',button:'left',buttons:1,...positions.b});
+    await command('Input.dispatchMouseEvent',{type:'mouseMoved',button:'left',buttons:1,...positions.b});
+    await command('Input.dispatchMouseEvent',{type:'mouseReleased',button:'left',clickCount:1,...positions.b});
+    await eventually(()=>evaluate(`document.querySelector('#quickJobs [data-job-id="${positions.id}"]')?.innerText`),s=>s?.includes('Manual Quick'),'native drop confirmed by API and render');
+    const moved=await evaluate(`window.__moves[0]`);
+    assert.equal(moved.status,200);
+    assert.equal(moved.body.job_id,positions.id);
+    assert.equal(moved.body.service_class,'quick');
+    const replay=await evaluate(`(async()=>{const r=await window.__realFetch('/api/dispatch-class',{method:'POST',headers:auth(),body:JSON.stringify(window.__moves[0].input)});return {status:r.status,body:await r.json()}})()`);
+    assert.equal(replay.status,200);
+    assert.deepEqual(replay.body,moved.body,'replayed native drop is idempotent');
+    const frame=await command('Page.captureScreenshot',{format:'png',fromSurface:true});
+    writeFileSync(join(artifactDirectory,'quick-drag-1440.png'),Buffer.from(frame.data,'base64'));
+    await command('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});
+    assert.equal(await evaluate(`document.documentElement.scrollWidth<=innerWidth`),true);
+    await evaluate(`(()=>{const select=document.querySelector('#quickJobs .dispatchClass');select.scrollIntoView({block:'center'});select.focus();select.value='normal';select.dispatchEvent(new Event('change',{bubbles:true}))})()`);
+    await eventually(()=>evaluate(`document.querySelectorAll('#quickJobs .job-item').length`),n=>n===0,'mobile queue selector confirmation');
+    assert.equal(await evaluate(`document.querySelector('#quickQueue').hidden`),false,'empty Quick after move-back');
+    await evaluate(`document.querySelector('#automaticQueue').scrollIntoView({block:'start'})`);
+    const phone=await command('Page.captureScreenshot',{format:'png',fromSurface:true});
+    writeFileSync(join(artifactDirectory,'quick-drag-390.png'),Buffer.from(phone.data,'base64'));
+    markPhase('quick-drag-stale-request');
+    const rejected=await evaluate(`(async()=>{const j=last.jobs[0];const r=await window.__realFetch('/api/dispatch-class',{method:'POST',headers:auth(),body:JSON.stringify({job_id:j.job_id,service_class:'quick',request_digest:'0'.repeat(64),request_id:crypto.randomUUID()})});return {status:r.status,body:await r.json()}})()`);
+    assert.equal(rejected.status,409);
+    assert.ok(rejected.body.error.includes('digest'));
+    // A fresh normal override also demonstrates another action remains independent.
+    await evaluate(`moveJob(last.jobs.find(j=>j.job_id==='${positions.id}'),'quick')`);
+    await evaluate(`moveJob(last.jobs.find(j=>j.job_id==='${positions.id}'),'normal')`);
+    markPhase('quick-drag-refresh-outage');
+    await evaluate(`window.fetch=(input,options)=>String(input).startsWith('/api/state')?Promise.reject(new Error('synthetic queue read outage')):window.__realFetch(input,options);load()`);
+    assert.equal(await evaluate(`document.querySelectorAll('.job-item[draggable="true"]').length`),0);
+    assert.equal(await evaluate(`[...document.querySelectorAll('.dispatchClass')].every(n=>n.disabled)`),true);
+    console.log(JSON.stringify({scenario,sourceRevision,effectiveRoute:base,effectiveMode:'admission-control with disposable request fixture',apiBehavior:'real authenticated API; injected refresh outage only',browser:browserVersion.Browser,artifact,
+      assertions:['native mouse drag into empty Quick','real authenticated override','idempotent replay','refresh preserves active drag','mobile selector move-back','stale digest rejected','failed refresh disables moves','desktop/mobile fit']}));
   } else if (scenario === 'columns' || scenario === 'installed-columns') {
     await evaluate(`location.hash='';smokeFilter='active';renderSmoke(lastSmoke);load()`);
     if(scenario==='columns'){

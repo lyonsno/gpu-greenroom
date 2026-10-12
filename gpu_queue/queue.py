@@ -84,7 +84,7 @@ def _safe_substitute(template: str, mapping: dict) -> str:
 def effective_worker_capabilities() -> frozenset[str]:
     configured = os.environ.get("GPU_GREENROOM_WORKER_CAPABILITIES")
     if configured is None:
-        return DEFAULT_WORKER_CAPABILITIES | {dispatch.CAPABILITY,'structured-command.v2','checkpoint-continuation.v1',admission.CAPABILITY}
+        return DEFAULT_WORKER_CAPABILITIES | {dispatch.CAPABILITY,dispatch.OVERRIDE_CAPABILITY,'structured-command.v2','checkpoint-continuation.v1',admission.CAPABILITY}
     return frozenset(
         capability.strip()
         for capability in configured.split(",")
@@ -1290,6 +1290,10 @@ class GPUQueue:
                 current=dispatch.policy(self.queue_dir)
             except (ValueError,OSError):
                 current={}
+            if current.get('schema') == dispatch.OVERRIDE_SCHEMA:
+                value = {**value, 'schema': dispatch.OVERRIDE_SCHEMA,
+                         'job_overrides': current.get('job_overrides', {}),
+                         'action_receipts': current.get('action_receipts', {})}
             fields={key:item for key,item in current.items() if key not in {'epoch','owner','configured_at'}}
             if value==fields and not reset_fairness:
                 return current
@@ -1299,6 +1303,38 @@ class GPUQueue:
                 dispatch.atomic_write(self.queue_dir/'dispatch-state.json',
                     {'schema':'gpu-greenroom.dispatch-state.v1','last_class':'normal','reset_by':owner,'at':time.time()})
             self._emit_event_locked('dispatch_policy_changed',receipt['epoch'],receipt)
+            return receipt
+
+    def override_dispatch(self, *, job_id, service_class, request_digest, request_id, requested_by):
+        receipt = dispatch.validate_override({
+            'schema': 'gpu-greenroom.dispatch-override.v1', 'job_id': job_id,
+            'service_class': service_class, 'request_digest': request_digest,
+            'request_id': request_id, 'requested_by': requested_by, 'at': time.time(),
+            'authority': 'authenticated-console; caller identity unverified',
+        })
+        with self._coordination_lock():
+            config = dispatch.policy(self.queue_dir)
+            prior = config.get('action_receipts', {}).get(request_id)
+            if prior:
+                if any(prior[key] != receipt[key] for key in ('job_id', 'service_class', 'request_digest', 'requested_by')):
+                    raise ValueError('dispatch request identity reused with a different action')
+                return prior
+            if config['mode'] != 'two-class':
+                raise ValueError('manual Quick moves require two-class dispatch')
+            directory = self.queue_dir / 'pending' / job_id
+            if not directory.is_dir():
+                raise ValueError('job is no longer pending')
+            state = JobState.from_json((directory / 'status.json').read_text())
+            request, digest = dispatch.read_request(directory / 'request.json')
+            if state.job_id != job_id or state.status != JobStatus.PENDING or not isinstance(request, dict) or request.get('job_id') != job_id:
+                raise ValueError('pending job identity or containment is unverified')
+            if digest != request_digest:
+                raise ValueError('pending request digest changed; refresh the queue')
+            # Classification and its retry receipt share one fsynced commit point.
+            updated = {**config, 'schema': dispatch.OVERRIDE_SCHEMA,
+                       'job_overrides': {**config.get('job_overrides', {}), job_id: receipt},
+                       'action_receipts': {**config.get('action_receipts', {}), request_id: receipt}}
+            dispatch.atomic_write(self.queue_dir / 'dispatch-policy.json', dispatch.validate(updated))
             return receipt
 
     def _next_pending(self, config=None) -> Path | None:
@@ -1435,6 +1471,8 @@ class GPUQueue:
                     dispatch_policy=dispatch.policy(self.queue_dir)
                     if dispatch_policy['mode']=='two-class' and dispatch.CAPABILITY not in effective_claimant.get('capabilities',[]):
                         return False
+                    if dispatch_policy['schema'] == dispatch.OVERRIDE_SCHEMA and dispatch.OVERRIDE_CAPABILITY not in effective_claimant.get('capabilities', []):
+                        return False
                     job_dir = self._next_pending(dispatch_policy)
                 except (ValueError,KeyError,TypeError,OSError) as error:
                     dispatch.atomic_write(self.queue_dir/'dispatch-error.json',
@@ -1444,9 +1482,10 @@ class GPUQueue:
                 if job_dir is None:
                     return False
 
-                request = JobRequest.from_json((job_dir / "request.json").read_text())
+                raw_request, request_digest = dispatch.read_request(job_dir / 'request.json')
+                request = JobRequest.from_json(json.dumps(raw_request))
                 try:
-                    service_class,basis=dispatch.classify(json.loads(request.to_json()),dispatch_policy)
+                    service_class,basis=dispatch.classify(raw_request,dispatch_policy,request_digest=request_digest)
                 except ValueError as error:
                     dispatch.atomic_write(self.queue_dir/'dispatch-error.json',
                         {'schema':'gpu-greenroom.dispatch-error.v1','phase':'dispatch-policy','error':str(error),
@@ -1492,6 +1531,8 @@ class GPUQueue:
                 state.worker_pid = os.getpid()
                 state.dispatch={'mode':dispatch_policy['mode'],'service_class':service_class,
                                 'policy_epoch':dispatch_policy.get('epoch'),'eligibility_basis':basis}
+                if dispatch_policy['mode'] == 'two-class' and request.job_id in dispatch_policy.get('job_overrides', {}):
+                    state.dispatch['operator_override'] = dispatch_policy['job_overrides'][request.job_id]
                 if dispatch_policy['mode']=='two-class':
                     dispatch.atomic_write(self.queue_dir/'dispatch-state.json',
                         {'schema':'gpu-greenroom.dispatch-state.v1','last_class':service_class,
