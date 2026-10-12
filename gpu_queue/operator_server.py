@@ -347,7 +347,7 @@ def queue_snapshot(queue: GPUQueue | Path, view: str = "all", *, read_only: bool
     running_dir = queue_dir / 'running'
     running_ids = sorted(path.name for path in running_dir.iterdir()) if running_dir.is_dir() else []
     try:
-        dispatch_state={'policy':dispatch.policy(queue_dir),'last_class':dispatch.last_class(queue_dir),'error':None}
+        dispatch_state={'policy':dispatch.policy(queue_dir),'last_class':dispatch.last_class(queue_dir),'error':classification_error}
     except (ValueError,OSError) as error:
         dispatch_state={'policy':None,'error':str(error)}
     prepared_root=queue_dir/'continuation-staging'
