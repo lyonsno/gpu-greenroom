@@ -349,6 +349,7 @@ class TestRunningJobControl:
         started = tmp_path / "started"
         child_pid_path = tmp_path / "child.pid"
         descendant_pid_path = tmp_path / "descendant.pid"
+        descendant_ready = tmp_path / "descendant-ready"
         second_started = tmp_path / "second-started"
         request = JobRequest(
             job_type="command",
@@ -359,9 +360,10 @@ class TestRunningJobControl:
                 "-c",
                 (
                     f"echo $$ > {child_pid_path}; "
-                    "sh -c \"trap '' TERM INT; while true; do sleep 1; done\" & "
-                    f"echo $! > {descendant_pid_path}; touch {started}; "
-                    "trap 'exit 0' TERM INT; while true; do sleep 1; done"
+                    f"sh -c \"trap '' TERM INT; touch {descendant_ready}; while true; do sleep 1; done\" & "
+                    f"echo $! > {descendant_pid_path}; trap 'exit 0' TERM INT; "
+                    f"while [ ! -e {descendant_ready} ]; do sleep 0.02; done; touch {started}; "
+                    "while true; do sleep 1; done"
                 ),
             ],
         )
