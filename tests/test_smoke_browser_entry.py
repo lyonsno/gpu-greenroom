@@ -38,7 +38,7 @@ def test_finished_browser_is_feedback_not_a_live_application(tmp_path):
 
 class Owner:
     def __init__(self, path, identity, binding):
-        self.directory = tempfile.TemporaryDirectory(prefix='gr-', dir='/private/tmp')
+        self.directory = tempfile.TemporaryDirectory(prefix='gr-', dir='/tmp')
         path = os.path.join(self.directory.name, 'reveal.sock')
         identity['socket_path'] = path
         self.identity = identity
