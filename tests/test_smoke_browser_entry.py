@@ -45,6 +45,9 @@ class Owner:
         self.binding = binding
         self.calls = []
         self.response_change = {}
+        self.reject_second_reveal = False
+        self.receipt_gate = threading.Event()
+        self.receipt_gate.set()
         self.server = socket.socket(socket.AF_UNIX)
         self.server.bind(str(path))
         os.chmod(path, 0o600)
@@ -60,10 +63,13 @@ class Owner:
                 if value.get('action') == 'close-fixture':
                     return
                 self.calls.append(value)
+                self.receipt_gate.wait()
                 response = {'schema': 'gpu-greenroom.application-reveal-receipt.v1',
                     'action': value['action'], 'call_id': value['call_id'],
                     **self.binding, 'reveal': self.identity, 'foreground': value['action'] == 'reveal',
                     **self.response_change}
+                if self.reject_second_reveal and len([call for call in self.calls if call['action'] == 'reveal']) == 2:
+                    response['foreground'] = False
                 stream.write(json.dumps(response).encode() + b'\n')
                 stream.flush()
 
@@ -99,15 +105,23 @@ def revealed_store(root, monkeypatch):
     return store, value, record, path, owner
 
 
+def wait_action(store, action):
+    from gpu_queue import smoke_browser_actions
+    key = smoke_browser_actions._key(store.directory, action['request_id'], action['destination_digest'])
+    state = smoke_browser_actions._actions[key]
+    assert state['finished'].wait(3), 'synthetic owner must finish its action'
+    return smoke_browser_actions.latest(store.directory, action['request_id'], action['destination_digest'])
+
+
 def test_browser_focus_requests_its_retained_owner_without_url_navigation(tmp_path, monkeypatch):
     store, value, record, _, owner = revealed_store(tmp_path, monkeypatch)
     try:
         destination = store.destination(record)
-        assert store.display(record)['application_verified'] is True
-        first = store.focus(value['id'], record['request_digest'], destination['identity_digest'])
-        second = store.focus(value['id'], record['request_digest'], destination['identity_digest'])
-        assert first['foreground'] is True and second['foreground'] is True
-        assert first['reveal'] == second['reveal'] == owner.identity
+        assert store.display(record)['application_navigation_available'] is True
+        first = wait_action(store, store.focus(value['id'], record['request_digest'], destination['identity_digest']))
+        second = wait_action(store, store.focus(value['id'], record['request_digest'], destination['identity_digest']))
+        assert first['receipt']['foreground'] is True and second['receipt']['foreground'] is True
+        assert first['receipt']['reveal'] == second['receipt']['reveal'] == owner.identity
         assert [call['action'] for call in owner.calls].count('reveal') == 2
         assert all(call['job_id'] == 'test-job' for call in owner.calls)
         assert store.get(value['id']) == record
@@ -121,8 +135,8 @@ def test_wrong_owner_receipt_cannot_authorize_browser_reveal(tmp_path, monkeypat
     store, value, record, _, owner = revealed_store(tmp_path, monkeypatch)
     try:
         owner.response_change = change
-        with pytest.raises(ValueError, match='identity|receipt'):
-            store.focus(value['id'], record['request_digest'], store.destination(record)['identity_digest'])
+        action = wait_action(store, store.focus(value['id'], record['request_digest'], store.destination(record)['identity_digest']))
+        assert action['status'] == 'failed' and 'receipt identity' in action['error']
         assert not any(call['action'] == 'reveal' for call in owner.calls)
     finally:
         owner.close()
@@ -132,8 +146,8 @@ def test_reveal_requires_foreground_observation_not_acknowledgement(tmp_path, mo
     store, value, record, _, owner = revealed_store(tmp_path, monkeypatch)
     try:
         owner.response_change = {'foreground': False}
-        with pytest.raises(ValueError, match='foreground'):
-            store.focus(value['id'], record['request_digest'], store.destination(record)['identity_digest'])
+        action = wait_action(store, store.focus(value['id'], record['request_digest'], store.destination(record)['identity_digest']))
+        assert action['status'] == 'failed' and 'foreground' in action['error']
     finally:
         owner.close()
 
@@ -192,4 +206,36 @@ def test_verified_entry_notification_preserves_exact_destination(tmp_path, monke
         assert len(events) == 1 and events[0]['kind'] == 'usable'
         assert events[0]['payload']['destination'] == store.destination(record)
     finally:
+        owner.close()
+
+
+def test_stalled_owner_does_not_block_list_focus_or_feedback(tmp_path, monkeypatch):
+    store, value, record, _, owner = revealed_store(tmp_path, monkeypatch)
+    focus_done, list_done, feedback_done = (threading.Event() for _ in range(3))
+    results = {}
+    def probe(name, done, call):
+        try:
+            results[name] = call()
+        finally:
+            done.set()
+    probes = []
+    owner.receipt_gate.clear()
+    try:
+        for name, done, call in [
+            ('focus', focus_done, lambda: store.focus(value['id'], record['request_digest'], store.destination(record)['identity_digest'])),
+            ('list', list_done, store.snapshot),
+            ('feedback', feedback_done, lambda: store.respond(value['id'], 'Still usable while its owner is stuck')),
+        ]:
+            worker = threading.Thread(target=probe, args=(name, done, call))
+            probes.append(worker)
+            worker.start()
+            assert done.wait(1), name + ' must not wait for a browser-owner receipt'
+        assert results['focus']['status'] == 'pending'
+        assert results['feedback']['status'] == 'responded'
+    finally:
+        owner.receipt_gate.set()
+        for worker in probes:
+            worker.join()
+        if results.get('focus', {}).get('status') == 'pending':
+            wait_action(store, results['focus'])
         owner.close()

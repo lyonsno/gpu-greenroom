@@ -108,19 +108,27 @@ try {
     const initialTargets=await command('Target.getTargets');
     await evaluate(`window.__focusCalls=[];window.__realFetch=window.fetch.bind(window);window.fetch=async(input,options)=>{const r=await window.__realFetch(input,options);if(String(input).endsWith('/focus'))window.__focusCalls.push({status:r.status,body:await r.clone().json()});return r}`);
     for(const [width,height] of [[1440,1000],[390,844]]){
+      markPhase(`browser-entry-${width}`);
       await command('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:width===390});
       await evaluate(`document.querySelector('${selector}').scrollIntoView({block:'start'})`);
       const position=await evaluate(`(()=>{const r=document.querySelector('${selector} .smokeFocus').getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2}})()`);
+      const before=await evaluate(`window.__focusCalls.length`);
       await command('Input.dispatchMouseEvent',{type:'mousePressed',button:'left',clickCount:1,...position});
       await command('Input.dispatchMouseEvent',{type:'mouseReleased',button:'left',clickCount:1,...position});
-      const receipt=await eventually(()=>evaluate(`window.__focusCalls.at(-1)`),r=>r?.status===200,'real browser entry action');
-      assert.equal(receipt.body.action,'reveal');
+      await eventually(()=>evaluate(`window.__focusCalls.length`),n=>n>before,'new click response');
+      const receipt=await evaluate(`window.__focusCalls[${before}]`);
+      assert.equal(receipt.status,200,JSON.stringify(receipt));
       assert.equal(receipt.body.request_id,requestId);
+      const action=await eventually(()=>evaluate(`(async()=>{await loadSmoke();return lastSmoke.items.find(i=>i.request.id==='${requestId}').display.focus_action})()`),
+        value=>value?.action_id===receipt.body.action_id&&value.status!=='pending','that click owner result');
       assert.equal(await evaluate(`location.pathname`),'/');
       assert.deepEqual((await command('Target.getTargets')).targetInfos.map(t=>t.targetId).sort(),initialTargets.targetInfos.map(t=>t.targetId).sort(),'entry must not create any browser page');
       assert.equal(await evaluate(`document.documentElement.scrollWidth<=innerWidth`),true);
       const frame=await command('Page.captureScreenshot',{format:'png',fromSurface:true});
       writeFileSync(join(artifactDirectory,`browser-entry-${width}.png`),Buffer.from(frame.data,'base64'));
+      screenshotArtifact=join(artifactDirectory,`browser-entry-${width}.png`);
+      assert.equal(action.status,'complete',JSON.stringify(action));
+      assert.equal(action.receipt.foreground,true);
       await eventually(()=>evaluate(`document.querySelector('${selector} .smokeFocus').disabled`),v=>v===false,'focus control restored');
     }
     console.log(JSON.stringify({scenario,sourceRevision,effectiveRoute:base,browser:browserVersion.Browser,artifact,

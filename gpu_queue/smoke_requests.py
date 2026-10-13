@@ -509,8 +509,14 @@ class SmokeRequests:
         if (type(state.get('pid')) is not int or not smoke_browser.descendant(identity['owner_pid'], state['pid'])
                 or not smoke_browser.descendant(identity['browser_pid'], identity['owner_pid'])):
             raise ValueError('browser reveal processes do not belong to the running job')
-        smoke_browser.exchange(application, record['request']['id'], 'inspect')
         return application
+
+    def _current_application(self, identity, digest):
+        with self._locked(identity):
+            record = self.get(identity)
+            if record['status'] == 'responded' or self.destination(record).get('identity_digest') != digest:
+                raise ValueError('browser session ended or changed before reveal completed')
+            return self._verify_application(record)
 
     def _verify_session(self, record):
         from . import smoke_navigation
@@ -535,11 +541,13 @@ class SmokeRequests:
             if not destination_digest or destination_digest != destination.get('identity_digest'):
                 raise ValueError('terminal destination changed; refresh before opening')
             if destination['kind'] == 'browser':
-                from . import smoke_browser
                 application = self._verify_application(record)
-                return smoke_browser.exchange(application, identity, 'reveal')
-            session = self._verify_session(record)
-            return smoke_navigation.focus(session)
+            else:
+                session = self._verify_session(record)
+                return smoke_navigation.focus(session)
+        from . import smoke_browser_actions
+        return smoke_browser_actions.start(self.directory, application, identity, destination_digest,
+            lambda: self._current_application(identity, destination_digest))
 
     @staticmethod
     def public_record(record):
@@ -676,9 +684,16 @@ class SmokeRequests:
                 if 'reveal' in application:
                     try:
                         self._verify_application(record)
-                        result['application_verified'] = True
+                        result['application_navigation_available'] = True
                     except (OSError, ValueError, TypeError, KeyError) as error:
                         result['navigation_error'] = str(error)
+                from . import smoke_browser_actions
+                action = smoke_browser_actions.latest(self.directory, record['request']['id'],
+                    self.destination(record).get('identity_digest'))
+                if action:
+                    result['focus_action'] = action
+                    if action['status'] == 'failed':
+                        result['navigation_error'] = action['error']
             if stage == 'pending':
                 result['queue_position'] = dispatch.pending_order(root).index(path)+1
         except (OSError, ValueError, TypeError, KeyError) as error:
