@@ -101,7 +101,32 @@ try {
   writeFileSync(artifact, Buffer.from(initialFrame.data, 'base64'));
   screenshotArtifact = artifact;
 
-  if (scenario === 'finished-session' || scenario === 'installed-finished') {
+  if (scenario === 'browser-entry') {
+    const selector=`#smoke-${requestId}`;
+    assert.equal(await evaluate(`document.querySelector('${selector} a')===null`),true,'request must not link to itself or open a second application');
+    assert.equal(await evaluate(`document.querySelector('${selector} .smokeFocus').disabled`),false);
+    const initialTargets=await command('Target.getTargets');
+    await evaluate(`window.__focusCalls=[];window.__realFetch=window.fetch.bind(window);window.fetch=async(input,options)=>{const r=await window.__realFetch(input,options);if(String(input).endsWith('/focus'))window.__focusCalls.push({status:r.status,body:await r.clone().json()});return r}`);
+    for(const [width,height] of [[1440,1000],[390,844]]){
+      await command('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:width===390});
+      await evaluate(`document.querySelector('${selector}').scrollIntoView({block:'start'})`);
+      const position=await evaluate(`(()=>{const r=document.querySelector('${selector} .smokeFocus').getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2}})()`);
+      await command('Input.dispatchMouseEvent',{type:'mousePressed',button:'left',clickCount:1,...position});
+      await command('Input.dispatchMouseEvent',{type:'mouseReleased',button:'left',clickCount:1,...position});
+      const receipt=await eventually(()=>evaluate(`window.__focusCalls.at(-1)`),r=>r?.status===200,'real browser entry action');
+      assert.equal(receipt.body.action,'reveal');
+      assert.equal(receipt.body.request_id,requestId);
+      assert.equal(await evaluate(`location.pathname`),'/');
+      assert.deepEqual((await command('Target.getTargets')).targetInfos.map(t=>t.targetId).sort(),initialTargets.targetInfos.map(t=>t.targetId).sort(),'entry must not create any browser page');
+      assert.equal(await evaluate(`document.documentElement.scrollWidth<=innerWidth`),true);
+      const frame=await command('Page.captureScreenshot',{format:'png',fromSurface:true});
+      writeFileSync(join(artifactDirectory,`browser-entry-${width}.png`),Buffer.from(frame.data,'base64'));
+      await eventually(()=>evaluate(`document.querySelector('${selector} .smokeFocus').disabled`),v=>v===false,'focus control restored');
+    }
+    console.log(JSON.stringify({scenario,sourceRevision,effectiveRoute:base,browser:browserVersion.Browser,artifact,
+      assertions:['real monitor button and authenticated focus API','owner-bound reveal transport','no URL navigation or new page','desktop/mobile fit'],
+      nativeForeground:'synthetic owner receipt; not claimed',simulation:'no GPU workload'}));
+  } else if (scenario === 'finished-session' || scenario === 'installed-finished') {
     const selector=`#smoke-${requestId}`;
     const card=await evaluate(`document.querySelector('${selector}').innerText`);
     assert.ok(card.includes('Process completed')&&card.includes('Ended '),card);

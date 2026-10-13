@@ -134,6 +134,16 @@ function render(s){
   document.querySelectorAll('.dispatchClass').forEach(select=>select.onchange=()=>moveJob(s.jobs.find(j=>j.job_id===select.dataset.jobId),select.value));
 }
 async function load(){try{const r=await request('/api/state?view='+encodeURIComponent(filter),{headers:auth()});if(!r.ok)throw new Error(await r.text());const s=await r.json();queueAvailable=true;render(s)}catch(e){queueAvailable=false;document.querySelectorAll('.job-item').forEach(n=>n.draggable=false);document.querySelectorAll('.dispatchClass').forEach(n=>n.disabled=true);document.querySelector('#queueState').textContent='State unavailable';document.querySelector('#pause').disabled=true;document.querySelector('#resume').disabled=true;err(e.message)}}
+function smokeDestination(item){
+  const q=item.request||{},target=item.destination||{kind:'context',url:q.url},display=item.display||{},readOnly=document.body.dataset.readOnly==='true';
+  if(display.run_available)return '';
+  if(target.kind==='browser'&&(item.prepared_job_id||display.job_id||display.job_state))return `<button type="button" class="smokeFocus" data-id="${esc(q.id)}" data-digest="${esc(item.request_digest)}" data-destination="${esc(target.identity_digest||'')}" ${display.application_verified&&!readOnly?'':'disabled'}>Show application</button>`;
+  if(target.kind==='terminal')return `<button type="button" class="smokeFocus" data-id="${esc(q.id)}" data-digest="${esc(item.request_digest)}" data-destination="${esc(target.identity_digest||'')}" ${display.terminal_verified&&!readOnly?'':'disabled'}>Open terminal${target.pane_id!=null?' · pane '+esc(target.pane_id):''}</button>`;
+  if(!target.url)return '';
+  const url=new URL(target.url,location.href);
+  if(url.origin===location.origin&&url.pathname===location.pathname)return '';
+  return `<a href="${esc(target.url)}" target="_blank" rel="noopener noreferrer">${target.kind==='browser'?'Open application':'View linked page'}</a>`;
+}
 function renderSmoke(payload){
   if(!payload||payload.schema!=='gpu-greenroom.smoke-request-list.v1'||!Array.isArray(payload.items)||!Array.isArray(payload.errors))throw new Error('Invalid smoke request list response');
   lastSmoke=payload;
@@ -169,12 +179,8 @@ function renderSmoke(payload){
     const q=item.request||{},response=item.response||{};
     if(item.status!=='operator-needed'){smokeDrafts.delete(q.id);smokeAccepted.delete(q.id)}
     const action=item.status==='operator-needed'?(document.body.dataset.readOnly==='true'?'<p class="meta">Read-only view; responses are unavailable.</p>':item.display?.phase==='awaiting-start'?`<div class="smoke-actions"><button type="button" class="smokeStart" data-id="${esc(q.id)}" data-digest="${esc(item.request_digest)}">▶ Start session</button></div>`:['operator-needed','interactive','awaiting-response'].includes(item.display?.phase)?smokeReply(item):''):`<p class="smoke-response-copy">${esc(response.text||'Response text not recorded.')}</p><p class="meta">${response.participation?'Participation: '+esc(response.participation)+' · ':''}Accepted through Greenroom; caller identity unverified.</p>`;
-    const target=item.destination||{kind:'context',url:q.url};
-    let destination='';
-    if(target.kind==='browser')destination=`<a href="${esc(target.url)}" target="_blank" rel="noopener noreferrer">Open application</a>`;
-    else if(target.kind==='terminal'&&!item.display?.run_available)destination=`<button type="button" class="smokeFocus" data-id="${esc(q.id)}" data-digest="${esc(item.request_digest)}" data-destination="${esc(target.identity_digest||'')}" ${item.display?.terminal_verified&&document.body.dataset.readOnly!=='true'?'':'disabled'}>Open terminal${target.pane_id!=null?' · pane '+esc(target.pane_id):''}</button>`;
-    else if(target.url&&new URL(target.url,location.href).href!==location.origin+location.pathname)destination=`<a href="${esc(target.url)}" target="_blank" rel="noopener noreferrer">View linked page</a>`;
-    const phase=item.display?.phase,instructions=item.display?.run_available?'':phase==='waiting-gpu'?'<p>Waiting for GPU dispatch; the session is not running yet.</p>':item.display?.job_state==='running'?`<p>${item.display.terminal_verified?'Open the terminal for the current session.':'Execution is underway; the application destination has not been verified.'}</p>`:`<p>${esc(q.prompt||'No request prompt recorded.')}</p>`;
+    const destination=smokeDestination(item);
+    const phase=item.display?.phase,instructions=item.display?.run_available?'':phase==='waiting-gpu'?'<p>Waiting for GPU dispatch; the session is not running yet.</p>':item.display?.job_state==='running'?`<p>${item.display.terminal_verified?'Open the terminal for the current session.':item.display.application_verified?'The existing application is available.':item.display.application_reported?'The application is running, but its existing-window control is unavailable.':'Execution is underway; the application destination has not been verified.'}</p>${item.display.navigation_error?'<p class="meta">'+esc(item.display.navigation_error)+'</p>':''}`:`<p>${esc(q.prompt||'No request prompt recorded.')}</p>`;
     const job=last?.jobs.find(j=>j.job_id===item.display?.job_id&&j.status===item.display?.job_state),controls=nativeActions(job);
     return `<article class="smoke-card" id="smoke-${esc(q.id)}"><h3>${esc(q.title||'Untitled smoke request')}</h3><p class="meta">Reported by (unverified): ${esc(q.source?.agent_id||'not recorded')}</p><p class="meta">Submitted: ${esc(new Date(item.created_at).toLocaleString())}${item.display?.operator_start_at?' · Start selected: '+esc(new Date(item.display.operator_start_at).toLocaleString()):''}</p>${smokeProgress(item)}${item.display?.phase_reported_at?'<p class="meta">Phase reported: '+esc(new Date(item.display.phase_reported_at).toLocaleString())+'</p>':''}${instructions}${destination?'<p>'+destination+'</p>':''}${smokeRunView(item)}${smokeNext(item)}${action}${smokeDelivery(item)}${controls?'<div class="job-actions actions">'+controls+'</div>':''}</article>`
   }).join('');
@@ -203,7 +209,7 @@ function renderSmoke(payload){
     }
   });
   if(!smokeArrivalHandled&&location.hash.startsWith('#smoke-')){const target=document.getElementById(location.hash.slice(1));if(target){if(!focusControl){target.style.scrollMarginTop=(document.querySelector('header').getBoundingClientRect().height+12)+'px';target.scrollIntoView({block:'start'});target.tabIndex=-1;target.focus({preventScroll:true})}smokeArrivalHandled=true}else{document.querySelector('#smokeStatus').textContent='Smoke request in link is not available'}}
-  if(arrivalId&&arrivalDigest&&!arrivalOpened){arrivalOpened=true;const item=payload.items.find(value=>value.request.id===arrivalId);if(item?.destination?.identity_digest===arrivalDigest&&!item.display?.run_available&&item.display?.job_state==='running'){if(item.display.terminal_verified){const button=host.querySelector(`button.smokeFocus[data-id="${CSS.escape(arrivalId)}"]`);if(button)focusSmoke(button)}else if(item.display.application_reported){location.assign(item.destination.url)}}else err('The linked session has ended or changed; showing its request instead.')}
+  if(arrivalId&&arrivalDigest&&!arrivalOpened){arrivalOpened=true;const item=payload.items.find(value=>value.request.id===arrivalId);if(item?.destination?.identity_digest===arrivalDigest&&!item.display?.run_available&&item.display?.job_state==='running'&&(item.display.terminal_verified||item.display.application_verified)){const button=host.querySelector(`button.smokeFocus[data-id="${CSS.escape(arrivalId)}"]`);if(button)focusSmoke(button)}else err(item?.display?.navigation_error||'The linked session has ended, changed, or has no existing-window control; showing its request instead.')}
 }
 function keepLastSmokeView(message){
   smokeRefreshUnavailable=true;

@@ -49,7 +49,7 @@ class SmokeDelivery:
         if display.get('phase') in {'operator-needed', 'interactive'} and display.get('job_state') == 'running':
             target = self.store.destination(record)
             session = record.get('session') or record.get('application_session')
-            if session and (display.get('terminal_verified') or display.get('application_reported')):
+            if session and (display.get('terminal_verified') or display.get('application_verified')):
                 values.append(('usable', {'destination': target, 'job_id': display['job_id']}, session['observed_at']))
         result = []
         for kind, payload, occurred in values:

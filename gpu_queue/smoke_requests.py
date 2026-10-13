@@ -243,6 +243,9 @@ class SmokeRequests:
                 raise ValueError('invalid application session record')
             _target({'kind': 'browser', 'url': application.get('url')})
             _timestamp(application.get('observed_at'), 'application observed_at')
+            if 'reveal' in application:
+                from .smoke_browser import validate
+                validate(application['reveal'])
         if 'operator_command' in request:
             plan = record.get('prepared')
             if not isinstance(plan, dict) or plan.get('schema') != admission.PLAN_SCHEMA:
@@ -469,11 +472,15 @@ class SmokeRequests:
                 return {**target, 'pane_id': session['pane_id'], 'identity_digest': _digest(identity)}
         if target['kind'] == 'browser' and record.get('application_session'):
             session = record['application_session']
-            return {**target, 'identity_digest': _digest({key: session[key] for key in ('request_digest', 'job_id', 'url')})}
+            identity = {key: session[key] for key in ('request_digest', 'job_id', 'url')}
+            if 'reveal' in session:
+                identity['reveal'] = session['reveal']
+            return {**target, 'identity_digest': _digest(identity)}
         return target
 
     def publish_application(self, identity, payload):
-        if (not isinstance(payload, dict) or set(payload) != {'url', 'phase', 'label'}
+        if (not isinstance(payload, dict) or not {'url', 'phase', 'label'} <= set(payload)
+                or set(payload) - {'url', 'phase', 'label', 'reveal'}
                 or payload.get('phase') not in {'loading', 'operator-needed', 'interactive'}
                 or not isinstance(payload.get('label'), str) or not payload['label'].strip()):
             raise ValueError('application publication needs URL, phase and label')
@@ -486,7 +493,24 @@ class SmokeRequests:
             record['application_session'] = {**payload, 'request_digest': record['request_digest'],
                 'job_id': job_id, 'observed_at': _now()}
             record['presentation'] = {**record.get('presentation', {}), 'target': target}
+            if 'reveal' in payload:
+                self._verify_application(record)
             return self._write(record)
+
+    def _verify_application(self, record):
+        from . import smoke_browser
+        application = record.get('application_session')
+        if (not isinstance(application, dict) or application.get('request_digest') != record['request_digest']
+                or application.get('job_id') != self._running_job(record)
+                or self.destination(record).get('url') != application.get('url')):
+            raise ValueError('browser application conflicts with its running job')
+        identity = smoke_browser.verify(application.get('reveal'))
+        _, _, state, _ = self._linked_job(record)
+        if (type(state.get('pid')) is not int or not smoke_browser.descendant(identity['owner_pid'], state['pid'])
+                or not smoke_browser.descendant(identity['browser_pid'], identity['owner_pid'])):
+            raise ValueError('browser reveal processes do not belong to the running job')
+        smoke_browser.exchange(application, record['request']['id'], 'inspect')
+        return application
 
     def _verify_session(self, record):
         from . import smoke_navigation
@@ -506,10 +530,14 @@ class SmokeRequests:
             if record['status'] == 'responded':
                 raise SmokeRequestConflict('smoke already has a response')
             destination = self.destination(record)
-            if request_digest != record['request_digest'] or destination['kind'] != 'terminal':
-                raise ValueError('terminal request identity changed')
+            if request_digest != record['request_digest'] or destination['kind'] not in {'terminal', 'browser'}:
+                raise ValueError('application request identity changed')
             if not destination_digest or destination_digest != destination.get('identity_digest'):
                 raise ValueError('terminal destination changed; refresh before opening')
+            if destination['kind'] == 'browser':
+                from . import smoke_browser
+                application = self._verify_application(record)
+                return smoke_browser.exchange(application, identity, 'reveal')
             session = self._verify_session(record)
             return smoke_navigation.focus(session)
 
@@ -634,17 +662,23 @@ class SmokeRequests:
                 session = self._verify_session(record)
                 result.update(phase=session['phase'], label=session['label'], terminal_verified=True,
                               phase_reported_at=session['observed_at'])
-            if record['status'] != 'responded' and stage == 'done' and self.destination(record)['kind'] == 'terminal':
+            if record['status'] != 'responded' and stage == 'done' and self.destination(record)['kind'] in {'terminal', 'browser'}:
                 result.update(phase='awaiting-response', label='Last session ended; your experience has not been recorded', progress=None)
             result['started_at'] = state.get('started_at')
             application = record.get('application_session')
             if record['status'] != 'responded' and stage == 'running' and application:
                 if (application.get('request_digest') != record['request_digest'] or application.get('job_id') != job['job_id']
-                        or self.destination(record) != {**_target({'kind': 'browser', 'url': application['url']}),
-                            'identity_digest': _digest({key: application[key] for key in ('request_digest', 'job_id', 'url')})}):
+                        or self.destination(record).get('kind') != 'browser'
+                        or self.destination(record).get('url') != application['url']):
                     raise ValueError('application destination conflicts with running job')
                 result.update(phase=application['phase'], label=application['label'], application_reported=True,
                               phase_reported_at=application['observed_at'])
+                if 'reveal' in application:
+                    try:
+                        self._verify_application(record)
+                        result['application_verified'] = True
+                    except (OSError, ValueError, TypeError, KeyError) as error:
+                        result['navigation_error'] = str(error)
             if stage == 'pending':
                 result['queue_position'] = dispatch.pending_order(root).index(path)+1
         except (OSError, ValueError, TypeError, KeyError) as error:
