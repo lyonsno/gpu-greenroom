@@ -4,6 +4,34 @@ Exhaustive CLI, on-disk layout, job type configuration, receipt schema, and
 failure phases. The [README](../README.md) explains why the system is shaped
 this way; this file is the manual.
 
+## Performance-Sensitive Runs
+
+Use `--performance-window "reason for measurement"` on `submit` or
+`submit-command` for jobs that need operator coordination before timing.
+Command.v2 and command.v3 manifests accept the same nonblank
+`performance_window` field. Ordinary jobs do not prompt.
+
+At dispatch, a macOS native confirmation asks the operator to quit Chrome or
+stop live rendering and other GPU-heavy activity. Cancel run is the default;
+only Start measurement launches the underlying command. Missing console,
+unsupported host, or dialog failure refuses launch. Greenroom does not close,
+suspend, or signal unrelated applications.
+
+The job holds its assigned execution slot while waiting, without an operator
+response timeout. Cancel releases it after normal process-group quiescence.
+The caller's command timeout starts after confirmation, not during the prompt.
+Existing queue pause, leases, ordering, Stop and worker shutdown remain in force.
+Workers need `performance-window.v1`; an older worker leaves the request pending
+rather than silently running without confirmation.
+
+`performance-window.json` in the native job directory records confirmation,
+operator wait, workload PID, workload command wall time, and terminal failure
+phase. The main receipt embeds this record, the actual wrapper argv and the
+underlying `workload_argv`. The console distinguishes waiting for confirmation
+from measuring. Confirmation is operator acknowledgement, not a GPU-quietness
+measurement: `quietness_proved` remains false. Workload-specific environmental
+telemetry still determines whether a performance comparison is informative.
+
 ## CLI
 
 ```bash

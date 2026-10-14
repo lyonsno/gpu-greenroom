@@ -17,6 +17,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from .queue import GPUQueue
+from .models import JobRequest
 from .admission_control import transition
 from .smoke_requests import READER_SHA256, SmokeRequestConflict, SmokeRequests
 from . import dispatch
@@ -91,6 +92,12 @@ function nativeActions(j){
   if(j.status==='running')return `<button class="danger text" title="Stop running job" onclick="act('terminate','${esc(j.job_id)}')"><span>■</span> Stop</button> <button class="danger icon" title="Force stop running job" onclick="act('kill','${esc(j.job_id)}')">!</button>`;
   return '';
 }
+function performanceWindow(j){
+  if(!j.performance_window_reason)return '';
+  const p=j.performance_window,labels={waiting:'Waiting for your confirmation',confirmed:'Confirmed; command not started',running:'Measuring',complete:'Command finished',cancelled:'Cancelled before command',failed:'Failed'};
+  const phase=j.performance_window_error?'Unverified: '+j.performance_window_error:p?labels[p.status]:'Confirmation required at dispatch';
+  return '<div class="meta"><strong>Performance measurement: '+esc(phase)+'</strong><br>'+esc(j.performance_window_reason)+(p?'<br>Operator wait: '+duration(p.operator_wait_seconds)+' · Command wall: '+duration(p.command_wall_seconds):'')+'</div>';
+}
 function render(s){
   last=s;
   if(draggedJob)return;
@@ -120,7 +127,7 @@ function render(s){
   const jobMarkup=items=>items.map(j=>{
     const a=nativeActions(j);
     const route=j.requested_route||j.effective_route||j.job_type;
-    const conflict=j.consistent?'':`<div class="meta">containment: ${esc(j.containment_status)} · declared: ${esc(j.declared_status)}</div>`;
+    const conflict=performanceWindow(j)+(j.consistent?'':`<div class="meta">containment: ${esc(j.containment_status)} · declared: ${esc(j.declared_status)}</div>`);
     const manual=j.dispatch_override||j.dispatch?.operator_override;
     const choice=canMove(j)?`<label class="queue-choice">Queue <select class="dispatchClass" aria-label="Queue for ${esc(j.job_id)}" data-job-id="${esc(j.job_id)}"><option value="normal" ${j.dispatch_class==='normal'?'selected':''}>Automatic</option><option value="quick" ${j.dispatch_class==='quick'?'selected':''}>Quick</option></select></label>`:'';
     return `<article class="job-item" data-job-id="${esc(j.job_id)}" draggable="${canMove(j)}"><div class="job-heading"><strong>${esc(j.job_id)}</strong><span class="pill ${esc(j.status)}">${esc(j.status)}</span>${j.dispatch_class==='quick'?`<span class="pill quick" title="${esc(j.dispatch_basis)}">${manual?'Manual Quick':'Quick'}</span>`:manual?'<span class="meta">Manual Automatic</span>':''}${j.queue_position?`<span class="meta">Queue ${esc(j.queue_position)}</span>`:''}</div>${conflict}<div class="route">${esc(route)}</div><div class="meta">${esc(document.body.dataset.identityLabel||'Agent')}: ${esc(j.agent_id||'not recorded')} · ${esc(j.job_type)}</div><div class="meta">${esc(j.repo_root||j.output_dir||j.record_error||'')}</div>${j.dispatch_error?'<div class="meta failed">Dispatch classification: '+esc(j.dispatch_error)+'</div>':''}<div class="job-timing"><div>Submitted: ${j.submitted_at?esc(new Date(j.submitted_at*1000).toLocaleString()):'not recorded'}</div><div>Queue wait: ${duration(j.queue_wait_seconds)}</div><div>Execution wall time: ${duration(j.execution_wall_seconds)}</div><div>GPU hold time: not recorded</div></div>${choice}<div class="job-actions actions">${a}</div></article>`;
@@ -308,6 +315,17 @@ def queue_snapshot(queue: GPUQueue | Path, view: str = "all", *, read_only: bool
                 row["agent_id"] = request.get("agent_id")
                 row["requested_route"] = request.get("route_identity")
                 row["repo_root"] = request.get("repo_root")
+                row['performance_window_reason'] = request.get('performance_window')
+                if request.get('performance_window') is not None:
+                    try:
+                        from .performance_window import read_receipt
+                        row['performance_window'] = read_receipt(job_dir / 'performance-window.json',
+                            JobRequest.from_json(json.dumps(request)))
+                    except FileNotFoundError:
+                        if declared_status != 'pending':
+                            row['performance_window_error'] = 'Confirmation receipt missing'
+                    except (OSError, ValueError, KeyError, TypeError) as error:
+                        row['performance_window_error'] = str(error)
                 if request.get('job_id') == job_dir.name:
                     row['request_digest'] = digest
                 try:

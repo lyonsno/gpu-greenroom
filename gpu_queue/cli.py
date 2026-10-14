@@ -88,6 +88,7 @@ def cmd_submit(args):
         params=params,
         agent_id=_optional_agent_id(args.agent_id),
         service_class=getattr(args,'service_class',None),
+        performance_window=getattr(args, 'performance_window', None),
     )
     try:
         definitions = _load_job_types(args.queue_dir, strict=True)
@@ -196,6 +197,8 @@ def cmd_dispatch_policy(args):
 def _command_payload(args):
     manifest_path = None
     if args.manifest:
+        if getattr(args, 'performance_window', None) is not None:
+            raise ValueError('--performance-window cannot override a manifest')
         if args.agent_id is not None:
             raise ValueError("--agent-id cannot be used with --manifest; declare agent_id in the manifest")
         if getattr(args,'service_class',None) is not None:
@@ -209,7 +212,7 @@ def _command_payload(args):
         if argv and argv[0] == "--":
             argv = argv[1:]
         payload = {
-            "schema": "gpu-greenroom.command.v2" if getattr(args,'service_class',None) is not None or getattr(args,'cooperative_checkpoint',None) else "gpu-greenroom.command.v1",
+            "schema": "gpu-greenroom.command.v2" if getattr(args,'service_class',None) is not None or getattr(args,'cooperative_checkpoint',None) or getattr(args, 'performance_window', None) is not None else "gpu-greenroom.command.v1",
             "agent_id": args.agent_id,
             "repo_root": args.repo_root,
             "cwd": args.cwd,
@@ -221,6 +224,7 @@ def _command_payload(args):
             "timeout": args.timeout,
             "service_class": getattr(args,'service_class',None),
             "cooperative_checkpoint": bool(getattr(args,'cooperative_checkpoint',False)),
+            "performance_window": getattr(args, 'performance_window', None),
         }
 
     payload = admission.normalize_manifest(payload)
@@ -239,6 +243,7 @@ def _command_payload(args):
         "command_schema": payload['schema'],
         "cooperative_checkpoint": payload['cooperative_checkpoint'],
         "preflight": payload['preflight'],
+        "performance_window": payload.get('performance_window'),
     }
 
 
@@ -300,6 +305,7 @@ def cmd_submit_command(args):
         required_worker_capabilities=[STRUCTURED_COMMAND_CAPABILITY],
         service_class=payload['service_class'],
         cooperative_checkpoint=payload['cooperative_checkpoint'],
+        performance_window=payload.get('performance_window'),
     )
     if payload['command_schema']=='gpu-greenroom.command.v2':
         request.required_worker_capabilities.append('structured-command.v2')
@@ -814,6 +820,7 @@ def main():
     )
     p_submit.set_defaults(func=cmd_submit)
     p_submit.add_argument('--service-class',choices=['normal','quick'],default=None)
+    p_submit.add_argument('--performance-window', metavar='REASON', help='Ask the operator for a quiet performance window at dispatch')
 
     # submit-command
     p_command = sub.add_parser(
@@ -836,6 +843,7 @@ def main():
     p_command.set_defaults(func=cmd_submit_command)
     p_command.add_argument('--service-class',choices=['normal','quick'],default=None)
     p_command.add_argument('--cooperative-checkpoint',action='store_true',default=None)
+    p_command.add_argument('--performance-window', metavar='REASON', help='Ask the operator for a quiet performance window at dispatch')
 
     p_prepare = sub.add_parser('prepare-command', help='Validate and preserve a command without enqueueing')
     p_prepare.add_argument('--manifest', required=True)

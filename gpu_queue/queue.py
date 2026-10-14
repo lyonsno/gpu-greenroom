@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from . import admission, dispatch
+from . import admission, dispatch, performance_window
 
 import ctypes
 import fcntl
@@ -84,7 +84,7 @@ def _safe_substitute(template: str, mapping: dict) -> str:
 def effective_worker_capabilities() -> frozenset[str]:
     configured = os.environ.get("GPU_GREENROOM_WORKER_CAPABILITIES")
     if configured is None:
-        return DEFAULT_WORKER_CAPABILITIES | {dispatch.CAPABILITY,dispatch.OVERRIDE_CAPABILITY,'structured-command.v2','checkpoint-continuation.v1',admission.CAPABILITY}
+        return DEFAULT_WORKER_CAPABILITIES | {dispatch.CAPABILITY,dispatch.OVERRIDE_CAPABILITY,'structured-command.v2','checkpoint-continuation.v1',admission.CAPABILITY,performance_window.CAPABILITY}
     return frozenset(
         capability.strip()
         for capability in configured.split(",")
@@ -130,6 +130,8 @@ def required_worker_capabilities(request: JobRequest) -> frozenset[str]:
     required = set(request.required_worker_capabilities)
     if request.command_argv is not None:
         required.add(STRUCTURED_COMMAND_CAPABILITY)
+    if request.performance_window is not None:
+        required.add(performance_window.CAPABILITY)
     return frozenset(required)
 
 
@@ -1103,6 +1105,11 @@ class GPUQueue:
         """
         if type(request.cooperative_checkpoint) is not bool:
             raise ValueError('cooperative_checkpoint must be a boolean')
+        if request.performance_window is not None:
+            if not isinstance(request.performance_window, str) or not request.performance_window.strip():
+                raise ValueError('performance_window must be a nonblank reason')
+            if performance_window.CAPABILITY not in request.required_worker_capabilities:
+                request.required_worker_capabilities.append(performance_window.CAPABILITY)
         if request.cooperative_checkpoint:
             if not request.command_argv or not isinstance(request.agent_id,str) or not request.agent_id.strip():
                 raise ValueError('checkpoint continuation requires a structured command and explicit owner')
@@ -1725,6 +1732,8 @@ class GPUQueue:
             shutdown_exception = None
             ownership_unresolved = False
             ready_read=ready_write=None
+            launch_cmd = cmd
+            performance_report = None
 
             if state.status == JobStatus.RUNNING:
                 try:
@@ -1741,8 +1750,10 @@ class GPUQueue:
                             run_env['GPU_GREENROOM_CONTEXT']=str(context_path.resolve())
                             run_env['GPU_GREENROOM_READY_FD']=str(ready_read)
                             child_options['pass_fds']=(ready_read,)
+                        if request.performance_window is not None:
+                            launch_cmd = performance_window.runner_command(job_dir, request, cmd, job_timeout)
                         proc = subprocess.Popen(
-                            cmd,
+                            launch_cmd,
                             stdout=out_f,
                             stderr=err_f,
                             cwd=job_cwd,
@@ -1771,7 +1782,7 @@ class GPUQueue:
                                 pass
                             os.close(ready_write)
                             ready_write=None
-                        state.exit_code = proc.wait(timeout=job_timeout)
+                        state.exit_code = proc.wait(timeout=None if request.performance_window is not None else job_timeout)
                         if self._worker_shutdown_requested:
                             raise KeyboardInterrupt
                     if not self._quiesce_owned_child(proc, state.child_process_group):
@@ -1838,6 +1849,25 @@ class GPUQueue:
                         )
                         state.warnings.append("ownership_unknown:process_group_live")
                         dest_status = None
+
+            if request.performance_window is not None and proc is not None:
+                try:
+                    performance_report = performance_window.read_receipt(job_dir / 'performance-window.json', request)
+                    if not ownership_unresolved and state.failure_phase != 'worker_shutdown':
+                        if performance_report['status'] not in {'complete', 'failed', 'cancelled'}:
+                            raise ValueError('Performance-window child exited without a terminal receipt')
+                        if performance_report['status'] != 'complete':
+                            state.status = JobStatus.FAILED
+                            state.failure_phase = 'performance_window_' + performance_report['phase']
+                            state.error_message = performance_report.get('error') or 'Performance measurement cancelled before launch'
+                            dest_status = 'failed'
+                except (OSError, ValueError, KeyError, TypeError) as error:
+                    if not ownership_unresolved and state.failure_phase != 'worker_shutdown':
+                        state.status = JobStatus.FAILED
+                        state.failure_phase = 'performance_window_receipt'
+                        state.error_message = str(error)
+                        state.exit_code = -1
+                        dest_status = 'failed'
 
             self._owned_child = None
             self._owned_process_group = None
@@ -1919,7 +1949,9 @@ class GPUQueue:
                 "repo_root": request.repo_root,
                 "requested_route": request.route_identity,
                 "effective_route": state.effective_route,
-                "effective_argv": cmd,
+                "effective_argv": launch_cmd,
+                "workload_argv": cmd,
+                "performance_window": performance_report,
                 "effective_cwd": job_cwd,
                 "effective_env": job_env,
                 "environment_inheritance": "worker-plus-overlay",
@@ -1928,6 +1960,7 @@ class GPUQueue:
                 "reserved_environment_policy": "managed context overwritten; legacy context/ready/resume removed",
                 "effective_defaults": job_defaults,
                 "effective_timeout": job_timeout,
+                "timeout_scope": "workload-after-operator-confirmation" if request.performance_window is not None else "command",
                 "worker_pid": state.worker_pid,
                 "child_pid": state.child_pid,
                 "child_process_group": state.child_process_group,

@@ -114,6 +114,10 @@ def normalize_manifest(value):
     schema = payload.get('schema')
     if schema not in {'gpu-greenroom.command.v1', 'gpu-greenroom.command.v2', 'gpu-greenroom.command.v3'}:
         raise ValueError('command manifest schema must be gpu-greenroom.command.v1, v2 or v3')
+    performance = payload.get('performance_window')
+    if performance is not None and (schema == 'gpu-greenroom.command.v1'
+            or not isinstance(performance, str) or not performance.strip()):
+        raise ValueError('performance_window requires command.v2 or v3 and a nonblank reason')
     preflight = payload.get('preflight')
     if 'preflight' in payload and schema != 'gpu-greenroom.command.v3':
         raise ValueError('preflight requires gpu-greenroom.command.v3')
@@ -196,7 +200,10 @@ def prepare(queue, manifest):
                          command_timeout=payload['timeout'], output_dir=payload['output_dir'],
                          output_class=payload.get('output_class'), route_identity=payload['route_identity'],
                          service_class=payload['service_class'], cooperative_checkpoint=payload['cooperative_checkpoint'],
+                         performance_window=payload.get('performance_window'),
                          required_worker_capabilities=capabilities)
+    if request.performance_window:
+        request.required_worker_capabilities.append('performance-window.v1')
     if not request.output_dir:
         request.output_dir = str(queue.queue_dir / 'outputs' / request.job_id)
     dispatch.classify(json.loads(request.to_json()), dispatch.policy(queue.queue_dir))
