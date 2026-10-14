@@ -3,6 +3,9 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+import io
+import tarfile
+import threading
 from unittest.mock import Mock
 
 import pytest
@@ -198,3 +201,100 @@ def test_native_api_error_and_unsupported_host_refuse(monkeypatch):
     with pytest.raises(OSError):
         performance_window.native_dialog(value)
     assert cf.CFRelease.call_count == 4
+
+
+def test_actual_base_prepared_job_keeps_validation_identity(tmp_path):
+    base = '8ea7b86e68303d55d0781bcf29eff29ac01ef21d'
+    archived = subprocess.run(['git', 'archive', base, 'gpu_queue'], capture_output=True)
+    if archived.returncode:
+        pytest.skip('actual base package unavailable in shallow checkout')
+    legacy = tmp_path / 'legacy'
+    legacy.mkdir()
+    with tarfile.open(fileobj=io.BytesIO(archived.stdout)) as source:
+        source.extractall(legacy, filter='data')
+    manifest = command(tmp_path)
+    script = ('import json,sys;from gpu_queue.queue import GPUQueue;from gpu_queue import admission;'
+              'q=GPUQueue(sys.argv[1]);p=admission.prepare(q,json.load(sys.stdin));'
+              'admission.submit_prepared(q,p);print(json.dumps(p))')
+    result = subprocess.run([sys.executable, '-c', script, str(tmp_path / 'queue')],
+        cwd=legacy, input=json.dumps(manifest), text=True, capture_output=True, check=True)
+    plan = json.loads(result.stdout)
+    assert 'performance_window' not in plan['job_request']
+    queue = GPUQueue(tmp_path / 'queue')
+    assert queue.run_one({})
+    assert (queue.queue_dir / 'done' / plan['job_request']['job_id']).is_dir()
+
+
+def test_input_changed_during_confirmation_never_executes(tmp_path):
+    queue = GPUQueue(tmp_path / 'queue')
+    script = tmp_path / 'work.py'
+    script.write_text("print('validated')")
+    manifest = command(tmp_path)
+    manifest.update(argv=[sys.executable, str(script)], performance_window='Measure timing')
+    plan = admission.prepare(queue, manifest)
+    request = JobRequest.from_json(json.dumps(plan['job_request']))
+    job = admission.submit_prepared(queue, plan)
+    launch = performance_window.runner_command(job, request, request.command_argv, None)
+    value = json.loads(Path(launch[-1]).read_text())
+    def prompt(_):
+        script.write_text(f"from pathlib import Path;Path({str(tmp_path / 'unvalidated')!r}).touch()")
+        return True
+    assert performance_window.run(value, prompt=prompt) != 0
+    assert not (tmp_path / 'unvalidated').exists()
+    receipt = json.loads(Path(value['receipt_path']).read_text())
+    assert receipt['phase'] == 'validation-invalidated' and not receipt['workload_started']
+
+
+@pytest.mark.parametrize('phase', ['waiting', 'running'])
+@pytest.mark.parametrize('control', ['stop', 'shutdown'])
+def test_stop_does_not_leave_live_performance_status(tmp_path, monkeypatch, phase, control):
+    queue = GPUQueue(tmp_path / 'queue')
+    request = JobRequest(job_type='command', input_path='', performance_window='Measure timing',
+                         command_argv=[sys.executable, '-c', 'import time;time.sleep(300)'])
+    original = performance_window.runner_command
+    def cpu_dialog(job_dir, request, argv, timeout):
+        launch = original(job_dir, request, argv, timeout)
+        prompt = '(time.sleep(300),True)[1]' if phase == 'waiting' else 'True'
+        return [sys.executable, '-c', 'import json,sys,time;from pathlib import Path;'
+            'from gpu_queue.performance_window import run;'
+            f'sys.exit(run(json.loads(Path(sys.argv[1]).read_text()),prompt=lambda _:{prompt}))', launch[-1]]
+    monkeypatch.setattr(performance_window, 'runner_command', cpu_dialog)
+    queue.submit(request)
+    def run_worker():
+        try:
+            queue.run_one({})
+        except KeyboardInterrupt:
+            assert queue.worker_shutdown_requested
+    worker = threading.Thread(target=run_worker)
+    worker.start()
+    stop_sent = False
+    try:
+        report_path = queue.queue_dir / 'running' / request.job_id / 'performance-window.json'
+        while worker.is_alive():
+            try:
+                state = json.loads(report_path.read_text())
+                native = queue.get_job(request.job_id)
+                if state['status'] == phase and native.child_start_identity:
+                    if control == 'shutdown':
+                        with pytest.raises(KeyboardInterrupt):
+                            queue.request_worker_shutdown()
+                    else:
+                        queue.terminate_running(request.job_id, requested_by='fixture', reason='test stop')
+                    stop_sent = True
+                    break
+            except FileNotFoundError:
+                pass
+            time.sleep(.01)
+        assert stop_sent
+    finally:
+        if worker.is_alive() and not stop_sent:
+            native = queue.get_job(request.job_id)
+            if native and native.child_start_identity:
+                queue.terminate_running(request.job_id, requested_by='fixture', reason='fixture cleanup')
+        worker.join()
+    row = next(row for row in queue_snapshot(queue, 'all')['jobs'] if row['job_id'] == request.job_id)
+    assert row['status'] == 'failed'
+    assert row.get('performance_window_effective_status') == 'interrupted'
+    assert row['performance_window']['status'] == phase, 'Raw last observation must stay intact'
+    if control == 'shutdown':
+        assert row['failure_phase'] == 'worker_shutdown'

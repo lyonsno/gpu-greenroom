@@ -94,8 +94,8 @@ function nativeActions(j){
 }
 function performanceWindow(j){
   if(!j.performance_window_reason)return '';
-  const p=j.performance_window,labels={waiting:'Waiting for your confirmation',confirmed:'Confirmed; command not started',running:'Measuring',complete:'Command finished',cancelled:'Cancelled before command',failed:'Failed'};
-  const phase=j.performance_window_error?'Unverified: '+j.performance_window_error:p?labels[p.status]:'Confirmation required at dispatch';
+  const p=j.performance_window,labels={waiting:'Waiting for your confirmation',confirmed:'Confirmed; command not started',running:'Measuring',complete:'Command finished',cancelled:'Cancelled before command',failed:'Failed',interrupted:'Interrupted',unverified:'Unverified'};
+  const phase=j.performance_window_error?'Unverified: '+j.performance_window_error:p?(labels[j.performance_window_effective_status||p.status]+(j.performance_window_effective_status==='interrupted'?' · '+(j.failure_phase||j.status):'')):'Confirmation required at dispatch';
   return '<div class="meta"><strong>Performance measurement: '+esc(phase)+'</strong><br>'+esc(j.performance_window_reason)+(p?'<br>Operator wait: '+duration(p.operator_wait_seconds)+' · Command wall: '+duration(p.command_wall_seconds):'')+'</div>';
 }
 function render(s){
@@ -321,6 +321,11 @@ def queue_snapshot(queue: GPUQueue | Path, view: str = "all", *, read_only: bool
                         from .performance_window import read_receipt
                         row['performance_window'] = read_receipt(job_dir / 'performance-window.json',
                             JobRequest.from_json(json.dumps(request)))
+                        reported = row['performance_window']['status']
+                        row['performance_window_effective_status'] = (
+                            'unverified' if not consistent else
+                            'interrupted' if declared_status in {'done', 'failed', 'cancelled'}
+                            and reported in {'waiting', 'confirmed', 'running'} else reported)
                     except FileNotFoundError:
                         if declared_status != 'pending':
                             row['performance_window_error'] = 'Confirmation receipt missing'

@@ -1855,8 +1855,11 @@ class GPUQueue:
                     performance_report = performance_window.read_receipt(job_dir / 'performance-window.json', request)
                     if not ownership_unresolved and state.failure_phase != 'worker_shutdown':
                         if performance_report['status'] not in {'complete', 'failed', 'cancelled'}:
-                            raise ValueError('Performance-window child exited without a terminal receipt')
-                        if performance_report['status'] != 'complete':
+                            state.status = JobStatus.FAILED
+                            state.failure_phase = 'performance_window_interrupted'
+                            state.error_message = 'Performance-window process stopped before its terminal report'
+                            dest_status = 'failed'
+                        elif performance_report['status'] != 'complete':
                             state.status = JobStatus.FAILED
                             state.failure_phase = 'performance_window_' + performance_report['phase']
                             state.error_message = performance_report.get('error') or 'Performance measurement cancelled before launch'
@@ -1952,6 +1955,10 @@ class GPUQueue:
                 "effective_argv": launch_cmd,
                 "workload_argv": cmd,
                 "performance_window": performance_report,
+                "performance_window_effective_status": (
+                    'interrupted' if performance_report and not ownership_unresolved
+                    and performance_report['status'] in {'waiting', 'confirmed', 'running'}
+                    else performance_report.get('status') if performance_report else None),
                 "effective_cwd": job_cwd,
                 "effective_env": job_env,
                 "environment_inheritance": "worker-plus-overlay",

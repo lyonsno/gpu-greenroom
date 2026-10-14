@@ -67,6 +67,10 @@ def runner_command(job_dir, request, argv, timeout):
             'route': request.route_identity or request.job_type, 'reason': request.performance_window,
             'argv': argv, 'timeout': timeout,
             'receipt_path': str((job_dir / 'performance-window.json').resolve())}
+    validation_path = job_dir / 'validation.json'
+    if 'command-preflight.v1' in request.required_worker_capabilities or validation_path.exists():
+        spec['validation'] = json.loads(validation_path.read_text())
+        spec['request'] = json.loads(request.to_json())
     path = job_dir / 'performance-launch.json'
     atomic_write(path, spec)
     return [sys.executable, str(Path(__file__).resolve()), '--launch', str(path.resolve())]
@@ -90,6 +94,14 @@ def run(spec, *, prompt=None):
         report.update(status='confirmed', confirmed_at=time.time())
         report['operator_wait_seconds'] = report['confirmed_at'] - report['requested_at']
         atomic_write(path, report)
+        report.update(phase='validation-invalidated')
+        atomic_write(path, report)
+        if 'validation' in spec:
+            # The native dialog may stay open while an owner edits the source.
+            sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+            from gpu_queue import admission
+            from gpu_queue.models import JobRequest
+            admission.assert_current(JobRequest.from_json(json.dumps(spec['request'])), spec['validation'])
         report.update(phase='launch')
         atomic_write(path, report)
         # Stay in the worker-owned process group so its Stop/shutdown still owns every child.

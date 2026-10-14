@@ -31,6 +31,9 @@ def digest(value):
 def request_identity(request):
     value = asdict(request)
     value.pop('submitted_at')
+    # Preserve hashes of jobs prepared before the optional performance contract.
+    if value.get('performance_window') is None:
+        value.pop('performance_window', None)
     value['params'].pop(DIGEST_PARAM, None)
     return digest(value)
 
