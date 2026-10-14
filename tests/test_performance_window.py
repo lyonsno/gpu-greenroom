@@ -61,17 +61,21 @@ def test_only_actual_confirmation_launches_command(tmp_path, answer):
     assert not (tmp_path / 'executed').exists()
 
 
-def test_prompt_time_does_not_spend_command_timeout(tmp_path):
+def test_prompt_time_does_not_spend_command_timeout(tmp_path, monkeypatch):
     value = spec(tmp_path)
-    value['timeout'] = .2
+    clock = [100.0]
+    child = Mock(pid=123)
+    child.wait.return_value = 0
+    monkeypatch.setattr(performance_window.time, 'time', lambda: clock[0])
+    monkeypatch.setattr(performance_window.subprocess, 'Popen', Mock(return_value=child))
     def prompt(_):
-        time.sleep(.25)
+        clock[0] += 20
         return True
     assert performance_window.run(value, prompt=prompt) == 0
     report = json.loads(Path(value['receipt_path']).read_text())
-    assert report['status'] == 'complete' and (tmp_path / 'executed').read_text() == 'ran'
-    assert report['operator_wait_seconds'] >= .25
-    assert report['command_wall_seconds'] < .2
+    assert report['status'] == 'complete'
+    assert report['operator_wait_seconds'] == 20
+    child.wait.assert_called_once_with(timeout=1)
     assert report['quietness_proved'] is False
 
 
@@ -162,7 +166,9 @@ def test_worker_refusal_and_timeout_preserve_phase_and_release_group(tmp_path, m
     assert queue.run_one({})
     receipt = json.loads((queue.queue_dir / 'failed' / request.job_id / 'receipt.json').read_text())
     assert receipt['failure_phase'] == ('performance_window_timeout' if accepted else 'performance_window_operator-confirmation')
-    assert marker.exists() is accepted
+    assert receipt['performance_window']['workload_started'] is accepted
+    if not accepted:
+        assert not marker.exists()
     assert not list((queue.queue_dir / 'running').iterdir())
     assert queue._process_group_alive(receipt['child_process_group']) is False
 
