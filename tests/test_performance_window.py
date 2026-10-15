@@ -18,6 +18,11 @@ from gpu_queue.operator_server import queue_snapshot
 from tests.test_smoke_admission import command
 
 
+@pytest.fixture(autouse=True)
+def no_native_end_notices(monkeypatch):
+    monkeypatch.setattr(performance_window, 'native_notice', Mock(), raising=False)
+
+
 def test_prepared_performance_job_requires_capable_worker(tmp_path):
     queue = GPUQueue(tmp_path / 'queue')
     manifest = command(tmp_path)
@@ -298,3 +303,7 @@ def test_stop_does_not_leave_live_performance_status(tmp_path, monkeypatch, phas
     assert row['performance_window']['status'] == phase, 'Raw last observation must stay intact'
     if control == 'shutdown':
         assert row['failure_phase'] == 'worker_shutdown'
+    performance_window.native_notice.assert_called_once()
+    notice = json.loads((queue.queue_dir / 'failed' / request.job_id / 'performance-completion-notice.json').read_text())
+    assert notice['quiescence'] == 'confirmed'
+    assert notice['status'] == 'submitted'

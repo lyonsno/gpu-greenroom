@@ -62,6 +62,82 @@ def native_dialog(spec):
             cf.CFRelease(value)
 
 
+def native_notice(title, message, level):
+    if sys.platform != 'darwin':
+        raise RuntimeError('Native performance notification requires the macOS console')
+    cf = ctypes.CDLL('/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation')
+    cf.CFStringCreateWithCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]
+    cf.CFStringCreateWithCString.restype = ctypes.c_void_p
+    cf.CFRelease.argtypes = [ctypes.c_void_p]
+    cf.CFUserNotificationDisplayNotice.argtypes = [
+        ctypes.c_double, ctypes.c_ulong, *([ctypes.c_void_p] * 6)]
+    cf.CFUserNotificationDisplayNotice.restype = ctypes.c_int32
+    values = []
+    try:
+        for text in (title, message, 'OK'):
+            value = cf.CFStringCreateWithCString(None, text.encode('utf-8'), 0x08000100)
+            if not value:
+                raise RuntimeError('Could not construct native performance notification')
+            values.append(value)
+        # The one-way API returns without waiting for dismissal.
+        error = cf.CFUserNotificationDisplayNotice(0, level, None, None, None, *values)
+        if error:
+            raise OSError(error, 'Native performance notification failed')
+    finally:
+        for value in values:
+            cf.CFRelease(value)
+
+
+def notify_completion(job_dir, request, receipt):
+    if receipt.get('job_id') != request.job_id:
+        raise ValueError('Performance notification job identity conflicts')
+    finished = receipt.get('finished_at')
+    phase = receipt.get('failure_phase')
+    confirmed = (receipt.get('status') in {'done', 'failed', 'cancelled'}
+                 and type(finished) in (int, float) and math.isfinite(finished) and finished > 0
+                 and (phase is None or (isinstance(phase, str) and not phase.endswith('_quiescence_unresolved'))))
+    if not confirmed:
+        outcome, level = 'cleanup uncertain', 0
+        detail = ('Some processes may still be running. Cleanup is not confirmed; '
+                  'do not treat this as an end-of-window or GPU-free notice.')
+    else:
+        outcome = ('finished' if receipt['status'] == 'done' else
+                   'cancelled' if (receipt['status'] == 'cancelled'
+                                  or (receipt.get('performance_window') or {}).get('status') == 'cancelled') else
+                   'interrupted' if phase in {'worker_shutdown', 'stale_recovery', 'performance_window_interrupted'}
+                   else 'failed')
+        level = 1 if outcome == 'finished' else 2
+        detail = ("This job's processes have stopped. Its performance window has ended. "
+                  'Other measurements may request their own window; this does not certify GPU quietness.')
+    path = Path(job_dir) / ('performance-completion-notice.json' if confirmed else 'performance-ownership-warning.json')
+    report = {'schema': 'gpu-greenroom.performance-notification.v1', 'job_id': request.job_id,
+              'owner': request.agent_id, 'route': request.route_identity or request.job_type,
+              'reason': request.performance_window, 'outcome': outcome, 'failure_phase': phase,
+              'quiescence': 'confirmed' if confirmed else 'unknown', 'status': 'submission-unknown',
+              'requested_at': time.time(), 'backend': 'CoreFoundation.CFUserNotificationDisplayNotice',
+              'human_observation': 'unverified', 'quietness_proved': False}
+    try:
+        with path.open('x') as stream:
+            json.dump(report, stream, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except FileExistsError:
+        return {'status': 'already-attempted', 'receipt_path': str(path)}
+    message = (f"Job: {request.job_id}\nOwner: {request.agent_id or 'not recorded'}\n"
+               f"Route: {report['route']}\nOutcome: {outcome}\n"
+               f"{request.performance_window}\n\n{detail}")
+    if phase:
+        message += f'\nFailure phase: {phase}'
+    try:
+        native_notice('Greenroom: measurement ' + outcome, message, level)
+        report['status'] = 'submitted'
+    except Exception as error:
+        report.update(status='failed', error=str(error))
+    report['finished_at'] = time.time()
+    atomic_write(path, report)
+    return report
+
+
 def runner_command(job_dir, request, argv, timeout):
     spec = {'schema': SCHEMA, 'job_id': request.job_id, 'owner': request.agent_id,
             'route': request.route_identity or request.job_type, 'reason': request.performance_window,

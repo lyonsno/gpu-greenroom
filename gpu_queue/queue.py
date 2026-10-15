@@ -1467,6 +1467,7 @@ class GPUQueue:
         if lock_fd is None:
             return False
 
+        performance_notice = None
         try:
             with self._coordination_lock():
                 if self.is_paused():
@@ -1992,6 +1993,8 @@ class GPUQueue:
 
             if not ownership_unresolved:
                 self._move_job(job_dir, dest_status)
+            if request.performance_window is not None:
+                performance_notice = (final_job_dir, request, receipt)
             if shutdown_exception is not None:
                 raise shutdown_exception
             return True
@@ -1999,6 +2002,11 @@ class GPUQueue:
         finally:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
             lock_fd.close()
+            if performance_notice is not None:
+                try:
+                    performance_window.notify_completion(*performance_notice)
+                except Exception as error:
+                    print(f'Performance notification failed: {error}', file=sys.stderr)
 
     def recover_stale(self) -> list[str]:
         """Check for stale running jobs (process no longer alive) and move to failed.
@@ -2007,6 +2015,19 @@ class GPUQueue:
         Returns list of recovered job IDs.
         """
         lock_fd = open(self.lock_path, "w")
+        performance_notices = []
+        def record_notice(job_dir, receipt):
+            try:
+                request = JobRequest.from_json((job_dir / 'request.json').read_text())
+                if request.performance_window is not None:
+                    performance_notices.append((job_dir, request, receipt))
+            except (OSError, ValueError, TypeError):
+                pass
+
+        def record_unknown(job_dir, state):
+            if self._pid_alive(state.worker_pid) is False:
+                record_notice(job_dir, {'job_id': state.job_id, 'status': 'ownership_unknown',
+                                       'finished_at': None, 'failure_phase': 'stale_recovery'})
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
 
@@ -2033,6 +2054,7 @@ class GPUQueue:
                     if warning not in state.warnings:
                         state.warnings.append(warning)
                         self._write_text_atomic(status_file, state.to_json())
+                    record_unknown(job_dir, state)
                     continue
 
                 observed_identity = self._process_start_identity(state.child_pid)
@@ -2056,12 +2078,15 @@ class GPUQueue:
                     if warning and warning not in state.warnings:
                         state.warnings.append(warning)
                         self._write_text_atomic(status_file, state.to_json())
+                    if warning:
+                        record_unknown(job_dir, state)
                     continue
                 if group_alive:
                     warning = "ownership_unknown:child_missing_group_live"
                     if warning not in state.warnings:
                         state.warnings.append(warning)
                         self._write_text_atomic(status_file, state.to_json())
+                    record_unknown(job_dir, state)
                     continue
 
                 state.status = JobStatus.FAILED
@@ -2088,9 +2113,15 @@ class GPUQueue:
                 }
                 self._write_json_atomic(job_dir / "receipt.json", receipt)
 
-                self._move_job(job_dir, "failed")
+                final_dir = self._move_job(job_dir, "failed")
+                record_notice(final_dir, receipt)
                 recovered.append(state.job_id)
             return recovered
         finally:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
             lock_fd.close()
+            for notice in performance_notices:
+                try:
+                    performance_window.notify_completion(*notice)
+                except Exception as error:
+                    print(f'Performance recovery notification failed: {error}', file=sys.stderr)

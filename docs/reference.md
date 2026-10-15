@@ -32,6 +32,22 @@ from measuring. Confirmation is operator acknowledgement, not a GPU-quietness
 measurement: `quietness_proved` remains false. Workload-specific environmental
 telemetry still determines whether a performance comparison is informative.
 
+When the worker finishes cleanup and releases the execution mutex, a one-way
+native notice names the job and whether it finished, failed, was interrupted,
+or was cancelled. It does not wait for dismissal and does not hold the queue
+for another acknowledgement. It describes this job's performance window, not
+global GPU availability. Unknown process ownership produces a cleanup warning,
+never an end-of-window notice. Stale recovery uses the same distinction.
+
+`performance-completion-notice.json` records the per-job notice attempt;
+`performance-ownership-warning.json` records an unresolved-cleanup warning.
+Each is claimed once before the native call, preventing duplicate submission
+by concurrent recovery. A warning can later be followed by a distinct terminal
+notice when recovery confirms the processes have stopped. `submitted` means
+the native API accepted the notice, not that a human saw it. `failed` records
+an API failure; `submission-unknown` preserves an interrupted attempt without
+silently retrying it. Notification failure does not change or rerun the job.
+
 ## CLI
 
 ```bash
