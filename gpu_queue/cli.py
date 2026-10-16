@@ -861,7 +861,7 @@ def main():
 
     # list
     p_list = sub.add_parser("list", help="List jobs")
-    p_list.add_argument("-s", "--status", choices=["pending", "running", "done", "failed", "cancelled"])
+    p_list.add_argument("-s", "--status", choices=[status.value for status in JobStatus])
     p_list.set_defaults(func=cmd_list)
 
     # status

@@ -13,6 +13,7 @@ from typing import Any
 
 class JobStatus(str, Enum):
     PENDING = "pending"
+    DEFERRED = "deferred"
     RUNNING = "running"
     DONE = "done"
     FAILED = "failed"
@@ -88,6 +89,7 @@ class JobState:
     child_start_identity: str | None = None
     warnings: list[str] = field(default_factory=list)
     dispatch: dict | None = None
+    performance_deferral: dict | None = None
 
     def to_json(self) -> str:
         d = asdict(self)

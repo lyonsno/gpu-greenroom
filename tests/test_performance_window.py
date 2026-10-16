@@ -96,19 +96,25 @@ def test_dialog_failure_never_launches_and_has_phase_receipt(tmp_path):
     assert not (tmp_path / 'executed').exists()
 
 
-@pytest.mark.parametrize('response,confirmed', [(0, False), (1, True), (2, False), (3, False), (9, False)])
+@pytest.mark.parametrize('response,confirmed', [(0, False), (1, True), (3, False), (9, False)])
 def test_native_response_is_exact_and_cfstrings_released(monkeypatch, response, confirmed):
     cf = Mock()
-    cf.CFStringCreateWithCString.side_effect = [10, 11, 12, 13]
+    cf.CFStringCreateWithCString.return_value = 10
+    monkeypatch.setattr(performance_window.ctypes.c_void_p, 'in_dll', lambda *_: Mock(value=100))
     def alert(*args):
         args[-1]._obj.value = response
-        assert args[0:2] == (0, 2), 'No response timeout; caution-level alert'
+        assert args[1] == 0, 'No response timeout'
         return 0
-    cf.CFUserNotificationDisplayAlert.side_effect = alert
+    cf.CFUserNotificationReceiveResponse.side_effect = alert
+    def create(*args):
+        assert args[1:3] == (0, 2), 'No response timeout; caution-level alert'
+        return 20
+    cf.CFUserNotificationCreate.side_effect = create
     monkeypatch.setattr(performance_window.sys, 'platform', 'darwin')
     monkeypatch.setattr(performance_window.ctypes, 'CDLL', lambda *_: cf)
     assert performance_window.native_dialog({'job_id': 'one', 'owner': 'owner', 'route': 'route', 'reason': 'timing'}) is confirmed
-    assert cf.CFRelease.call_count == 4
+    assert cf.CFRelease.call_count == 11
+    assert cf.CFDictionarySetValue.call_count == 7
 
 
 def test_worker_records_native_gate_and_runs_exact_command(tmp_path, monkeypatch):
@@ -200,12 +206,13 @@ def test_native_api_error_and_unsupported_host_refuse(monkeypatch):
         performance_window.native_dialog(value)
     monkeypatch.setattr(performance_window.sys, 'platform', 'darwin')
     cf = Mock()
-    cf.CFStringCreateWithCString.side_effect = [10, 11, 12, 13]
-    cf.CFUserNotificationDisplayAlert.return_value = 7
+    cf.CFStringCreateWithCString.return_value = 10
+    monkeypatch.setattr(performance_window.ctypes.c_void_p, 'in_dll', lambda *_: Mock(value=100))
+    cf.CFUserNotificationReceiveResponse.return_value = 7
     monkeypatch.setattr(performance_window.ctypes, 'CDLL', lambda *_: cf)
     with pytest.raises(OSError):
         performance_window.native_dialog(value)
-    assert cf.CFRelease.call_count == 4
+    assert cf.CFRelease.call_count == 11
 
 
 def test_actual_base_prepared_job_keeps_validation_identity(tmp_path):

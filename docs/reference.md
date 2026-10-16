@@ -17,8 +17,20 @@ only Start measurement launches the underlying command. Missing console,
 unsupported host, or dialog failure refuses launch. Greenroom does not close,
 suspend, or signal unrelated applications.
 
-The job holds its assigned execution slot while waiting, without an operator
-response timeout. Cancel releases it after normal process-group quiescence.
+The prompt includes **Remind me later** and an editable **Remind me in
+(minutes)** field, initially **5**. Choosing that action puts this same job in
+`deferred/` after confirmation-process quiescence, releases the execution lock,
+and lets other queued work proceed. Positive fractional minutes are supported;
+invalid input reopens the prompt with a correction message. At the chosen time
+the job regains ordinary dispatch eligibility under the current queue policy.
+It does not interrupt running work or bypass pause, leases, or its service class,
+and a fresh Start measurement confirmation is still required. The delay and
+request digest are receipted in `performance-deferrals/`; deferral survives a
+worker restart and is not a failed or cancelled run. Older workers cannot
+dispatch a job while it remains in `deferred/`.
+
+Until the operator chooses an action, the job holds its assigned execution slot
+without a response timeout. Cancel releases it after normal process-group quiescence.
 The caller's command timeout starts after confirmation, not during the prompt.
 Existing queue pause, leases, ordering, Stop and worker shutdown remain in force.
 Workers need `performance-window.v1`; an older worker leaves the request pending
@@ -53,9 +65,9 @@ silently retrying it. Notification failure does not change or rerun the job.
 ```bash
 # Jobs
 gpu-greenroom submit <job-type> <input-path> [output-dir] [-p key=value ...] [--cwd DIR]
-gpu-greenroom list [-s pending|running|done|failed|cancelled]
+gpu-greenroom list [-s pending|deferred|running|done|failed|cancelled]
 gpu-greenroom status <job-id>
-gpu-greenroom cancel <job-id>          # pending jobs only
+gpu-greenroom cancel <job-id>          # pending or deferred jobs
 
 # Exact-argv jobs (no job type, no substitution)
 gpu-greenroom submit-command --agent-id NAME --repo-root DIR --cwd DIR --route-identity LABEL \

@@ -271,7 +271,7 @@ class ActiveRefs:
         names: set[str] = set()
         texts: list[str] = []
         unreadable: list[str] = []
-        for status in ("pending", "running"):
+        for status in ("pending", "deferred", "running"):
             status_dir = queue_dir / status
             if not status_dir.is_dir():
                 continue

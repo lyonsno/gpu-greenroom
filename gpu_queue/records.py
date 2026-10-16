@@ -20,7 +20,7 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
-STATE_DIRS = ("pending", "running", "done", "failed", "cancelled")   # the JobStatus values, in lifecycle order
+STATE_DIRS = ("pending", "deferred", "running", "done", "failed", "cancelled")   # the JobStatus values, in lifecycle order
 TERMINAL = ("done", "failed", "cancelled")
 _PRECEDENCE = {"pending": 1, "running": 2, "cancelled": 3, "failed": 4, "done": 5}
 RECEIPT_SCHEMA = "gpu-greenroom.gc-receipt.v1"

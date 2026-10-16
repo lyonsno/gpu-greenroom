@@ -154,7 +154,7 @@ class GPUQueue:
         self._worker_shutdown_requested = False
         self._owned_child: subprocess.Popen | None = None
         self._owned_process_group: int | None = None
-        for sub in ("pending", "running", "done", "failed", "cancelled", "outputs"):
+        for sub in ("pending", "deferred", "running", "done", "failed", "cancelled", "outputs"):
             (self.queue_dir / sub).mkdir(parents=True, exist_ok=True)
         for sub in (
             "leases",
@@ -1251,13 +1251,14 @@ class GPUQueue:
         return recovered
 
     def cancel(self, job_id: str) -> bool:
-        """Cancel a pending job. Returns True if cancelled, False if not found/not pending.
+        """Cancel a pending or deferred job without launching it.
 
         Uses the short transition lock shared with run_one().
         """
         with self._coordination_lock():
-            pending_dir = self.queue_dir / "pending" / job_id
-            if not pending_dir.exists():
+            pending_dir = next((self.queue_dir / sub / job_id for sub in ('pending', 'deferred')
+                                if (self.queue_dir / sub / job_id).is_dir()), None)
+            if pending_dir is None:
                 return False
 
             state = JobState.from_json((pending_dir / "status.json").read_text())
@@ -1272,7 +1273,7 @@ class GPUQueue:
     def list_jobs(self, status: JobStatus | None = None) -> list[JobState]:
         """List jobs, optionally filtered by status."""
         results = []
-        dirs = ["pending", "running", "done", "failed", "cancelled"]
+        dirs = ["pending", "deferred", "running", "done", "failed", "cancelled"]
         if status:
             dirs = [status.value]
         for sub in dirs:
@@ -1287,7 +1288,7 @@ class GPUQueue:
 
     def get_job(self, job_id: str) -> JobState | None:
         """Get a specific job's state."""
-        for sub in ("pending", "running", "done", "failed", "cancelled"):
+        for sub in ("pending", "deferred", "running", "done", "failed", "cancelled"):
             status_file = self.queue_dir / sub / job_id / "status.json"
             if status_file.exists():
                 return JobState.from_json(status_file.read_text())
@@ -1353,6 +1354,62 @@ class GPUQueue:
         """Get the oldest pending job directory."""
         jobs=dispatch.pending_order(self.queue_dir,config)
         return jobs[0] if jobs else None
+
+    def _read_performance_deferral(self, job_dir, request):
+        record = json.loads((job_dir / 'performance-defer.json').read_text())
+        report = performance_window.read_receipt(job_dir / 'performance-window.json', request)
+        digest = hashlib.sha256((job_dir / 'request.json').read_bytes()).hexdigest()
+        if (record.get('schema') != 'gpu-greenroom.performance-deferral.v1'
+                or record.get('job_id') != request.job_id or record.get('request_sha256') != digest
+                or record.get('performance_window') != report or report['status'] != 'deferred'
+                or record.get('quiescence') != 'confirmed'):
+            raise ValueError('Performance deferral identity or quiescence conflicts')
+        return record
+
+    def _apply_performance_deferral(self, job_dir, request, record):
+        # The receipt is committed before status/rename, so either interrupted
+        # write can be replayed under the original execution mutex.
+        attempt = JobState.from_json(json.dumps(record['attempt']))
+        if (not attempt.child_process_group or self._process_group_alive(attempt.child_process_group)
+                or self._process_start_identity(attempt.child_pid)):
+            raise ValueError('Deferred confirmation process is not quiescent')
+        report = record['performance_window']
+        state = JobState(job_id=request.job_id, status=JobStatus.DEFERRED, job_type=request.job_type,
+            input_path=request.input_path, output_dir=request.output_dir, params=request.params,
+            submitted_at=request.submitted_at,
+            performance_deferral={'deferred_until': report['deferred_until'],
+                                  'defer_seconds': report['defer_seconds'], 'attempt_id': report['attempt_id']})
+        performance_window.atomic_write(job_dir / 'status.json', json.loads(state.to_json()))
+        if job_dir.parent.name != 'deferred':
+            self._move_job(job_dir, 'deferred')
+
+    def _defer_performance_job(self, job_dir, request, state, report, worker):
+        record = {'schema': 'gpu-greenroom.performance-deferral.v1', 'job_id': request.job_id,
+            'request_sha256': hashlib.sha256((job_dir / 'request.json').read_bytes()).hexdigest(),
+            'performance_window': report, 'attempt': json.loads(state.to_json()),
+            'worker': worker, 'quiescence': 'confirmed', 'recorded_at': time.time()}
+        history = job_dir / 'performance-deferrals'
+        history.mkdir(exist_ok=True)
+        performance_window.atomic_write(history / (report['attempt_id'] + '.json'), record)
+        performance_window.atomic_write(job_dir / 'performance-defer.json', record)
+        self._apply_performance_deferral(job_dir, request, record)
+
+    def _promote_due_performance_jobs(self):
+        for job_dir in sorted((self.queue_dir / 'deferred').iterdir()):
+            try:
+                request = JobRequest.from_json((job_dir / 'request.json').read_text())
+                record = self._read_performance_deferral(job_dir, request)
+                state = JobState.from_json((job_dir / 'status.json').read_text())
+                if state.job_id != request.job_id or state.performance_deferral is None:
+                    raise ValueError('Deferred status identity missing')
+                if record['performance_window']['deferred_until'] > time.time():
+                    continue
+                state.status = JobStatus.PENDING
+                performance_window.atomic_write(job_dir / 'status.json', json.loads(state.to_json()))
+                self._move_job(job_dir, 'pending')
+            except (OSError, ValueError, TypeError, KeyError) as error:
+                performance_window.atomic_write(job_dir / 'deferral-error.json',
+                    {'phase': 'performance-deferral', 'error': str(error), 'observed_at': time.time()})
 
     def _write_metadata_sidecar(self, request: JobRequest, state: JobState):
         """Write metadata.json into output_dir for asset browser consumption."""
@@ -1478,6 +1535,8 @@ class GPUQueue:
                     return False
                 if any((self.queue_dir / "running").iterdir()):
                     return False
+
+                self._promote_due_performance_jobs()
 
                 effective_claimant = claimant or worker_identity()
                 try:
@@ -1739,6 +1798,11 @@ class GPUQueue:
             if state.status == JobStatus.RUNNING:
                 try:
                     os.makedirs(request.output_dir, exist_ok=True)
+                    if request.performance_window is not None:
+                        # Preserve old decisions in performance-deferrals/, but never
+                        # let recovery mistake one for this newly dispatched attempt.
+                        (job_dir / 'performance-defer.json').unlink(missing_ok=True)
+                        (job_dir / 'performance-window.json').unlink(missing_ok=True)
                     with open(stdout_path, "w") as out_f, open(stderr_path, "w") as err_f:
                         child_options={}
                         if request.cooperative_checkpoint:
@@ -1854,6 +1918,17 @@ class GPUQueue:
             if request.performance_window is not None and proc is not None:
                 try:
                     performance_report = performance_window.read_receipt(job_dir / 'performance-window.json', request)
+                    if (performance_report['status'] == 'deferred' and not ownership_unresolved
+                            and state.failure_phase == 'execution'
+                            and state.exit_code == performance_window.DEFER_EXIT
+                            and not self._worker_shutdown_requested):
+                        with self._coordination_lock():
+                            self._defer_performance_job(job_dir, request, state, performance_report, effective_claimant)
+                        self._owned_child = self._owned_process_group = None
+                        for descriptor in (ready_read, ready_write):
+                            if descriptor is not None:
+                                os.close(descriptor)
+                        return True
                     if not ownership_unresolved and state.failure_phase != 'worker_shutdown':
                         if performance_report['status'] not in {'complete', 'failed', 'cancelled'}:
                             state.status = JobStatus.FAILED
@@ -2044,6 +2119,17 @@ class GPUQueue:
                     state = JobState.from_json(status_file.read_text())
                 except (OSError, ValueError, json.JSONDecodeError):
                     continue
+                if (job_dir / 'performance-defer.json').exists():
+                    try:
+                        request = JobRequest.from_json((job_dir / 'request.json').read_text())
+                        record = self._read_performance_deferral(job_dir, request)
+                        with self._coordination_lock():
+                            self._apply_performance_deferral(job_dir, request, record)
+                        recovered.append(state.job_id)
+                        continue
+                    except (OSError, ValueError, TypeError, KeyError) as error:
+                        performance_window.atomic_write(job_dir / 'deferral-error.json',
+                            {'phase': 'performance-deferral-recovery', 'error': str(error), 'observed_at': time.time()})
                 exact_identity = all((
                     state.child_pid,
                     state.child_process_group,
@@ -2088,6 +2174,19 @@ class GPUQueue:
                         self._write_text_atomic(status_file, state.to_json())
                     record_unknown(job_dir, state)
                     continue
+
+                try:
+                    request = JobRequest.from_json((job_dir / 'request.json').read_text())
+                    if request.performance_window is not None:
+                        report = performance_window.read_receipt(job_dir / 'performance-window.json', request)
+                        if report['status'] == 'deferred':
+                            with self._coordination_lock():
+                                self._defer_performance_job(job_dir, request, state, report,
+                                    {'recovered_by': worker_identity()})
+                            recovered.append(state.job_id)
+                            continue
+                except (OSError, ValueError, TypeError, KeyError):
+                    pass
 
                 state.status = JobStatus.FAILED
                 state.finished_at = time.time()

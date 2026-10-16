@@ -88,14 +88,15 @@ for(const [id,serviceClass] of [['automaticQueue','normal'],['quickQueue','quick
 function duration(seconds){if(seconds==null)return 'not recorded';const s=Math.floor(seconds);return s>=3600?`${Math.floor(s/3600)}h ${Math.floor(s%3600/60)}m`:s>=60?`${Math.floor(s/60)}m ${s%60}s`:`${s}s`}
 function nativeActions(j){
   if(!j?.consistent||last?.read_only||last?.admission_control||document.body.dataset.readOnly==='true')return '';
-  if(j.status==='pending')return `<button class="danger text" title="Cancel pending job" onclick="act('cancel','${esc(j.job_id)}')"><span>×</span> Cancel</button>`;
+  if(['pending','deferred'].includes(j.status))return `<button class="danger text" title="Cancel queued job" onclick="act('cancel','${esc(j.job_id)}')"><span>×</span> Cancel</button>`;
   if(j.status==='running')return `<button class="danger text" title="Stop running job" onclick="act('terminate','${esc(j.job_id)}')"><span>■</span> Stop</button> <button class="danger icon" title="Force stop running job" onclick="act('kill','${esc(j.job_id)}')">!</button>`;
   return '';
 }
 function performanceWindow(j){
   if(!j.performance_window_reason)return '';
   const p=j.performance_window,labels={waiting:'Waiting for your confirmation',confirmed:'Confirmed; command not started',running:'Measuring',complete:'Command finished',cancelled:'Cancelled before command',failed:'Failed',interrupted:'Interrupted',unverified:'Unverified'};
-  const phase=j.performance_window_error?'Unverified: '+j.performance_window_error:p?(labels[j.performance_window_effective_status||p.status]+(j.performance_window_effective_status==='interrupted'?' · '+(j.failure_phase||j.status):'')):'Confirmation required at dispatch';
+  const deferred=j.status==='deferred'&&j.performance_deferral;
+  const phase=j.performance_window_error?'Unverified: '+j.performance_window_error:deferred?'Reminder after '+new Date(deferred.deferred_until*1000).toLocaleTimeString()+' · Other work may proceed':p?.status==='deferred'?'Awaiting fresh confirmation':p?(labels[j.performance_window_effective_status||p.status]+(j.performance_window_effective_status==='interrupted'?' · '+(j.failure_phase||j.status):'')):'Confirmation required at dispatch';
   return '<div class="meta"><strong>Performance measurement: '+esc(phase)+'</strong><br>'+esc(j.performance_window_reason)+(p?'<br>Operator wait: '+duration(p.operator_wait_seconds)+' · Command wall: '+duration(p.command_wall_seconds):'')+'</div>';
 }
 function render(s){
@@ -253,9 +254,9 @@ document.querySelector('#pause').onclick=()=>post('/api/pause',{requested_by:'op
 
 def queue_snapshot(queue: GPUQueue | Path, view: str = "all", *, read_only: bool = False) -> dict:
     queue_dir = queue if isinstance(queue, Path) else queue.queue_dir
-    statuses = ("pending", "running", "done", "failed", "cancelled")
+    statuses = ("pending", "deferred", "running", "done", "failed", "cancelled")
     if view == "active":
-        selected = ("pending", "running")
+        selected = ("pending", "deferred", "running")
     elif view == "all":
         selected = statuses
     elif view in statuses:
@@ -319,8 +320,13 @@ def queue_snapshot(queue: GPUQueue | Path, view: str = "all", *, read_only: bool
                 if request.get('performance_window') is not None:
                     try:
                         from .performance_window import read_receipt
-                        row['performance_window'] = read_receipt(job_dir / 'performance-window.json',
-                            JobRequest.from_json(json.dumps(request)))
+                        parsed_request = JobRequest.from_json(json.dumps(request))
+                        row['performance_window'] = read_receipt(job_dir / 'performance-window.json', parsed_request)
+                        if declared_status == 'deferred':
+                            record = queue._read_performance_deferral(job_dir, parsed_request)
+                            row['performance_deferral'] = {
+                                key: record['performance_window'][key]
+                                for key in ('deferred_until', 'defer_seconds', 'attempt_id')}
                         reported = row['performance_window']['status']
                         row['performance_window_effective_status'] = (
                             'unverified' if not consistent else
@@ -353,7 +359,7 @@ def queue_snapshot(queue: GPUQueue | Path, view: str = "all", *, read_only: bool
                 if not all(isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) for value in (end, start)):
                     return None
                 return end - start if end >= start else None
-            wait_end = started if started is not None else (now if declared_status == 'pending' else None)
+            wait_end = started if started is not None else (now if declared_status in {'pending', 'deferred'} else None)
             row['queue_wait_seconds'] = difference(wait_end, submitted) if consistent else None
             row['execution_wall_seconds'] = difference(finished or (now if declared_status == 'running' else None), started) if consistent else None
             jobs.append(row)
