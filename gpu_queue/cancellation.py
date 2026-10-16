@@ -32,6 +32,66 @@ def read_request(job, state):
     return record
 
 
+def parent_request(queue, job_id):
+    if not isinstance(job_id,str) or not re.fullmatch(r'[A-Za-z0-9_-]+',job_id):
+        raise ValueError('invalid continuation parent identity')
+    matches = [queue.queue_dir/status.value/job_id for status in JobStatus
+               if (queue.queue_dir/status.value/job_id/'cancel-request.json').exists()]
+    if len(matches) > 1:
+        raise ValueError('continuation parent cancellation is ambiguous')
+    if not matches:
+        return None
+    parent = matches[0]
+    return read_request(parent, JobState.from_json((parent/'status.json').read_text()))
+
+
+def cancel_successor(queue, stage, parent, record):
+    """Called under coordination authority for this exact unstarted handoff."""
+    state = JobState.from_json((stage/'status.json').read_text())
+    if state.job_id != stage.name:
+        raise ValueError('checkpoint successor state identity changed')
+    if state.status == JobStatus.CANCELLED:
+        return stage
+    if state.status != JobStatus.PENDING or state.started_at is not None:
+        raise ValueError('checkpoint successor is no longer unstarted')
+    destination = queue.queue_dir/'cancelled'/state.job_id
+    if destination.exists():
+        raise ValueError('cancelled successor identity is already present')
+    state.status, state.finished_at = JobStatus.CANCELLED, time.time()
+    state.failure_phase = 'parent_cancelled'
+    state.error_message = f'Checkpoint parent {parent} was cancelled'
+    write_durable(stage/'status.json', json.loads(state.to_json()))
+    write_durable(stage/'receipt.json', {'job_id':state.job_id,'status':'cancelled',
+        'execution_started':False,'finished_at':state.finished_at,'failure_phase':state.failure_phase,
+        'parent_job_id':parent,'parent_cancellation':record})
+    source_parent = stage.parent
+    stage.rename(destination)
+    sync_directory(source_parent)
+    sync_directory(destination.parent)
+    return destination
+
+
+def cancel_handoff(queue, job, record):
+    try:
+        commit = json.loads((job/'checkpoint-handoff.json').read_text())
+    except FileNotFoundError:
+        return
+    if (not isinstance(commit,dict) or commit.get('schema')!='gpu-greenroom.checkpoint-handoff.v2'
+            or commit.get('job_id')!=job.name or commit.get('status')!='committed'
+            or not isinstance(commit.get('next_job_id'),str)
+            or not re.fullmatch(r'[A-Za-z0-9_-]+',commit['next_job_id'])):
+        raise ValueError('checkpoint handoff identity is unverified')
+    for status in ('continuation-staging','pending'):
+        successor = queue.queue_dir/status/commit['next_job_id']
+        if not successor.exists():
+            continue
+        raw = (successor/'request.json').read_bytes()
+        if (hashlib.sha256(raw).hexdigest()!=commit.get('next_request_sha256')
+                or json.loads(raw).get('params',{}).get('continuation_of')!=job.name):
+            raise ValueError('checkpoint successor identity changed')
+        cancel_successor(queue,successor,job.name,record)
+
+
 def request(queue, *, job_id, request_digest, expected_status, expected_started_at,
             request_id, requested_by, force=False):
     for name, value in (('job_id', job_id), ('request_id', request_id)):
@@ -68,6 +128,8 @@ def request(queue, *, job_id, request_digest, expected_status, expected_started_
             raise ValueError('job changed; refresh before cancelling')
         if expected_status == 'running' and CAPABILITY not in state.worker_capabilities:
             raise ValueError('running worker does not support confirmed cancellation; refresh after worker update')
+        if expected_status == 'running' and any(warning.startswith('ownership_unknown:') for warning in state.warnings):
+            raise ValueError('job ownership is unresolved; exact recovery is required before further cancellation')
         previous = read_request(job, state)
         if previous and previous['force'] and not force:
             raise ValueError('force stop already requested')
@@ -79,6 +141,8 @@ def request(queue, *, job_id, request_digest, expected_status, expected_started_
                    'queue_dir': str(queue.queue_dir.resolve()), 'result': result}
         write_durable(receipt_path, receipt)
         write_durable(job/'cancel-request.json', record)
+        if expected_status == 'running':
+            cancel_handoff(queue, job, record)
         if expected_status != 'running':
             state.status, state.finished_at = JobStatus.CANCELLED, time.time()
             state.failure_phase = 'operator_cancelled'

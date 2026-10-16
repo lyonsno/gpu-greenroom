@@ -11,6 +11,8 @@ from . import dispatch
 from .gc import RetentionPins
 from .models import JobRequest
 from .queue import GPUQueue
+from .models import JobState
+from .cancellation import read_request as read_cancellation
 
 
 def _context():
@@ -67,6 +69,8 @@ def yield_if_requested(*,save_checkpoint,quiesce,continuation,on_submitted=None)
     if context is None:
         return False
     queue,job,request,state=context
+    if read_cancellation(job,JobState.from_json(json.dumps(state))):
+        return False
     if list(queue.control_receipts_dir.glob('*-'+request.job_id+'-signal-*.json')):
         return False
     config=dispatch.policy(queue.queue_dir)
@@ -109,6 +113,8 @@ def yield_if_requested(*,save_checkpoint,quiesce,continuation,on_submitted=None)
     overlay=request.command_env if next_request.command_env is None else next_request.command_env
     next_request.command_env={**(overlay or {}),'GPU_GREENROOM_RESUME_CHECKPOINT':str(checkpoint.resolve())}
     with queue._coordination_lock():
+        if read_cancellation(job,JobState.from_json(json.dumps(state))):
+            return False
         if queue.get_job(next_request.job_id) is not None:
             raise ValueError('continuation job identity is already in use')
         stage=queue.submit(next_request,_staged=True)

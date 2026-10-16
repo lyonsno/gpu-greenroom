@@ -1224,6 +1224,10 @@ class GPUQueue:
                 raise ValueError('prepared continuation state changed after registration')
             if self.get_job(request.job_id) is not None:
                 raise ValueError('continuation identity is already admitted')
+            from .cancellation import parent_request, cancel_successor
+            cancelled_parent = parent_request(self, commit['job_id'])
+            if cancelled_parent:
+                return cancel_successor(self,stage,commit['job_id'],cancelled_parent)
             destination=stage.rename(self.queue_dir/'pending'/request.job_id)
             for directory in (destination.parent,self.queue_dir/'continuation-staging'):
                 fd=os.open(directory,os.O_RDONLY)
@@ -1380,6 +1384,8 @@ class GPUQueue:
         if (not attempt.child_process_group or self._process_group_alive(attempt.child_process_group)
                 or self._process_start_identity(attempt.child_pid)):
             raise ValueError('Deferred confirmation process is not quiescent')
+        if self._recover_cancelled_locked(job_dir, attempt):
+            return
         report = record['performance_window']
         state = JobState(job_id=request.job_id, status=JobStatus.DEFERRED, job_type=request.job_type,
             input_path=request.input_path, output_dir=request.output_dir, params=request.params,
@@ -1400,6 +1406,30 @@ class GPUQueue:
         performance_window.atomic_write(history / (report['attempt_id'] + '.json'), record)
         performance_window.atomic_write(job_dir / 'performance-defer.json', record)
         self._apply_performance_deferral(job_dir, request, record)
+
+    def _recover_cancelled_locked(self, job_dir, state):
+        from .cancellation import read_request, cancel_handoff
+        record = read_request(job_dir,state)
+        if not record:
+            return False
+        if (not all((state.child_pid,state.child_process_group,state.child_start_identity))
+                or self._process_start_identity(state.child_pid)
+                or self._process_group_alive(state.child_process_group) is not False):
+            raise ValueError('Cancelled process-group quiescence is unverified')
+        cancel_handoff(self,job_dir,record)
+        state.status,state.finished_at = JobStatus.CANCELLED,time.time()
+        state.failure_phase = 'operator_cancelled_recovery'
+        state.error_message = 'Accepted cancellation recovered after exact process-group quiescence'
+        self._write_text_atomic(job_dir/'status.json',state.to_json())
+        self._write_json_atomic(job_dir/'receipt.json',{
+            'job_id':state.job_id,'job_type':state.job_type,'status':'cancelled',
+            'started_at':state.started_at,'finished_at':state.finished_at,
+            'child_pid':state.child_pid,'child_process_group':state.child_process_group,
+            'child_start_identity':state.child_start_identity,'failure_phase':state.failure_phase,
+            'error_message':state.error_message,'effective_route':state.effective_route,
+            'cancellation':record,'recovered_by':worker_identity()})
+        self._move_job(job_dir,'cancelled')
+        return True
 
     def _promote_due_performance_jobs(self):
         for job_dir in sorted((self.queue_dir / 'deferred').iterdir()):
@@ -2094,6 +2124,18 @@ class GPUQueue:
                         receipt.update(status='failed', failure_phase=state.failure_phase, error_message=str(error))
                 if cancellation_record:
                     receipt['cancellation'] = cancellation_record
+                    from .cancellation import cancel_handoff
+                    try:
+                        cancel_handoff(self,job_dir,cancellation_record)
+                    except (ValueError,TypeError,KeyError,OSError) as error:
+                        ownership_unresolved = True
+                        state.status,state.finished_at = JobStatus.RUNNING,None
+                        state.failure_phase = 'cancellation_handoff_unresolved'
+                        state.error_message = str(error)
+                        state.warnings.append('ownership_unknown:checkpoint_handoff_unresolved')
+                        final_job_dir = job_dir
+                        receipt.update(status='ownership_unknown',finished_at=None,
+                            failure_phase=state.failure_phase,error_message=str(error),warnings=state.warnings)
                     if not ownership_unresolved:
                         state.status = JobStatus.CANCELLED
                         state.failure_phase = 'operator_cancelled'
@@ -2102,9 +2144,9 @@ class GPUQueue:
                         final_job_dir = self.queue_dir/dest_status/state.job_id
                         receipt.update(status='cancelled', failure_phase=state.failure_phase,
                                        error_message=state.error_message)
-                        for key in ('request_path', 'stdout_path', 'stderr_path', 'managed_context_record'):
-                            if receipt.get(key):
-                                receipt[key] = str(final_job_dir/Path(receipt[key]).name)
+                for key in ('request_path', 'stdout_path', 'stderr_path', 'managed_context_record'):
+                    if receipt.get(key):
+                        receipt[key] = str(final_job_dir/Path(receipt[key]).name)
                 self._write_text_atomic(job_dir/'status.json', state.to_json())
                 self._write_json_atomic(job_dir / "receipt.json", receipt)
                 if not ownership_unresolved:
@@ -2166,6 +2208,9 @@ class GPUQueue:
                         record = self._read_performance_deferral(job_dir, request)
                         with self._coordination_lock():
                             self._apply_performance_deferral(job_dir, request, record)
+                        cancelled = self.queue_dir/'cancelled'/state.job_id
+                        if cancelled.exists():
+                            record_notice(cancelled,json.loads((cancelled/'receipt.json').read_text()))
                         recovered.append(state.job_id)
                         continue
                     except (OSError, ValueError, TypeError, KeyError) as error:
@@ -2214,6 +2259,18 @@ class GPUQueue:
                         state.warnings.append(warning)
                         self._write_text_atomic(status_file, state.to_json())
                     record_unknown(job_dir, state)
+                    continue
+
+                try:
+                    with self._coordination_lock():
+                        if self._recover_cancelled_locked(job_dir,state):
+                            cancelled = self.queue_dir/'cancelled'/state.job_id
+                            record_notice(cancelled,json.loads((cancelled/'receipt.json').read_text()))
+                            recovered.append(state.job_id)
+                            continue
+                except (OSError,ValueError,TypeError,KeyError) as error:
+                    self._write_json_atomic(job_dir/'recovery-error.json',
+                        {'phase':'cancellation-recovery','error':str(error),'observed_at':time.time()})
                     continue
 
                 try:

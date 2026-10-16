@@ -57,6 +57,12 @@ For example, a Node runner can set an `AbortController` from
 `process.on('SIGTERM', () => controller.abort())`, then use its signal at async
 boundaries and close resources in `finally`. A new checkpoint continuation should
 not be submitted on cancellation; this is distinct from yielding to queued work.
+The existing checkpoint helper and worker enforce this at handoff and recovery:
+an exact unstarted successor is cancelled with its parent while checkpoint bytes
+are preserved. The worker also closes handoffs from older producer helpers before
+releasing execution authority. Conflicting handoff identity is held for recovery,
+not treated as permission to execute another unit. Performance deferral recovery
+likewise resolves an accepted cancellation before reoffering the measurement.
 
 CLI control uses `cancel JOB` for queued work, `cancel --running JOB` for graceful
 running cancellation and `cancel --force JOB` for explicit force stop. The HTTP

@@ -91,6 +91,7 @@ function nativeActions(j){
   if(!j?.consistent||document.body.dataset.readOnly==='true')return '';
   if(last?.job_control){
     if(!['pending','deferred','running'].includes(j.status)||!j.request_digest)return '';
+    if(j.warnings?.some(w=>w.startsWith('ownership_unknown:')))return '<span class="meta failed">Ownership unresolved; recovery required</span>';
     if(j.cancellation_error)return '<span class="meta failed">Cancellation unverified</span>';
     if(j.status==='running'&&!j.worker_capabilities?.includes('job-cancellation.v1'))return '<span class="meta">Cancellation requires worker update</span>';
     if(j.cancellation)return `<span class="meta">${j.cancellation.force?'Force stop requested':'Cancelling; waiting for process exit'}</span>${j.status==='running'&&!j.cancellation.force?` <button class="danger icon" title="Force stop job" onclick="askCancel('${esc(j.job_id)}',true)">■</button>`:''}`;

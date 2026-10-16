@@ -335,3 +335,104 @@ def test_malformed_running_request_cannot_silently_close_as_cancelled(tmp_path):
         if worker.is_alive():
             os.killpg(queue.get_job(request.job_id).child_process_group, signal.SIGKILL)
             worker.join(8)
+
+
+@pytest.mark.parametrize('boundary', ['save', 'registration', 'committed', 'recovery', 'published', 'legacy-producer'])
+def test_cancellation_during_checkpoint_handoff_cannot_publish_or_recover_successor(tmp_path, boundary):
+    queue = GPUQueue(tmp_path/'queue')
+    marker, release = tmp_path/'boundary', tmp_path/'release'
+    script = tmp_path/'checkpoint.py'
+    script.write_text('''import os,pathlib,sys,time
+from gpu_queue.cancellation import cancellation
+from gpu_queue.cooperative import _context,yield_if_requested
+from gpu_queue.models import JobRequest
+from gpu_queue.queue import GPUQueue
+queue,job,request,state=_context()
+queue.pause(owner='fixture-checkpoint')
+def block(kind):
+    if kind==sys.argv[1] or (sys.argv[1] in ('recovery','legacy-producer') and kind=='registration'):
+        pathlib.Path(sys.argv[2]).touch()
+        while not pathlib.Path(sys.argv[3]).exists(): time.sleep(.01)
+def save(directory):
+    block('save')
+    return {'saved':'checkpoint preserved'}
+def continuation(path):
+    return JobRequest(job_type='command',input_path='',agent_id=request.agent_id,
+        repo_root=request.repo_root,command_cwd=request.command_cwd,route_identity=request.route_identity,
+        command_argv=[sys.executable,'-c',"print('must not run')"])
+original=GPUQueue.publish_continuation
+def publish(self,stage):
+    if sys.argv[1]=='recovery': os._exit(9)
+    if sys.argv[1]=='legacy-producer': return stage.rename(self.queue_dir/'pending'/stage.name)
+    block('committed')
+    result=original(self,stage)
+    block('published')
+    return result
+GPUQueue.publish_continuation=publish
+with cancellation() as stop:
+    yield_if_requested(save_checkpoint=save,quiesce=lambda:True,
+        continuation=continuation,on_submitted=lambda request:block('registration'))
+    stop.checkpoint()
+''')
+    request = JobRequest(job_type='command',input_path='',agent_id='fixture-checkpoint',
+        route_identity='fixture/checkpoint-cancel',repo_root=str(tmp_path),command_cwd=str(tmp_path),
+        command_argv=[sys.executable,str(script),boundary,str(marker),str(release)],
+        command_env={'PYTHONPATH':str(Path(__file__).resolve().parents[1])},cooperative_checkpoint=True)
+    queue.submit(request)
+    worker = threading.Thread(target=queue.run_one,args=({},))
+    worker.start()
+    try:
+        wait_until(marker.exists)
+        cancel(queue,request,status='running',started=queue.get_job(request.job_id).started_at)
+        wait_until(lambda:(queue.queue_dir/'running'/request.job_id/'cancel-progress.json').exists())
+        release.touch()
+        worker.join(8)
+        assert not worker.is_alive()
+        assert queue.get_job(request.job_id).status == JobStatus.CANCELLED
+        assert not list((queue.queue_dir/'pending').iterdir())
+        queue.recover_continuations()
+        queue.recover_continuations()
+        assert not list((queue.queue_dir/'pending').iterdir())
+        assert (queue.queue_dir/'outputs'/request.job_id/'checkpoints/checkpoint.json').is_file()
+    finally:
+        release.touch()
+        if worker.is_alive():
+            os.killpg(queue.get_job(request.job_id).child_process_group,signal.SIGKILL)
+            worker.join(8)
+
+
+@pytest.mark.parametrize('committed', [False,True])
+def test_crash_recovery_cancel_precedes_both_deferral_paths(tmp_path,monkeypatch,committed):
+    from gpu_queue import performance_window
+    from gpu_queue.operator_server import queue_snapshot
+    queue = GPUQueue(tmp_path/'queue')
+    request = JobRequest(job_type='command',input_path='',command_argv=[sys.executable,'-c','pass'],
+        agent_id='fixture-recovery',performance_window='CPU-only recovery fixture')
+    job = queue.submit(request)
+    job = job.rename(queue.queue_dir/'running'/request.job_id)
+    child = subprocess.Popen([sys.executable,'-c','import time; time.sleep(.1)'],start_new_session=True)
+    identity = queue._process_start_identity(child.pid)
+    assert identity
+    child.wait()
+    state = JobState.from_json((job/'status.json').read_text())
+    state.status,state.started_at = JobStatus.RUNNING,123
+    state.worker_pid,state.child_pid,state.child_process_group = 999999,child.pid,child.pid
+    state.child_start_identity,state.worker_capabilities = identity,['job-cancellation.v1']
+    (job/'status.json').write_text(state.to_json())
+    spec = {'job_id':request.job_id,'owner':request.agent_id,'route':request.job_type,
+        'reason':request.performance_window,'receipt_path':str(job/'performance-window.json'),
+        'argv':request.command_argv,'timeout':None}
+    assert performance_window.run(spec,prompt=lambda _: {'defer_minutes':5})==performance_window.DEFER_EXIT
+    report = performance_window.read_receipt(job/'performance-window.json',request)
+    if committed:
+        monkeypatch.setattr(queue,'_apply_performance_deferral',lambda *_:None)
+        queue._defer_performance_job(job,request,state,report,{'fixture':'crash before apply'})
+    cancel(queue,request,status='running',started=state.started_at)
+    restarted = GPUQueue(queue.queue_dir)
+    assert restarted.recover_stale()==[request.job_id]
+    recovered = restarted.get_job(request.job_id)
+    assert recovered.status==JobStatus.CANCELLED
+    assert recovered.started_at==123
+    row = queue_snapshot(queue.queue_dir,'all')['jobs'][0]
+    assert row.get('cancellation_error') is None
+    assert row['cancellation']['request_id']=='cancel-1'
