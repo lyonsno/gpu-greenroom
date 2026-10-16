@@ -101,7 +101,38 @@ try {
   writeFileSync(artifact, Buffer.from(initialFrame.data, 'base64'));
   screenshotArtifact = artifact;
 
-  if (scenario === 'performance-deferred') {
+  if (scenario === 'job-cancel') {
+    await eventually(() => evaluate(`document.querySelectorAll('.job-item').length`), n=>n===2, 'actual queue jobs');
+    await evaluate(`window.__cancelCalls=[];window.__realFetch=window.fetch.bind(window);window.fetch=async(input,options)=>{const r=await window.__realFetch(input,options);if(String(input).endsWith('/api/job-cancel'))window.__cancelCalls.push({status:r.status,body:JSON.parse(options.body)});return r}`);
+    for (const [width,height] of [[1440,1000],[390,844]]) {
+      await command('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:width===390});
+      await evaluate(`document.querySelector('[data-job-id="browser-pending"] button[title="Cancel job"]').click()`);
+      const modal=await evaluate(`(()=>{const d=document.querySelector('#cancelDialog'),r=d.getBoundingClientRect();return {open:d.open,text:d.innerText,left:r.left,right:r.right,bottom:r.bottom,top:r.top,width:innerWidth,height:innerHeight,focus:document.activeElement?.textContent}})()`);
+      assert.equal(modal.open,true);
+      assert.ok(modal.text.includes('fixture-queued-owner')&&modal.text.includes('fixture/browser-cancel-pending'));
+      assert.equal(modal.focus,'Keep job');
+      assert.ok(modal.left>=0&&modal.right<=width&&modal.top>=0&&modal.bottom<=height,JSON.stringify(modal));
+      const frame=await command('Page.captureScreenshot',{format:'png',fromSurface:true});
+      writeFileSync(join(artifactDirectory,`${scenario}-${width}.png`),Buffer.from(frame.data,'base64'));
+      await evaluate(`document.querySelector('#cancelDialog button[value="back"]').click()`);
+      assert.equal(await evaluate(`window.__cancelCalls.length`),0,'Keep job must not cancel');
+    }
+    await evaluate(`document.querySelector('[data-job-id="browser-pending"] button[title="Cancel job"]').click();document.querySelector('#confirmCancel').click()`);
+    await eventually(()=>evaluate(`window.__cancelCalls.length`),n=>n===1,'queued cancellation');
+    assert.equal(await evaluate(`window.__cancelCalls[0].status`),200);
+    await eventually(()=>evaluate(`!document.querySelector('[data-job-id="browser-pending"]')`),Boolean,'pending removed');
+    await evaluate(`document.querySelector('[data-job-id="browser-running"] button[title="Cancel job"]').click();document.querySelector('#confirmCancel').click()`);
+    await eventually(()=>evaluate(`document.querySelector('[data-job-id="browser-running"]')?.innerText`),text=>text?.includes('Cancelling; waiting for process exit'),'running cancelling state');
+    await evaluate(`document.querySelector('[data-job-id="browser-running"] button[title="Force stop job"]').click()`);
+    assert.ok(await evaluate(`document.querySelector('#cancelDialog').innerText.includes('Unsaved work may be lost')`));
+    await evaluate(`document.querySelector('#confirmCancel').click()`);
+    await eventually(()=>evaluate(`window.__cancelCalls.length`),n=>n===3,'force request');
+    await eventually(()=>evaluate(`load().then(()=>!document.querySelector('[data-job-id="browser-running"]'))`),Boolean,'running terminal cancellation');
+    assert.equal(await evaluate(`window.__cancelCalls.every(c=>c.status===200)`),true);
+    markPhase('owned-browser-shutdown');
+    await command('Browser.close');
+    console.log(JSON.stringify({scenario,sourceRevision,effectiveRoute:base,effectiveMode:'admission-control with disposable request fixture',apiBehavior:'real authenticated API',browser:browserVersion.Browser,artifact,assertions:['Keep job makes no request','modal identifies exact job and owner','desktop/mobile fit','queued cancellation','running cancellation waits','separate force confirmation','worker terminal cancellation']}));
+  } else if (scenario === 'performance-deferred') {
     await eventually(() => evaluate(`Boolean(document.querySelector('.job-item .pill.deferred'))`), Boolean, 'deferred queue render');
     for (const [width, height] of [[1440, 1000], [390, 844]]) {
       await command('Emulation.setDeviceMetricsOverride', {width, height, deviceScaleFactor: 1, mobile: width === 390});

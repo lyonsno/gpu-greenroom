@@ -359,6 +359,18 @@ def cmd_status(args):
 
 def cmd_cancel(args):
     queue = get_queue(args)
+    if getattr(args, 'running', False) or getattr(args, 'force', False):
+        import hashlib
+        import uuid
+        state = queue.get_job(args.job_id)
+        if state is None or state.status.value != 'running':
+            raise ValueError('running job not found')
+        digest = hashlib.sha256((queue.queue_dir/'running'/args.job_id/'request.json').read_bytes()).hexdigest()
+        result = queue.request_cancel(job_id=args.job_id, request_digest=digest,
+            expected_status='running', expected_started_at=state.started_at,
+            request_id=uuid.uuid4().hex, requested_by='cli', force=bool(args.force))
+        print(json.dumps(result))
+        return
     if queue.cancel(args.job_id):
         print(f"Cancelled job {args.job_id}")
     else:
@@ -376,6 +388,7 @@ def cmd_operator(args):
         admission_control=args.admission_control,
         identity_label=args.identity_label,
         local_operator=args.local_operator,
+        job_control=args.job_control,
     )
 
 
@@ -870,8 +883,10 @@ def main():
     p_status.set_defaults(func=cmd_status)
 
     # cancel
-    p_cancel = sub.add_parser("cancel", help="Cancel a pending job")
+    p_cancel = sub.add_parser("cancel", help="Cancel queued work or explicitly stop a running job")
     p_cancel.add_argument("job_id")
+    p_cancel.add_argument('--running', action='store_true', help='request cancellation of this running job')
+    p_cancel.add_argument('--force', action='store_true', help='force stop this running job; unsaved work may be lost')
     p_cancel.set_defaults(func=cmd_cancel)
 
     # Interactive-smoke requests are Greenroom-owned records, separate from GPU jobs.
@@ -904,6 +919,7 @@ def main():
     p_operator.add_argument("--port", type=int, default=8765)
     p_operator.add_argument("--identity-label", default="Agent")
     p_operator.add_argument("--local-operator", action="store_true")
+    p_operator.add_argument('--job-control', action='store_true', help='enable confirmed exact-job cancellation')
     operator_modes = p_operator.add_mutually_exclusive_group()
     operator_modes.add_argument("--read-only", action="store_true")
     operator_modes.add_argument("--admission-control", action="store_true")

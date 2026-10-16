@@ -84,7 +84,7 @@ def _safe_substitute(template: str, mapping: dict) -> str:
 def effective_worker_capabilities() -> frozenset[str]:
     configured = os.environ.get("GPU_GREENROOM_WORKER_CAPABILITIES")
     if configured is None:
-        return DEFAULT_WORKER_CAPABILITIES | {dispatch.CAPABILITY,dispatch.OVERRIDE_CAPABILITY,'structured-command.v2','checkpoint-continuation.v1',admission.CAPABILITY,performance_window.CAPABILITY}
+        return DEFAULT_WORKER_CAPABILITIES | {dispatch.CAPABILITY,dispatch.OVERRIDE_CAPABILITY,'structured-command.v2','checkpoint-continuation.v1',admission.CAPABILITY,performance_window.CAPABILITY,'job-cancellation.v1'}
     return frozenset(
         capability.strip()
         for capability in configured.split(",")
@@ -329,6 +329,8 @@ class GPUQueue:
             return True
         try:
             os.killpg(process_group, signal.SIGTERM)
+        except PermissionError:
+            return False
         except ProcessLookupError:
             if proc is not None and proc.poll() is None:
                 proc.wait()
@@ -471,6 +473,10 @@ class GPUQueue:
             receipt["delivered_at"] = time.time()
             self._write_json_atomic(receipt_path, receipt)
             return receipt
+
+    def request_cancel(self, **kwargs) -> dict:
+        from .cancellation import request
+        return request(self, **kwargs)
 
     def _mark_lease_unknown_locked(self, lease: ExternalLease, reason: str) -> ExternalLease:
         if lease.lifecycle_state == LeaseStatus.OWNERSHIP_UNKNOWN:
@@ -1602,6 +1608,7 @@ class GPUQueue:
                 state.started_at = time.time()
                 state.pid = os.getpid()
                 state.worker_pid = os.getpid()
+                state.worker_capabilities = list(effective_claimant.get('capabilities', []))
                 state.dispatch={'mode':dispatch_policy['mode'],'service_class':service_class,
                                 'policy_epoch':dispatch_policy.get('epoch'),'eligibility_basis':basis}
                 if dispatch_policy['mode'] == 'two-class' and request.job_id in dispatch_policy.get('job_overrides', {}):
@@ -1711,6 +1718,7 @@ class GPUQueue:
             run_env.pop('GPU_GREENROOM_CONTEXT',None)
             run_env.pop('GPU_GREENROOM_READY_FD',None)
             run_env.pop('GPU_GREENROOM_RESUME_CHECKPOINT',None)
+            run_env['GPU_GREENROOM_CANCEL_REQUEST'] = str((job_dir/'cancel-request.json').resolve())
             if request.cooperative_checkpoint and (job_env or {}).get('GPU_GREENROOM_RESUME_CHECKPOINT'):
                 if not request.params.get('continuation_of') or not request.params.get('checkpoint_sha256'):
                     state.status=JobStatus.FAILED
@@ -1798,6 +1806,9 @@ class GPUQueue:
 
             if state.status == JobStatus.RUNNING:
                 try:
+                    from .cancellation import read_request as read_cancellation
+                    if read_cancellation(job_dir, state):
+                        raise RuntimeError('Cancelled before workload launch')
                     os.makedirs(request.output_dir, exist_ok=True)
                     if request.performance_window is not None:
                         # Preserve old decisions in performance-deferrals/, but never
@@ -1848,7 +1859,9 @@ class GPUQueue:
                                 pass
                             os.close(ready_write)
                             ready_write=None
-                        state.exit_code = proc.wait(timeout=None if request.performance_window is not None else job_timeout)
+                        from .cancellation import wait as wait_cancellable
+                        state.exit_code = wait_cancellable(self, job_dir, state, proc,
+                            None if request.performance_window is not None else job_timeout)
                         if self._worker_shutdown_requested:
                             raise KeyboardInterrupt
                     if not self._quiesce_owned_child(proc, state.child_process_group):
@@ -1924,12 +1937,13 @@ class GPUQueue:
                             and state.exit_code == performance_window.DEFER_EXIT
                             and not self._worker_shutdown_requested):
                         with self._coordination_lock():
-                            self._defer_performance_job(job_dir, request, state, performance_report, effective_claimant)
-                        self._owned_child = self._owned_process_group = None
-                        for descriptor in (ready_read, ready_write):
-                            if descriptor is not None:
-                                os.close(descriptor)
-                        return True
+                            if read_cancellation(job_dir, state) is None:
+                                self._defer_performance_job(job_dir, request, state, performance_report, effective_claimant)
+                                self._owned_child = self._owned_process_group = None
+                                for descriptor in (ready_read, ready_write):
+                                    if descriptor is not None:
+                                        os.close(descriptor)
+                                return True
                     if not ownership_unresolved and state.failure_phase != 'worker_shutdown':
                         if performance_report['status'] not in {'complete', 'failed', 'cancelled'}:
                             state.status = JobStatus.FAILED
@@ -2065,10 +2079,36 @@ class GPUQueue:
                 "runtime_identity": runtime_identity,
                 "artifact_manifest": artifact_manifest,
             }
-            self._write_json_atomic(job_dir / "receipt.json", receipt)
-
-            if not ownership_unresolved:
-                self._move_job(job_dir, dest_status)
+            # Serialize the final decision with operator admission so an accepted
+            # request cannot disappear between the last read and terminal rename.
+            with self._coordination_lock():
+                from .cancellation import read_request as read_cancellation
+                try:
+                    cancellation_record = read_cancellation(job_dir, state)
+                except (ValueError, TypeError, KeyError, OSError) as error:
+                    cancellation_record = None
+                    receipt['cancellation_error'] = str(error)
+                    if not ownership_unresolved:
+                        state.status, dest_status = JobStatus.FAILED, 'failed'
+                        state.failure_phase, state.error_message = 'cancellation_invalid', str(error)
+                        receipt.update(status='failed', failure_phase=state.failure_phase, error_message=str(error))
+                if cancellation_record:
+                    receipt['cancellation'] = cancellation_record
+                    if not ownership_unresolved:
+                        state.status = JobStatus.CANCELLED
+                        state.failure_phase = 'operator_cancelled'
+                        state.error_message = 'Cancelled by operator; owned process group quiesced'
+                        dest_status = 'cancelled'
+                        final_job_dir = self.queue_dir/dest_status/state.job_id
+                        receipt.update(status='cancelled', failure_phase=state.failure_phase,
+                                       error_message=state.error_message)
+                        for key in ('request_path', 'stdout_path', 'stderr_path', 'managed_context_record'):
+                            if receipt.get(key):
+                                receipt[key] = str(final_job_dir/Path(receipt[key]).name)
+                self._write_text_atomic(job_dir/'status.json', state.to_json())
+                self._write_json_atomic(job_dir / "receipt.json", receipt)
+                if not ownership_unresolved:
+                    self._move_job(job_dir, dest_status)
             if request.performance_window is not None:
                 performance_notice = (final_job_dir, request, receipt)
             if shutdown_exception is not None:

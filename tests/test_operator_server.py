@@ -58,7 +58,7 @@ def _run_operator_browser_witness(tmp_path, scenario, *, responded=False):
 
     queue_dir = tmp_path / "queue"
     queue_dir.mkdir(exist_ok=True)
-    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(queue_dir, "secret", admission_control=True, local_operator=True))
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(queue_dir, "secret", admission_control=True, local_operator=True, job_control=scenario=='job-cancel'))
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     base = f"http://127.0.0.1:{server.server_address[1]}"
@@ -76,6 +76,25 @@ def _run_operator_browser_witness(tmp_path, scenario, *, responded=False):
     }
     smoke_requests = SmokeRequests(queue_dir / "smoke-requests")
     smoke_requests.submit(request)
+    owned_worker = None
+    owned_queue = None
+    if scenario == 'job-cancel':
+        import sys
+        import time
+        owned_queue = GPUQueue(queue_dir)
+        marker = tmp_path/'cancel-browser-started'
+        running = JobRequest(job_type='command', input_path='', job_id='browser-running',
+            agent_id='fixture-running-owner', route_identity='fixture/browser-cancel-running',
+            command_argv=[sys.executable,'-c',f"import signal,time,pathlib; signal.signal(signal.SIGTERM,signal.SIG_IGN); pathlib.Path({str(marker)!r}).touch(); time.sleep(60)"])
+        owned_queue.submit(running)
+        owned_worker = threading.Thread(target=owned_queue.run_one,args=({},))
+        owned_worker.start()
+        until = time.monotonic()+8
+        while not marker.exists() and time.monotonic()<until:
+            time.sleep(.01)
+        assert marker.exists()
+        owned_queue.submit(JobRequest(job_type='command', input_path='', job_id='browser-pending',
+            agent_id='fixture-queued-owner', route_identity='fixture/browser-cancel-pending', command_argv=[sys.executable,'-c','pass']))
     if scenario == 'quick-drag':
         from tests.test_quick_dispatch import policy, submit
         queue = GPUQueue(queue_dir)
@@ -115,7 +134,7 @@ def _run_operator_browser_witness(tmp_path, scenario, *, responded=False):
         report = json.loads(result.stdout.strip().splitlines()[-1])
         assert report["effectiveRoute"] == base
         assert report["effectiveMode"] == "admission-control with disposable request fixture"
-        assert report["apiBehavior"] == ("real authenticated API; injected refresh outage only" if scenario == 'quick-drag' else "real authenticated API" if scenario == 'performance-deferred' else "scenario-specific browser fetch interception")
+        assert report["apiBehavior"] == ("real authenticated API; injected refresh outage only" if scenario == 'quick-drag' else "real authenticated API" if scenario in {'performance-deferred','job-cancel'} else "scenario-specific browser fetch interception")
         assert report["sourceRevision"] == source_identity
         assert report["browser"].startswith("Chrome/")
         assert Path(report["artifact"]).is_file() and Path(report["artifact"]).stat().st_size > 0
@@ -126,6 +145,12 @@ def _run_operator_browser_witness(tmp_path, scenario, *, responded=False):
             assert len(config['action_receipts']) == 4
             assert all(item['service_class'] == 'normal' for item in config['job_overrides'].values())
     finally:
+        if owned_worker is not None:
+            if owned_worker.is_alive() and owned_queue._owned_child is not None:
+                proc = owned_queue._owned_child
+                if proc.poll() is None:
+                    os.killpg(proc.pid,signal.SIGKILL)
+            owned_worker.join(8)
         server.shutdown()
         server.server_close()
         thread.join()

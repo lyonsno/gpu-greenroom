@@ -704,6 +704,12 @@ class SmokeRequests:
                         result['navigation_error'] = action['error']
             if stage == 'pending':
                 result['queue_position'] = dispatch.pending_order(root).index(path)+1
+            if stage == 'running' and (path/'cancel-request.json').exists():
+                from .cancellation import read_request as read_cancellation
+                from .models import JobState
+                cancellation = read_cancellation(path, JobState.from_json(json.dumps(state)))
+                result.update(phase='cancelling', label='Force stop requested; waiting for process exit'
+                    if cancellation['force'] else 'Cancelling; cleanup may still be running', progress=None)
         except (OSError, ValueError, TypeError, KeyError) as error:
             result.update(phase='responded' if record['status'] == 'responded' else 'unknown', progress=None, error=str(error))
         if record['status'] == 'responded':

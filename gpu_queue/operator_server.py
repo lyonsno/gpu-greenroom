@@ -34,6 +34,7 @@ PAGE = r"""<!doctype html>
 .queue-columns{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:28px;margin-top:18px}.queue-column{min-width:0}.column-heading{display:flex;align-items:center;gap:12px;min-height:36px;margin-bottom:14px}.column-heading h2{font:600 17px/1.2 system-ui;margin:0}.column-heading .meta{margin:0}.job-item{border-top:1px solid var(--line);padding:14px 0;overflow-wrap:anywhere}.job-heading{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px}.job-heading strong{font-size:14px}.job-timing{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px 12px;margin:10px 0;color:var(--muted);font-size:12px}.quick{color:var(--blue);border-color:var(--blue)}.job-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:8px}.toolbar button{flex-shrink:0}.delivery-status{color:var(--muted);font-size:12px}.delivery-status.failed,.delivery-status.uncertain{color:var(--amber)}@media(max-width:900px){.queue-columns{grid-template-columns:minmax(0,1fr);gap:24px}.queue-column+ .queue-column{border-top:1px solid var(--line);padding-top:18px}.job-timing{grid-template-columns:minmax(0,1fr)}}
 .queue-columns[data-quick="true"]{grid-template-columns:repeat(3,minmax(0,1fr))}@media(max-width:900px){.queue-columns[data-quick="true"]{grid-template-columns:minmax(0,1fr)}}
 .queue-column.drop-target{outline:2px solid var(--blue);outline-offset:6px}.queue-column[data-drop-class]{min-height:200px}.job-item[draggable="true"]{cursor:grab}.job-item[draggable="true"]:active{cursor:grabbing}.queue-choice{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted);margin-top:10px}.queue-choice select{font:inherit;color:var(--text);background:#25292d;border:1px solid var(--line);border-radius:4px;padding:7px;min-height:34px}
+dialog{width:480px;max-width:calc(100vw - 24px);max-height:calc(100dvh - 24px);overflow:auto;background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:20px}dialog::backdrop{background:#0009}dialog h2{font:600 18px/1.3 system-ui;margin:0 0 14px}dialog p{overflow-wrap:anywhere;white-space:pre-wrap}.dialog-actions{display:flex;justify-content:flex-end;flex-wrap:wrap;gap:10px;margin-top:20px}
 </style>
 </head>
 <body><header><h1>GPU Greenroom</h1><div class="state"><span id="dot" class="dot"></span><span id="queueState">loading</span></div><div class="spacer"></div><button id="pause" title="Pause queue" class="icon">Ⅱ</button><button id="resume" title="Resume queue" class="icon">▶</button><button id="refresh" title="Refresh" class="icon">↻</button></header>
@@ -49,7 +50,7 @@ function reconcileSmokeRun(item){
   if(run){if(!item.display?.run_available||smokeRunVersions.get(id)!==smokeRunVersion(item)){smokeRuns.delete(id);smokeRunVersions.delete(id)}else run.participation=item.response?.participation||'not-recorded'}
   for(const [key,player] of smokeAudio){if(key.startsWith(id+':')&&(!item.display?.run_available||smokeAudioBindings.get(key)!==smokeAudioBinding(item,key.slice(id.length+1)))){player.pause();URL.revokeObjectURL(player.src);smokeAudio.delete(key);smokeAudioBindings.delete(key)}}
 }
-const smokePhases={'awaiting-start':'Awaiting start','waiting-gpu':'Waiting for GPU',deferred:'Reminder deferred',running:'Executing; participation unverified',loading:'Loading',interactive:'Interactive (reported)',preparing:'Preparing',blocked:'Blocked','operator-needed':'Waiting for you','awaiting-response':'Waiting for response',responded:'Feedback saved',failed:'Failed',cancelled:'Cancelled',unknown:'Unverified'};
+const smokePhases={'awaiting-start':'Awaiting start','waiting-gpu':'Waiting for GPU',deferred:'Reminder deferred',cancelling:'Cancelling',running:'Executing; participation unverified',loading:'Loading',interactive:'Interactive (reported)',preparing:'Preparing',blocked:'Blocked','operator-needed':'Waiting for you','awaiting-response':'Waiting for response',responded:'Feedback saved',failed:'Failed',cancelled:'Cancelled',unknown:'Unverified'};
 function smokeDelivery(item){const labels={saved:'Feedback saved locally',queued:'Queued for owner',submitted:'Submitted to owner conversation',consumed:'Owner marked consumed',notified:'Session notification dispatched',failed:'Delivery failed',uncertain:'Delivery uncertain; checking receipt','saved-before-activation':'Saved before automatic return was enabled','not-notified-before-activation':'Session predates notifications','not-notified':'Notification pending',sending:'Delivery in progress'};return Object.entries(item.delivery||{}).map(([kind,value])=>kind==='error'?`<p class="delivery-status failed">Delivery state unavailable: ${esc(value)}</p>`:`<p class="delivery-status ${esc(value.status)}">${kind==='repeat'?'New session request: ':kind==='usable'?'Notification: ':''}${esc(labels[value.status]||'Unverified')}${value.error?' · '+esc(value.error):''}${['failed','saved-before-activation','not-notified-before-activation'].includes(value.status)&&document.body.dataset.readOnly!=='true'?` <button type="button" class="smokeDeliveryRetry" data-id="${esc(item.request.id)}" data-kind="${esc(kind)}" data-event="${esc(value.event_id)}">Retry delivery</button>`:''}</p>`).join('')}
 function smokeProgress(item){const d=item.display||{},p=d.progress;return `<p class="smoke-progress"><strong>${esc(smokePhases[d.phase]||'Unverified')}</strong>${d.queue_position?' · Queue position '+esc(d.queue_position):''}${d.label?' · '+esc(d.label):''}</p>${p?.total?`<div class="smoke-progress"><progress value="${esc(p.completed)}" max="${esc(p.total)}"></progress> ${esc(p.completed)} / ${esc(p.total)} ${esc(p.unit)}</div>`:''}${d.failure_phase?`<p class="meta">Failure phase: ${esc(d.failure_phase)}${d.exit_code!=null?' · Exit '+esc(d.exit_code):''}</p>`:''}${d.error?`<p class="meta">${esc(d.error)}</p>`:''}`}
 function smokeRunView(item){
@@ -87,7 +88,15 @@ for(const [id,serviceClass] of [['automaticQueue','normal'],['quickQueue','quick
 }
 function duration(seconds){if(seconds==null)return 'not recorded';const s=Math.floor(seconds);return s>=3600?`${Math.floor(s/3600)}h ${Math.floor(s%3600/60)}m`:s>=60?`${Math.floor(s/60)}m ${s%60}s`:`${s}s`}
 function nativeActions(j){
-  if(!j?.consistent||last?.read_only||last?.admission_control||document.body.dataset.readOnly==='true')return '';
+  if(!j?.consistent||document.body.dataset.readOnly==='true')return '';
+  if(last?.job_control){
+    if(!['pending','deferred','running'].includes(j.status)||!j.request_digest)return '';
+    if(j.cancellation_error)return '<span class="meta failed">Cancellation unverified</span>';
+    if(j.status==='running'&&!j.worker_capabilities?.includes('job-cancellation.v1'))return '<span class="meta">Cancellation requires worker update</span>';
+    if(j.cancellation)return `<span class="meta">${j.cancellation.force?'Force stop requested':'Cancelling; waiting for process exit'}</span>${j.status==='running'&&!j.cancellation.force?` <button class="danger icon" title="Force stop job" onclick="askCancel('${esc(j.job_id)}',true)">■</button>`:''}`;
+    return `<button class="danger text" title="Cancel job" onclick="askCancel('${esc(j.job_id)}')" ${busy||!queueAvailable?'disabled':''}><span>×</span> Cancel</button>`;
+  }
+  if(last?.read_only||last?.admission_control)return '';
   if(['pending','deferred'].includes(j.status))return `<button class="danger text" title="Cancel queued job" onclick="act('cancel','${esc(j.job_id)}')"><span>×</span> Cancel</button>`;
   if(j.status==='running')return `<button class="danger text" title="Stop running job" onclick="act('terminate','${esc(j.job_id)}')"><span>■</span> Stop</button> <button class="danger icon" title="Force stop running job" onclick="act('kill','${esc(j.job_id)}')">!</button>`;
   return '';
@@ -96,7 +105,7 @@ function performanceWindow(j){
   if(!j.performance_window_reason)return '';
   const p=j.performance_window,labels={waiting:'Waiting for your confirmation',confirmed:'Confirmed; command not started',running:'Measuring',complete:'Command finished',cancelled:'Cancelled before command',failed:'Failed',interrupted:'Interrupted',unverified:'Unverified'};
   const deferred=j.status==='deferred'&&j.performance_deferral;
-  const phase=j.performance_window_error?'Unverified: '+j.performance_window_error:deferred?'Reminder after '+new Date(deferred.deferred_until*1000).toLocaleTimeString()+' · Other work may proceed':p?.status==='deferred'?'Awaiting fresh confirmation':p?(labels[j.performance_window_effective_status||p.status]+(j.performance_window_effective_status==='interrupted'?' · '+(j.failure_phase||j.status):'')):'Confirmation required at dispatch';
+  const phase=j.status==='cancelled'?'Cancelled':j.performance_window_error?'Unverified: '+j.performance_window_error:deferred?'Reminder after '+new Date(deferred.deferred_until*1000).toLocaleTimeString()+' · Other work may proceed':p?.status==='deferred'?'Awaiting fresh confirmation':p?(labels[j.performance_window_effective_status||p.status]+(j.performance_window_effective_status==='interrupted'?' · '+(j.failure_phase||j.status):'')):'Confirmation required at dispatch';
   return '<div class="meta"><strong>Performance measurement: '+esc(phase)+'</strong><br>'+esc(j.performance_window_reason)+(p?'<br>Operator wait: '+duration(p.operator_wait_seconds)+' · Command wall: '+duration(p.command_wall_seconds):'')+'</div>';
 }
 function render(s){
@@ -247,7 +256,21 @@ async function loadSmokeRun(id){if(smokeRunLoads.has(id))return;smokeRunLoads.ad
 async function loadSmokeAudio(button){const id=button.dataset.id,index=button.dataset.index,item=lastSmoke?.items.find(i=>i.request.id===id),binding=smokeAudioBinding(item,index);if(!binding)return;button.disabled=true;try{const r=await request(`/api/smoke-requests/${encodeURIComponent(id)}/audio/${index}`,{headers:{...auth(),'X-Greenroom-Artifact-SHA256':item.presentation.review_artifacts[index].sha256}});if(!r.ok)throw new Error(await r.text());const blob=await r.blob();if(binding!==smokeAudioBinding(lastSmoke?.items.find(i=>i.request.id===id),index))return;const player=document.createElement('audio');player.controls=true;player.preload='metadata';player.src=URL.createObjectURL(blob);smokeAudio.set(id+':'+index,player);smokeAudioBindings.set(id+':'+index,binding);renderSmoke(lastSmoke)}catch(e){err(e.message);button.disabled=false}}
 async function sendSmokeResponse(event){event.preventDefault();const form=event.currentTarget,id=form.dataset.id,button=form.querySelector('button[type="submit"]'),participation=form.querySelector('input[name="participation"]:checked')?.value;let text=form.querySelector('textarea').value;if(participation==='not-tried'&&!text.trim())text="I didn't get to try this session.";if(smokeSubmitting.has(id)||smokeAccepted.has(id))return;smokeSubmitting.add(id);button.disabled=true;try{const r=await request(`/api/smoke-requests/${encodeURIComponent(id)}/response`,{method:'POST',headers:auth(),body:JSON.stringify({text,...(participation?{participation}:{})})});if(!r.ok)throw new Error(await r.text());smokeAccepted.add(id);smokeDrafts.delete(id);await loadSmoke()}catch(e){err(e.message)}finally{smokeSubmitting.delete(id);const current=document.querySelector(`form.smokeReply[data-id="${CSS.escape(id)}"] button[type="submit"]`);if(current)current.disabled=smokeRefreshUnavailable||smokeAccepted.has(id)}}
 async function post(path,body={}){if(busy)return;busy=true;if(last)render(last);try{const r=await request(path,{method:'POST',headers:auth(),body:JSON.stringify({...body,request_id:crypto.randomUUID()})});if(!r.ok)throw new Error(await r.text())}finally{busy=false;await load()}}
-async function act(kind,id){try{if(kind==='cancel')await post('/api/cancel',{job_id:id,requested_by:'operator-console',reason:'operator cancelled pending job'});else await post('/api/terminate',{job_id:id,requested_by:'operator-console',reason:'operator stopped running job',force:kind==='kill'})}catch(e){err(e.message)}}
+let cancelSelection=null,cancelFocus=null;
+function askCancel(id,force=false){
+  const job=last?.jobs.find(j=>j.job_id===id);if(!job||!queueAvailable||busy)return;
+  cancelSelection={job_id:id,request_digest:job.request_digest,expected_status:job.status,expected_started_at:job.started_at??null,force};
+  cancelFocus=document.activeElement;
+  let dialog=document.querySelector('#cancelDialog');
+  if(!dialog){dialog=document.createElement('dialog');dialog.id='cancelDialog';dialog.setAttribute('aria-labelledby','cancelTitle');dialog.innerHTML='<form method="dialog"><h2 id="cancelTitle"></h2><p id="cancelIdentity"></p><p id="cancelEffect"></p><div class="dialog-actions"><button value="back" autofocus>Keep job</button><button id="confirmCancel" class="danger" type="button"></button></div></form>';document.body.append(dialog);dialog.addEventListener('close',()=>{cancelSelection=null;cancelFocus?.focus()});dialog.querySelector('#confirmCancel').onclick=confirmCancel}
+  dialog.querySelector('#cancelTitle').textContent=force?'Force stop this job?':'Cancel this job?';
+  dialog.querySelector('#cancelIdentity').textContent=`${job.job_id}\nDiaulos: ${job.agent_id||'not recorded'}\n${job.requested_route||job.effective_route||job.job_type}\nState: ${job.status}`;
+  dialog.querySelector('#cancelEffect').textContent=force?'Stop the owned process group immediately. Unsaved work may be lost. The queue will wait for confirmed process exit.':job.status==='running'?'Ask this job to stop. Its cleanup can finish before the next job starts. Saved outputs are kept; other jobs and the queue pause state are unchanged.':'Remove this job from the queue without starting it. Saved outputs are kept; other jobs are unchanged.';
+  dialog.querySelector('#confirmCancel').textContent=force?'Force stop':'Cancel job';
+  dialog.showModal();
+}
+async function confirmCancel(){const selection=cancelSelection;if(!selection)return;document.querySelector('#cancelDialog').close();try{await post('/api/job-cancel',selection)}catch(e){err(e.message)}}
+async function act(kind,id){askCancel(id,kind==='kill')}
 document.querySelector('#pause').onclick=()=>post('/api/pause',{requested_by:'operator-console'}).catch(e=>err(e.message));document.querySelector('#resume').onclick=()=>post('/api/resume',{requested_by:'operator-console',epoch:last?.pause_state?.epoch}).catch(e=>err(e.message));document.querySelector('#refresh').onclick=load;document.querySelector('#refreshSmoke').onclick=loadSmoke;bindDropTargets();load();loadSmoke();setInterval(()=>{if(filter==='active')load();loadSmoke()},5000);
 </script></body></html>"""
 
@@ -354,6 +377,12 @@ def queue_snapshot(queue: GPUQueue | Path, view: str = "all", *, read_only: bool
                 except ValueError as error:
                     row['dispatch_error'] = str(error)
             row['queue_position'] = positions.get(row['job_id'])
+            try:
+                from .cancellation import read_request as read_cancellation
+                from .models import JobState
+                row['cancellation'] = read_cancellation(job_dir, JobState.from_json(status_path.read_text())) if (job_dir/'cancel-request.json').exists() else None
+            except (OSError, ValueError, TypeError, KeyError) as error:
+                row['cancellation_error'] = str(error)
             now = time.time()
             submitted, started, finished = (row.get(key) for key in ('submitted_at', 'started_at', 'finished_at'))
             def difference(end, start):
@@ -410,7 +439,8 @@ def queue_snapshot(queue: GPUQueue | Path, view: str = "all", *, read_only: bool
     }
 
 
-def make_handler(queue: GPUQueue | Path, token: str, *, read_only: bool = False, admission_control: bool = False, identity_label: str = 'Agent', local_operator: bool = False):
+def make_handler(queue: GPUQueue | Path, token: str, *, read_only: bool = False, admission_control: bool = False, identity_label: str = 'Agent', local_operator: bool = False, job_control: bool = False):
+    job_control = (job_control or not admission_control) and not read_only
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, _format, *_args):
             return
@@ -533,7 +563,7 @@ def make_handler(queue: GPUQueue | Path, token: str, *, read_only: bool = False,
                 page = page.replace('<body>', f'<body data-read-only="{str(read_only).lower()}" data-identity-label="{html.escape(identity_label, quote=True)}">')
                 page = page.replace('<th class="age">Elapsed</th>', '<th class="age">Timing</th>')
                 page = page.replace('</style>', 'header{min-height:56px;height:auto;flex-wrap:wrap;padding-top:8px;padding-bottom:8px}.age,.ageCell{width:260px}.ageCell{font-size:12px}table{min-width:1000px}.smoke-panel{max-width:1100px;margin:0 0 14px;padding:12px;border:1px solid var(--line);border-radius:6px;background:var(--panel)}.smoke-heading{display:flex;align-items:center;gap:10px;margin:0 0 8px}.smoke-heading h2{font:600 15px/1.2 system-ui;margin:0}.smoke-card{border-top:1px solid var(--line);padding:10px 0}.smoke-card h3{font:600 14px/1.3 system-ui;margin:0 0 4px}.smoke-card p{margin:5px 0;white-space:pre-wrap;overflow-wrap:anywhere}.smoke-card a{color:var(--blue)}.smoke-response{width:100%;min-height:76px;padding:8px;border:1px solid var(--line);border-radius:4px;background:#111315;color:var(--text);font:inherit;resize:vertical}.smoke-actions{display:flex;justify-content:flex-end;margin-top:6px}.smoke-response-copy{border-left:2px solid var(--green);padding-left:9px}@media(max-width:760px){.age,.ageCell{display:table-cell}.state{flex:1;min-width:170px}}\n</style>')
-                if admission_control:
+                if admission_control and not job_control:
                     page = page.replace('<style>', '<style>.actions{display:none!important}')
                 elif read_only:
                     page = page.replace('<h1>GPU Greenroom</h1>', '<h1>GPU Greenroom · Read only</h1>')
@@ -596,6 +626,7 @@ def make_handler(queue: GPUQueue | Path, token: str, *, read_only: bool = False,
                 try:
                     snapshot = queue_snapshot(queue, view, read_only=read_only or admission_control)
                     snapshot['admission_control'] = admission_control
+                    snapshot['job_control'] = job_control and not read_only
                 except ValueError:
                     self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_view"})
                     return
@@ -615,6 +646,21 @@ def make_handler(queue: GPUQueue | Path, token: str, *, read_only: bool = False,
                 self._json(HTTPStatus.FORBIDDEN, {"error": "read_only_monitor"})
                 return
             smoke_route = self._is_smoke_post_path(path)
+            if path == '/api/job-cancel':
+                if not job_control:
+                    self._json(HTTPStatus.FORBIDDEN, {'error': 'job_controls_disabled'})
+                    return
+                try:
+                    body = self._body()
+                    if set(body) != {'job_id', 'request_digest', 'expected_status', 'expected_started_at', 'request_id', 'force'}:
+                        raise ValueError('cancel requires the exact displayed job and attempt identity')
+                    root = queue if isinstance(queue, Path) else queue.queue_dir
+                    result = GPUQueue(root).request_cancel(**body, requested_by='operator-console')
+                except (ValueError, TypeError, KeyError, OSError, RuntimeError) as error:
+                    self._json(HTTPStatus.CONFLICT, {'error': str(error)})
+                    return
+                self._json(HTTPStatus.OK, result)
+                return
             if path == '/api/dispatch-class':
                 try:
                     body = self._body()
@@ -700,10 +746,10 @@ def operator_url(port: int, token: str, *, local_operator: bool = False) -> str:
     return base if local_operator else f"{base}#token={token}"
 
 
-def serve(queue_dir: str | Path, *, port: int = 8765, token: str | None = None, read_only: bool = False, admission_control: bool = False, identity_label: str = 'Agent', local_operator: bool = False):
+def serve(queue_dir: str | Path, *, port: int = 8765, token: str | None = None, read_only: bool = False, admission_control: bool = False, identity_label: str = 'Agent', local_operator: bool = False, job_control: bool = False):
     token = token or secrets.token_urlsafe(32)
     queue = Path(queue_dir) if read_only or admission_control else GPUQueue(queue_dir)
-    server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(queue, token, read_only=read_only, admission_control=admission_control, identity_label=identity_label, local_operator=local_operator))
+    server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(queue, token, read_only=read_only, admission_control=admission_control, identity_label=identity_label, local_operator=local_operator, job_control=job_control))
     effective_port = server.server_address[1]
     adapter = os.environ.get('GPU_GREENROOM_SMOKE_DELIVERY_ADAPTER')
     if adapter and not read_only:
@@ -726,8 +772,9 @@ def main():
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--read-only", action="store_true")
     modes.add_argument("--admission-control", action="store_true")
+    parser.add_argument('--job-control', action='store_true', help='enable exact-job cancellation controls')
     args = parser.parse_args()
-    serve(Path(args.queue_dir).expanduser(), port=args.port, read_only=args.read_only, admission_control=args.admission_control, identity_label=args.identity_label, local_operator=args.local_operator)
+    serve(Path(args.queue_dir).expanduser(), port=args.port, read_only=args.read_only, admission_control=args.admission_control, identity_label=args.identity_label, local_operator=args.local_operator, job_control=args.job_control)
 
 
 if __name__ == "__main__":

@@ -4,6 +4,66 @@ Exhaustive CLI, on-disk layout, job type configuration, receipt schema, and
 failure phases. The [README](../README.md) explains why the system is shaped
 this way; this file is the manual.
 
+## Cancelling Jobs
+
+The operator console offers confirmed cancellation when job controls are enabled
+(`operator --job-control`, also usable with `--admission-control`). The dialog
+names the job, its owner and route. Pending and deferred jobs are removed without
+starting. For a running job, acceptance means **cancelling**, not stopped: the
+worker sends SIGTERM to its own recorded process group and keeps the execution
+mutex until that group is quiescent. Cleanup has no new timer. A separately
+confirmed **Force stop** sends SIGKILL and can lose unsaved work. Existing worker
+cleanup of surviving descendants after the command leader exits still applies.
+An unresolved process group remains in `running/` with `ownership_unknown`;
+neither a cancellation request nor a signal is proof that the GPU is free.
+
+Cancellation preserves saved outputs, other jobs and the current queue pause.
+It affects managed jobs, not external leases. A running worker must advertise
+`job-cancellation.v1`; older workers are explicitly refused rather than silently
+pretending that a request worked. The browser binds confirmation to the displayed
+request digest, status and start timestamp, so a stale dialog cannot cancel a
+later dispatch attempt. Requests have idempotent action receipts under
+`operator-actions/`, with the accepted request and signal progress retained beside
+the job and the final cancellation included in `receipt.json`.
+
+Job authors need no adapter for basic process termination. For graceful Python
+cleanup, install the optional hook once and call its safe point between units:
+
+```python
+from gpu_queue.cancellation import cancellation
+
+with cancellation() as stop:
+    try:
+        for batch in batches:
+            stop.checkpoint()
+            process(batch)
+    finally:
+        save_partial_results()
+        close_resources()
+```
+
+`stop.requested` supports custom control flow; `stop.wait()` supports an idle
+event wait. Managed SIGTERM sets the event; `checkpoint()` raises `Cancelled`
+(a `SystemExit(130)`), running normal `finally` cleanup. The context restores the
+previous handler afterward. Outside a managed worker it leaves signal handling
+unchanged. Install the context from Python's main thread before starting work;
+thread workers can share the returned token. Keep cleanup inside the context.
+
+Other runtimes use their normal SIGTERM handler and `finally`/exit cleanup.
+The worker exports `GPU_GREENROOM_CANCEL_REQUEST`, the absolute path to the
+durable JSON request, for tools that check a file at a safe point. The file is a
+request to stop, not permission to launch a continuation or release the lock.
+For example, a Node runner can set an `AbortController` from
+`process.on('SIGTERM', () => controller.abort())`, then use its signal at async
+boundaries and close resources in `finally`. A new checkpoint continuation should
+not be submitted on cancellation; this is distinct from yielding to queued work.
+
+CLI control uses `cancel JOB` for queued work, `cancel --running JOB` for graceful
+running cancellation and `cancel --force JOB` for explicit force stop. The HTTP
+control is `POST /api/job-cancel` with the existing operator authentication and
+`job_id`, `request_digest`, `expected_status`, `expected_started_at`, `request_id`
+and boolean `force`. It offers no arbitrary PID or command surface.
+
 ## Performance-Sensitive Runs
 
 Use `--performance-window "reason for measurement"` on `submit` or

@@ -90,6 +90,7 @@ class JobState:
     warnings: list[str] = field(default_factory=list)
     dispatch: dict | None = None
     performance_deferral: dict | None = None
+    worker_capabilities: list[str] = field(default_factory=list)
 
     def to_json(self) -> str:
         d = asdict(self)
