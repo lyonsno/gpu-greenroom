@@ -114,6 +114,8 @@ try {
       const frame = await command('Page.captureScreenshot', {format:'png', fromSurface:true});
       writeFileSync(join(artifactDirectory, `${scenario}-${width}.png`), Buffer.from(frame.data, 'base64'));
     }
+    markPhase('owned-browser-shutdown');
+    await command('Browser.close');
     console.log(JSON.stringify({scenario, sourceRevision, effectiveRoute:base, effectiveMode:'admission-control with disposable request fixture', apiBehavior:'real authenticated API', browser:browserVersion.Browser, artifact, assertions:['validated deferral visible', 'reminder time visible', 'existing control boundary preserved', 'desktop and mobile fit']}));
   } else if (scenario === 'browser-entry') {
     const selector=`#smoke-${requestId}`;
