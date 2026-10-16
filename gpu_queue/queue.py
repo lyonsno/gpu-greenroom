@@ -1360,7 +1360,7 @@ class GPUQueue:
         record = json.loads((job_dir / 'performance-defer.json').read_text())
         report = performance_window.read_receipt(job_dir / 'performance-window.json', request)
         digest = hashlib.sha256((job_dir / 'request.json').read_bytes()).hexdigest()
-        if (record.get('schema') != 'gpu-greenroom.performance-deferral.v1'
+        if (not isinstance(record, dict) or record.get('schema') != 'gpu-greenroom.performance-deferral.v1'
                 or record.get('job_id') != request.job_id or record.get('request_sha256') != digest
                 or record.get('performance_window') != report or report['status'] != 'deferred'
                 or record.get('quiescence') != 'confirmed'):

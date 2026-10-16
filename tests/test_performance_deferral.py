@@ -267,3 +267,23 @@ def test_browser_displays_deferred_measurement_in_admission_monitor(tmp_path, mo
     install_prompt(monkeypatch, {'defer_minutes': '5'})
     assert queue.run_one({})
     _run_operator_browser_witness(tmp_path, 'performance-deferred')
+
+
+@pytest.mark.parametrize('malformed', [[], None, 'invalid', 1])
+def test_malformed_deferral_is_held_without_blocking_unrelated_work(tmp_path, monkeypatch, malformed):
+    queue = GPUQueue(tmp_path / 'queue')
+    first = request(tmp_path)
+    queue.submit(first)
+    install_prompt(monkeypatch, {'defer_minutes': '5'})
+    assert queue.run_one({})
+    job = queue.queue_dir / 'deferred' / first.job_id
+    (job / 'performance-defer.json').write_text(json.dumps(malformed))
+    other = JobRequest(job_type='command', input_path='', command_argv=[sys.executable, '-c', 'import time;time.sleep(.1)'])
+    queue.submit(other)
+    assert queue.run_one({})
+    assert queue.get_job(other.job_id).status.value == 'done'
+    assert queue.get_job(first.job_id).status.value == 'deferred'
+    assert (job / 'deferral-error.json').is_file()
+    row = next(row for row in queue_snapshot(queue.queue_dir, 'active', read_only=True)['jobs'] if row['job_id'] == first.job_id)
+    assert row['performance_window_error']
+    assert not list((queue.queue_dir / 'running').iterdir())
