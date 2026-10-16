@@ -106,6 +106,7 @@ try {
     for (const [width, height] of [[1440, 1000], [390, 844]]) {
       await command('Emulation.setDeviceMetricsOverride', {width, height, deviceScaleFactor: 1, mobile: width === 390});
       await evaluate(`document.querySelector('.job-item .pill.deferred').closest('article').scrollIntoView({block:'start'})`);
+      await evaluate(`scrollBy(0,-document.querySelector('header').getBoundingClientRect().height-8)`);
       const state = await evaluate(`(()=>{const node=document.querySelector('.job-item .pill.deferred').closest('article'),button=node.querySelector('button');return {text:node.innerText,cancel:button?.title,enabled:button&&!button.disabled,overflow:document.documentElement.scrollWidth>innerWidth}})()`);
       assert.ok(state.text.includes('Reminder after'), JSON.stringify(state));
       assert.ok(state.text.includes('Other work may proceed'), JSON.stringify(state));
