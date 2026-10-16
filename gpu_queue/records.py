@@ -22,7 +22,7 @@ from pathlib import Path
 
 STATE_DIRS = ("pending", "deferred", "running", "done", "failed", "cancelled")   # the JobStatus values, in lifecycle order
 TERMINAL = ("done", "failed", "cancelled")
-_PRECEDENCE = {"pending": 1, "running": 2, "cancelled": 3, "failed": 4, "done": 5}
+_PRECEDENCE = {"pending": 1, "deferred": 2, "running": 3, "cancelled": 4, "failed": 5, "done": 6}
 RECEIPT_SCHEMA = "gpu-greenroom.gc-receipt.v1"
 
 

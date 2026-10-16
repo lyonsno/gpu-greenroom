@@ -57,7 +57,7 @@ def _run_operator_browser_witness(tmp_path, scenario, *, responded=False):
         pytest.fail('The installed GUI Chrome app must not be used for headless verification')
 
     queue_dir = tmp_path / "queue"
-    queue_dir.mkdir()
+    queue_dir.mkdir(exist_ok=True)
     server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(queue_dir, "secret", admission_control=True, local_operator=True))
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -115,7 +115,7 @@ def _run_operator_browser_witness(tmp_path, scenario, *, responded=False):
         report = json.loads(result.stdout.strip().splitlines()[-1])
         assert report["effectiveRoute"] == base
         assert report["effectiveMode"] == "admission-control with disposable request fixture"
-        assert report["apiBehavior"] == ("real authenticated API; injected refresh outage only" if scenario == 'quick-drag' else "scenario-specific browser fetch interception")
+        assert report["apiBehavior"] == ("real authenticated API; injected refresh outage only" if scenario == 'quick-drag' else "real authenticated API" if scenario == 'performance-deferred' else "scenario-specific browser fetch interception")
         assert report["sourceRevision"] == source_identity
         assert report["browser"].startswith("Chrome/")
         assert Path(report["artifact"]).is_file() and Path(report["artifact"]).stat().st_size > 0

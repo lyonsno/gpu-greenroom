@@ -1080,9 +1080,9 @@ class GPUQueue:
                     for p in self.VOLATILE_PREFIXES)
 
     def _submission_replay_locked(self, request):
-        existing = [self.queue_dir / state / request.job_id
-                    for state in ('pending', 'running', 'done', 'failed', 'cancelled')
-                    if (self.queue_dir / state / request.job_id).exists()]
+        existing = [self.queue_dir / state.value / request.job_id
+                    for state in JobStatus
+                    if (self.queue_dir / state.value / request.job_id).exists()]
         if not existing:
             return None
         if len(existing) != 1:
@@ -1195,8 +1195,8 @@ class GPUQueue:
             if stage.parent.resolve()!=(self.queue_dir/'continuation-staging').resolve():
                 raise ValueError('continuation staging root differs from this queue')
             if not stage.exists():
-                matches=[self.queue_dir/state/stage.name for state in ('pending','running','done','failed','cancelled')
-                         if (self.queue_dir/state/stage.name/'checkpoint-handoff.json').is_file()]
+                matches=[self.queue_dir/state.value/stage.name for state in JobStatus
+                         if (self.queue_dir/state.value/stage.name/'checkpoint-handoff.json').is_file()]
                 if len(matches)==1:
                     stage=matches[0]
                 else:
@@ -1355,7 +1355,8 @@ class GPUQueue:
         jobs=dispatch.pending_order(self.queue_dir,config)
         return jobs[0] if jobs else None
 
-    def _read_performance_deferral(self, job_dir, request):
+    @staticmethod
+    def _read_performance_deferral(job_dir, request):
         record = json.loads((job_dir / 'performance-defer.json').read_text())
         report = performance_window.read_receipt(job_dir / 'performance-window.json', request)
         digest = hashlib.sha256((job_dir / 'request.json').read_bytes()).hexdigest()

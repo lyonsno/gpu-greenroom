@@ -184,3 +184,86 @@ def test_changed_deferred_request_is_held_not_executed(tmp_path, monkeypatch):
     assert (job / 'deferral-error.json').is_file()
     assert not list((queue.queue_dir / 'running').iterdir())
     assert queue.get_job(first.job_id).status.value == 'deferred'
+
+
+def test_linked_operator_smoke_reports_deferral_not_unknown(tmp_path, monkeypatch):
+    from gpu_queue.smoke_requests import SmokeRequests
+    from tests.test_smoke_admission import command, smoke
+    queue = GPUQueue(tmp_path / 'queue')
+    manifest = command(tmp_path)
+    manifest['performance_window'] = 'Measure replay cost'
+    store = SmokeRequests(queue.queue_dir / 'smoke-requests')
+    record, _ = store.submit(smoke(tmp_path, manifest))
+    active = store.start(record['request']['id'], record['request_digest'])
+    install_prompt(monkeypatch, {'defer_minutes': '5'})
+    assert queue.run_one({})
+    shown = store.display(store.get(record['request']['id']))
+    assert shown['phase'] == 'deferred', shown
+    assert shown['job_state'] == 'deferred'
+    assert shown['deferred_until'] > 0
+    assert shown['run_available'] is False
+    assert store.start(record['request']['id'], record['request_digest'])['activation'] == active['activation']
+
+
+def test_submission_replay_preserves_deferred_identity_and_deadline(tmp_path, monkeypatch):
+    queue = GPUQueue(tmp_path / 'queue')
+    first = request(tmp_path)
+    queue.submit(first)
+    install_prompt(monkeypatch, {'defer_minutes': '5'})
+    assert queue.run_one({})
+    job = queue.queue_dir / 'deferred' / first.job_id
+    before = {name: (job / name).read_bytes() for name in ('request.json', 'status.json')}
+    assert queue.submit(first) == job
+    assert not (queue.queue_dir / 'pending' / first.job_id).exists()
+    assert {name: (job / name).read_bytes() for name in before} == before
+    conflicting = JobRequest.from_json(first.to_json())
+    conflicting.route_identity = 'different/route'
+    with pytest.raises(ValueError, match='different request'):
+        queue.submit(conflicting)
+    assert queue.run_one({}) is False
+
+
+@pytest.mark.parametrize('read_only', [False, True])
+def test_path_monitor_reads_deferred_job_without_mutating(tmp_path, monkeypatch, read_only):
+    queue = GPUQueue(tmp_path / 'queue')
+    first = request(tmp_path)
+    queue.submit(first)
+    install_prompt(monkeypatch, {'defer_minutes': '5'})
+    assert queue.run_one({})
+    before = sorted(p.relative_to(queue.queue_dir).as_posix() for p in queue.queue_dir.rglob('*'))
+    snapshot = queue_snapshot(queue.queue_dir, 'active', read_only=read_only)
+    assert snapshot['jobs'][0]['status'] == 'deferred'
+    assert snapshot['jobs'][0]['performance_deferral']['deferred_until'] > 0
+    assert before == sorted(p.relative_to(queue.queue_dir).as_posix() for p in queue.queue_dir.rglob('*'))
+
+
+@pytest.mark.parametrize('empty', [False, True])
+def test_duplicate_record_resolution_includes_deferred_state(tmp_path, monkeypatch, empty):
+    import shutil
+    from gpu_queue.records import load_job_records
+    queue = GPUQueue(tmp_path / 'queue')
+    first = request(tmp_path)
+    queue.submit(first)
+    install_prompt(monkeypatch, {'defer_minutes': '5'})
+    assert queue.run_one({})
+    deferred = queue.queue_dir / 'deferred' / first.job_id
+    pending = queue.queue_dir / 'pending' / first.job_id
+    if empty:
+        pending.mkdir()
+    else:
+        shutil.copytree(deferred, pending)
+    record = load_job_records(queue.queue_dir)[first.job_id]
+    assert record.state_dir == 'deferred'
+    assert record.duplicates == ['pending']
+
+
+def test_browser_displays_deferred_measurement_in_admission_monitor(tmp_path, monkeypatch):
+    import os
+    if not os.environ.get('GREENROOM_CHROME'):
+        pytest.skip('Requires independent Chrome for Testing')
+    from tests.test_operator_server import _run_operator_browser_witness
+    queue = GPUQueue(tmp_path / 'queue')
+    queue.submit(request(tmp_path))
+    install_prompt(monkeypatch, {'defer_minutes': '5'})
+    assert queue.run_one({})
+    _run_operator_browser_witness(tmp_path, 'performance-deferred')

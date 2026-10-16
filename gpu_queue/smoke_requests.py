@@ -288,7 +288,7 @@ class SmokeRequests:
         if not isinstance(job_id, str) or not job_id or not all(c.isalnum() or c in '_-' for c in job_id):
             raise ValueError('linked job identity is missing or invalid')
         root = self.directory.parent
-        paths = [root / stage / job_id for stage in ('pending', 'running', 'done', 'failed', 'cancelled')
+        paths = [root / stage / job_id for stage in ('pending', 'deferred', 'running', 'done', 'failed', 'cancelled')
                  if (root / stage / job_id).is_dir()]
         if len(paths) != 1:
             raise ValueError('linked job is missing or ambiguous')
@@ -425,7 +425,7 @@ class SmokeRequests:
         if not isinstance(job_id, str) or not job_id or not all(c.isalnum() or c in '_-' for c in job_id):
             raise ValueError('invalid running terminal job identity')
         root = self.directory.parent
-        paths = [root / state / job_id for state in ('pending', 'running', 'done', 'failed', 'cancelled')
+        paths = [root / state / job_id for state in ('pending', 'deferred', 'running', 'done', 'failed', 'cancelled')
                  if (root / state / job_id).is_dir()]
         if len(paths) != 1 or paths[0].parent.name != 'running':
             raise ValueError('terminal session needs an unambiguous running linked job')
@@ -575,7 +575,7 @@ class SmokeRequests:
             planned = JobRequest.from_json(json.dumps(plan['job_request']))
             queue = GPUQueue(self.directory.parent)
             existing = [queue.queue_dir / state / planned.job_id
-                        for state in ('pending', 'running', 'done', 'failed', 'cancelled')
+                        for state in ('pending', 'deferred', 'running', 'done', 'failed', 'cancelled')
                         if (queue.queue_dir / state / planned.job_id).is_dir()]
             if existing:
                 if len(existing) != 1:
@@ -656,7 +656,7 @@ class SmokeRequests:
             stage, path, state, job = self._linked_job(record)
             root = self.directory.parent
             if stage != 'done' and record['status'] != 'responded':
-                result['phase'] = {'pending':'waiting-gpu','running':'running',
+                result['phase'] = {'pending':'waiting-gpu','deferred':'deferred','running':'running',
                                    'failed':'failed','cancelled':'cancelled'}[stage]
             result['job_state'] = stage
             result.update(finished_at=state.get('finished_at'), exit_code=state.get('exit_code'),
@@ -673,6 +673,14 @@ class SmokeRequests:
             if record['status'] != 'responded' and stage == 'done' and self.destination(record)['kind'] in {'terminal', 'browser'}:
                 result.update(phase='awaiting-response', label='Last session ended; your experience has not been recorded', progress=None)
             result['started_at'] = state.get('started_at')
+            if stage == 'deferred':
+                from .performance_window import read_receipt
+                reminder = read_receipt(path / 'performance-window.json', JobRequest.from_json(json.dumps(job)))
+                if (reminder['status'] != 'deferred'
+                        or (state.get('performance_deferral') or {}).get('deferred_until') != reminder['deferred_until']):
+                    raise ValueError('Deferred smoke reminder identity conflicts')
+                result.update(deferred_until=reminder['deferred_until'],
+                              label='Measurement deferred; other queued work may proceed')
             application = record.get('application_session')
             if record['status'] != 'responded' and stage == 'running' and application:
                 if (application.get('request_digest') != record['request_digest'] or application.get('job_id') != job['job_id']

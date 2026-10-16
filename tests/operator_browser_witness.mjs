@@ -101,7 +101,21 @@ try {
   writeFileSync(artifact, Buffer.from(initialFrame.data, 'base64'));
   screenshotArtifact = artifact;
 
-  if (scenario === 'browser-entry') {
+  if (scenario === 'performance-deferred') {
+    await eventually(() => evaluate(`Boolean(document.querySelector('.job-item .pill.deferred'))`), Boolean, 'deferred queue render');
+    for (const [width, height] of [[1440, 1000], [390, 844]]) {
+      await command('Emulation.setDeviceMetricsOverride', {width, height, deviceScaleFactor: 1, mobile: width === 390});
+      await evaluate(`document.querySelector('.job-item .pill.deferred').closest('article').scrollIntoView({block:'start'})`);
+      const state = await evaluate(`(()=>{const node=document.querySelector('.job-item .pill.deferred').closest('article'),button=node.querySelector('button');return {text:node.innerText,cancel:button?.title,enabled:button&&!button.disabled,overflow:document.documentElement.scrollWidth>innerWidth}})()`);
+      assert.ok(state.text.includes('Reminder after'), JSON.stringify(state));
+      assert.ok(state.text.includes('Other work may proceed'), JSON.stringify(state));
+      assert.equal(state.cancel, undefined, 'admission-only monitor must keep its existing control boundary');
+      assert.equal(state.overflow, false, 'page must fit the viewport');
+      const frame = await command('Page.captureScreenshot', {format:'png', fromSurface:true});
+      writeFileSync(join(artifactDirectory, `${scenario}-${width}.png`), Buffer.from(frame.data, 'base64'));
+    }
+    console.log(JSON.stringify({scenario, sourceRevision, effectiveRoute:base, effectiveMode:'admission-control with disposable request fixture', apiBehavior:'real authenticated API', browser:browserVersion.Browser, artifact, assertions:['validated deferral visible', 'reminder time visible', 'existing control boundary preserved', 'desktop and mobile fit']}));
+  } else if (scenario === 'browser-entry') {
     const selector=`#smoke-${requestId}`;
     assert.equal(await evaluate(`document.querySelector('${selector} a')===null`),true,'request must not link to itself or open a second application');
     assert.equal(await evaluate(`document.querySelector('${selector} .smokeFocus').disabled`),false);
