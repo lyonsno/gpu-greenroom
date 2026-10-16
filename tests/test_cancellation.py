@@ -404,6 +404,7 @@ with cancellation() as stop:
 @pytest.mark.parametrize('committed', [False,True])
 def test_crash_recovery_cancel_precedes_both_deferral_paths(tmp_path,monkeypatch,committed):
     from gpu_queue import performance_window
+    monkeypatch.setattr(performance_window,'native_notice',lambda *_:None)
     from gpu_queue.operator_server import queue_snapshot
     queue = GPUQueue(tmp_path/'queue')
     request = JobRequest(job_type='command',input_path='',command_argv=[sys.executable,'-c','pass'],
