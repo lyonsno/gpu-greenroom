@@ -48,24 +48,41 @@ def parent_request(queue, job_id):
 def cancel_successor(queue, stage, parent, record):
     """Called under coordination authority for this exact unstarted handoff."""
     state = JobState.from_json((stage/'status.json').read_text())
-    if state.job_id != stage.name:
+    raw = (stage/'request.json').read_bytes()
+    if (state.job_id != stage.name or json.loads(raw).get('params',{}).get('continuation_of')!=parent
+            or state.status not in {JobStatus.PENDING,JobStatus.CANCELLED} or state.started_at is not None):
         raise ValueError('checkpoint successor state identity changed')
-    if state.status == JobStatus.CANCELLED:
-        return stage
-    if state.status != JobStatus.PENDING or state.started_at is not None:
-        raise ValueError('checkpoint successor is no longer unstarted')
     destination = queue.queue_dir/'cancelled'/state.job_id
-    if destination.exists():
+    if destination.exists() and destination!=stage:
         raise ValueError('cancelled successor identity is already present')
-    state.status, state.finished_at = JobStatus.CANCELLED, time.time()
-    state.failure_phase = 'parent_cancelled'
-    state.error_message = f'Checkpoint parent {parent} was cancelled'
-    write_durable(stage/'status.json', json.loads(state.to_json()))
+    identity = {'schema':'gpu-greenroom.checkpoint-cancellation.v1','parent_job_id':parent,
+        'parent_request_digest':record['request_digest'],'parent_started_at':record['expected_started_at'],
+        'job_id':stage.name,'request_sha256':hashlib.sha256(raw).hexdigest()}
+    intent_path = stage/'successor-cancel.json'
+    if intent_path.exists():
+        intent = json.loads(intent_path.read_text())
+        if not isinstance(intent,dict) or any(intent.get(key)!=value for key,value in identity.items()):
+            raise ValueError('successor cancellation intent identity changed')
+    else:
+        if state.status != JobStatus.PENDING:
+            raise ValueError('cancelled successor has no replayable cancellation intent')
+        commit = json.loads((stage/'checkpoint-handoff.json').read_text())
+        if (commit.get('next_request_sha256')!=identity['request_sha256']
+                or commit.get('next_state_sha256')!=hashlib.sha256((stage/'status.json').read_bytes()).hexdigest()):
+            raise ValueError('unstarted successor bytes changed before cancellation')
+        intent = {**identity,'parent_cancellation':record}
+        write_durable(intent_path,intent)
+    if state.status == JobStatus.PENDING:
+        state.status, state.finished_at = JobStatus.CANCELLED, time.time()
+        state.failure_phase = 'parent_cancelled'
+        state.error_message = f'Checkpoint parent {parent} was cancelled'
+        write_durable(stage/'status.json', json.loads(state.to_json()))
     write_durable(stage/'receipt.json', {'job_id':state.job_id,'status':'cancelled',
         'execution_started':False,'finished_at':state.finished_at,'failure_phase':state.failure_phase,
-        'parent_job_id':parent,'parent_cancellation':record})
+        'parent_job_id':parent,'parent_cancellation':intent['parent_cancellation']})
     source_parent = stage.parent
-    stage.rename(destination)
+    if stage!=destination:
+        stage.rename(destination)
     sync_directory(source_parent)
     sync_directory(destination.parent)
     return destination

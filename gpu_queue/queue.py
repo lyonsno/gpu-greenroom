@@ -1218,16 +1218,16 @@ class GPUQueue:
                 raise ValueError('continuation commit or request identity is unverified')
             if stage.parent.name!='continuation-staging':
                 return stage
+            from .cancellation import parent_request, cancel_successor
+            cancelled_parent = parent_request(self, commit['job_id'])
+            if cancelled_parent:
+                return cancel_successor(self,stage,commit['job_id'],cancelled_parent)
             if state.status!=JobStatus.PENDING or state.job_id!=stage.name:
                 raise ValueError('prepared continuation state is unverified')
             if commit.get('next_state_sha256')!=hashlib.sha256((stage/'status.json').read_bytes()).hexdigest():
                 raise ValueError('prepared continuation state changed after registration')
             if self.get_job(request.job_id) is not None:
                 raise ValueError('continuation identity is already admitted')
-            from .cancellation import parent_request, cancel_successor
-            cancelled_parent = parent_request(self, commit['job_id'])
-            if cancelled_parent:
-                return cancel_successor(self,stage,commit['job_id'],cancelled_parent)
             destination=stage.rename(self.queue_dir/'pending'/request.job_id)
             for directory in (destination.parent,self.queue_dir/'continuation-staging'):
                 fd=os.open(directory,os.O_RDONLY)

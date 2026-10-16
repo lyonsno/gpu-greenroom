@@ -437,3 +437,64 @@ def test_crash_recovery_cancel_precedes_both_deferral_paths(tmp_path,monkeypatch
     row = queue_snapshot(queue.queue_dir,'all')['jobs'][0]
     assert row.get('cancellation_error') is None
     assert row['cancellation']['request_id']=='cancel-1'
+
+
+@pytest.mark.parametrize('containment', ['pending','continuation-staging'])
+@pytest.mark.parametrize('interruption', ['receipt','rename'])
+def test_interrupted_successor_cancellation_finishes_before_parent_release(tmp_path,monkeypatch,containment,interruption):
+    from gpu_queue import cancellation
+    queue = GPUQueue(tmp_path/'queue')
+    parent = submit(queue,tmp_path)
+    job = (queue.queue_dir/'pending'/parent.job_id).rename(queue.queue_dir/'running'/parent.job_id)
+    child = subprocess.Popen([sys.executable,'-c','import time; time.sleep(.1)'],start_new_session=True)
+    identity = queue._process_start_identity(child.pid)
+    assert identity
+    child.wait()
+    state = JobState.from_json((job/'status.json').read_text())
+    state.status,state.started_at = JobStatus.RUNNING,123
+    state.worker_pid,state.child_pid,state.child_process_group = 999999,child.pid,child.pid
+    state.child_start_identity,state.worker_capabilities = identity,['job-cancellation.v1']
+    (job/'status.json').write_text(state.to_json())
+    accepted = cancel(queue,parent,status='running',started=123)
+    assert json.loads(Path(accepted['receipt_path']).read_text())['phase']=='completed'
+    successor_request = JobRequest(job_type='command',input_path='',
+        command_argv=[sys.executable,'-c','pass'],params={'continuation_of':parent.job_id})
+    stage = queue.submit(successor_request,_staged=True)
+    checkpoint = tmp_path/'saved-checkpoint'
+    checkpoint.write_text('saved work must survive')
+    commit = {'schema':'gpu-greenroom.checkpoint-handoff.v2','status':'committed',
+        'job_id':parent.job_id,'next_job_id':successor_request.job_id,'checkpoint':str(checkpoint),
+        'next_request_sha256':hashlib.sha256((stage/'request.json').read_bytes()).hexdigest(),
+        'next_state_sha256':hashlib.sha256((stage/'status.json').read_bytes()).hexdigest()}
+    (stage/'checkpoint-handoff.json').write_text(json.dumps(commit))
+    (job/'checkpoint-handoff.json').write_text(json.dumps(commit))
+    successor = stage if containment=='continuation-staging' else stage.rename(queue.queue_dir/'pending'/stage.name)
+    original_write,original_rename = cancellation.write_durable,Path.rename
+    def write(path,payload):
+        if interruption=='receipt' and path==successor/'receipt.json':
+            raise OSError('injected successor receipt interruption')
+        return original_write(path,payload)
+    def rename(path,destination):
+        if interruption=='rename' and path==successor:
+            raise OSError('injected successor rename interruption')
+        return original_rename(path,destination)
+    with monkeypatch.context() as fault:
+        fault.setattr(cancellation,'write_durable',write)
+        fault.setattr(Path,'rename',rename)
+        assert GPUQueue(queue.queue_dir).recover_stale()==[]
+    restarted = GPUQueue(queue.queue_dir)
+    # Exercise continuation recovery before parent recovery for staged state.
+    if containment=='continuation-staging':
+        restarted.recover_continuations()
+    assert restarted.recover_stale()==[parent.job_id]
+    terminal = queue.queue_dir/'cancelled'/successor_request.job_id
+    assert terminal.is_dir()
+    receipt = json.loads((terminal/'receipt.json').read_text())
+    assert receipt['status']=='cancelled' and receipt['execution_started'] is False
+    assert receipt['parent_job_id']==parent.job_id
+    assert restarted.get_job(parent.job_id).status==JobStatus.CANCELLED
+    assert checkpoint.read_text()=='saved work must survive'
+    assert not list((queue.queue_dir/'pending').iterdir())
+    other = submit(queue,tmp_path,'import time; time.sleep(.1)')
+    assert restarted.run_one({})
+    assert restarted.get_job(other.job_id).status==JobStatus.DONE
