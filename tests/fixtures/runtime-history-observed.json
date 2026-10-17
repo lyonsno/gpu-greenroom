@@ -1,0 +1,26 @@
+{
+  "provenance": {
+    "observed_at": "2026-10-16T18:25:22.753236Z",
+    "snapshot_sha256": "e1a9916587f32be4f015a9e2f1114bac9e562318f34fa7163fd0c5373dd2749d",
+    "selection": "Clock/identity fields from actual retained records; command bodies and private paths omitted. Not synthetic GPU timing."
+  },
+  "records": [
+    {
+      "job_id": "4fdcc3528441", "state_dir": "done",
+      "request": {"job_id": "4fdcc3528441", "submitted_at": 1791474663.574731},
+      "state": {"job_id": "4fdcc3528441", "status": "done", "started_at": 1791475268.685219, "finished_at": 1791475282.817182},
+      "receipt": {"job_id": "4fdcc3528441", "status": "done", "exit_code": 0, "started_at": 1791475268.685219, "finished_at": 1791475282.817182, "performance_window": null}
+    },
+    {
+      "job_id": "cb0a65840ee0", "state_dir": "done",
+      "request": {"job_id": "cb0a65840ee0", "submitted_at": 1791996747.775721},
+      "state": {"job_id": "cb0a65840ee0", "status": "done", "started_at": 1791996749.3137438, "finished_at": 1791996763.2448168},
+      "receipt": {"job_id": "cb0a65840ee0", "status": "done", "exit_code": 0, "started_at": 1791996749.3137438, "finished_at": 1791996763.2448168,
+        "performance_window": {"job_id": "cb0a65840ee0", "status": "complete", "workload_started": true, "command_wall_seconds": 0.15263054200113402, "operator_wait_seconds": 13.342743158340454}}
+    },
+    {
+      "job_id": "mac-8step", "state_dir": "done", "request": {}, "state": {},
+      "receipt": {"job_id": "mac-8step", "status": "done", "exit_code": 0, "started_at": 1782935827.058836, "finished_at": 1782935827.058836, "performance_window": null}
+    }
+  ]
+}

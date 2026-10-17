@@ -84,7 +84,7 @@ def _safe_substitute(template: str, mapping: dict) -> str:
 def effective_worker_capabilities() -> frozenset[str]:
     configured = os.environ.get("GPU_GREENROOM_WORKER_CAPABILITIES")
     if configured is None:
-        return DEFAULT_WORKER_CAPABILITIES | {dispatch.CAPABILITY,dispatch.OVERRIDE_CAPABILITY,'structured-command.v2','checkpoint-continuation.v1',admission.CAPABILITY,performance_window.CAPABILITY,'job-cancellation.v1'}
+        return DEFAULT_WORKER_CAPABILITIES | {dispatch.CAPABILITY,dispatch.OVERRIDE_CAPABILITY,'structured-command.v2','checkpoint-continuation.v1',admission.CAPABILITY,performance_window.CAPABILITY,'job-cancellation.v1',dispatch.HISTORY_CAPABILITY}
     return frozenset(
         capability.strip()
         for capability in configured.split(",")
@@ -1111,6 +1111,11 @@ class GPUQueue:
         """
         if type(request.cooperative_checkpoint) is not bool:
             raise ValueError('cooperative_checkpoint must be a boolean')
+        if request.runtime_profile is not None:
+            from .runtime_history import identity, CAPABILITY
+            identity(request,request.runtime_profile)
+            if CAPABILITY not in request.required_worker_capabilities:
+                request.required_worker_capabilities.append(CAPABILITY)
         if request.performance_window is not None:
             if not isinstance(request.performance_window, str) or not request.performance_window.strip():
                 raise ValueError('performance_window must be a nonblank reason')
@@ -1145,9 +1150,9 @@ class GPUQueue:
                 existing = self._submission_replay_locked(request)
                 if existing:
                     return existing
-                dispatch.classify(json.loads(request.to_json()), dispatch.policy(self.queue_dir))
+                dispatch.classify(json.loads(request.to_json()), dispatch.policy(self.queue_dir),queue_dir=self.queue_dir)
         else:
-            dispatch.classify(json.loads(request.to_json()), dispatch.policy(self.queue_dir))
+            dispatch.classify(json.loads(request.to_json()), dispatch.policy(self.queue_dir),queue_dir=self.queue_dir)
 
         staging_root = self.queue_dir / 'submission-staging'
         staging_root.mkdir(exist_ok=True)
@@ -1313,8 +1318,8 @@ class GPUQueue:
                 current=dispatch.policy(self.queue_dir)
             except (ValueError,OSError):
                 current={}
-            if current.get('schema') == dispatch.OVERRIDE_SCHEMA:
-                value = {**value, 'schema': dispatch.OVERRIDE_SCHEMA,
+            if current.get('schema') in (dispatch.OVERRIDE_SCHEMA,dispatch.HISTORY_SCHEMA):
+                value = {**value, 'schema': dispatch.HISTORY_SCHEMA if value.get('runtime_history') is not None else dispatch.OVERRIDE_SCHEMA,
                          'job_overrides': current.get('job_overrides', {}),
                          'action_receipts': current.get('action_receipts', {})}
             fields={key:item for key,item in current.items() if key not in {'epoch','owner','configured_at'}}
@@ -1354,7 +1359,7 @@ class GPUQueue:
             if digest != request_digest:
                 raise ValueError('pending request digest changed; refresh the queue')
             # Classification and its retry receipt share one fsynced commit point.
-            updated = {**config, 'schema': dispatch.OVERRIDE_SCHEMA,
+            updated = {**config, 'schema': dispatch.HISTORY_SCHEMA if config.get('runtime_history') is not None else dispatch.OVERRIDE_SCHEMA,
                        'job_overrides': {**config.get('job_overrides', {}), job_id: receipt},
                        'action_receipts': {**config.get('action_receipts', {}), request_id: receipt}}
             dispatch.atomic_write(self.queue_dir / 'dispatch-policy.json', dispatch.validate(updated))
@@ -1580,7 +1585,9 @@ class GPUQueue:
                     dispatch_policy=dispatch.policy(self.queue_dir)
                     if dispatch_policy['mode']=='two-class' and dispatch.CAPABILITY not in effective_claimant.get('capabilities',[]):
                         return False
-                    if dispatch_policy['schema'] == dispatch.OVERRIDE_SCHEMA and dispatch.OVERRIDE_CAPABILITY not in effective_claimant.get('capabilities', []):
+                    if dispatch_policy['schema'] in (dispatch.OVERRIDE_SCHEMA,dispatch.HISTORY_SCHEMA) and dispatch.OVERRIDE_CAPABILITY not in effective_claimant.get('capabilities', []):
+                        return False
+                    if dispatch_policy['schema'] == dispatch.HISTORY_SCHEMA and dispatch.HISTORY_CAPABILITY not in effective_claimant.get('capabilities', []):
                         return False
                     job_dir = self._next_pending(dispatch_policy)
                 except (ValueError,KeyError,TypeError,OSError) as error:
@@ -1594,7 +1601,7 @@ class GPUQueue:
                 raw_request, request_digest = dispatch.read_request(job_dir / 'request.json')
                 request = JobRequest.from_json(json.dumps(raw_request))
                 try:
-                    service_class,basis=dispatch.classify(raw_request,dispatch_policy,request_digest=request_digest)
+                    service_class,basis=dispatch.classify(raw_request,dispatch_policy,request_digest=request_digest,queue_dir=self.queue_dir)
                 except ValueError as error:
                     dispatch.atomic_write(self.queue_dir/'dispatch-error.json',
                         {'schema':'gpu-greenroom.dispatch-error.v1','phase':'dispatch-policy','error':str(error),
@@ -1758,13 +1765,23 @@ class GPUQueue:
                 else:
                     run_env['GPU_GREENROOM_RESUME_CHECKPOINT']=job_env['GPU_GREENROOM_RESUME_CHECKPOINT']
 
+            from .runtime_history import generation
+            history_generation_before = generation(self.queue_dir)
             # Evidence-custody preflight: attest the input source and probe the
             # runtime before anything touches output_dir.
             input_artifact = None
             source_attestation = None
             runtime_identity = None
             artifact_manifest = None
+            profile_observation = None
             dest_status = "failed"
+            if state.status == JobStatus.RUNNING and request.runtime_profile is not None:
+                from .runtime_history import capture
+                try:
+                    profile_observation = capture(request,cmd,job_cwd)
+                except (ValueError,TypeError,KeyError,OSError) as error:
+                    state.status,state.failure_phase,state.exit_code = JobStatus.FAILED,'runtime_profile_preflight',-1
+                    state.error_message = str(error)
 
             if source_attestation_mode not in (None, "git-clean-input"):
                 state.status = JobStatus.FAILED
@@ -2020,6 +2037,12 @@ class GPUQueue:
                     state.exit_code = -1
                     dest_status = "failed"
 
+            if profile_observation is not None:
+                from .runtime_history import identity
+                try:
+                    profile_observation['source_unchanged'] = identity(request,request.runtime_profile) == profile_observation['key']
+                except (ValueError,TypeError,KeyError,OSError) as error:
+                    profile_observation['error'] = str(error)
             state.finished_at = None if ownership_unresolved else time.time()
 
             # Metadata must exist before terminal artifacts are hashed.
@@ -2107,6 +2130,7 @@ class GPUQueue:
                 "input_artifact": input_artifact,
                 "source_attestation": source_attestation,
                 "runtime_identity": runtime_identity,
+                "runtime_profile_observation": profile_observation,
                 "artifact_manifest": artifact_manifest,
             }
             # Serialize the final decision with operator admission so an accepted
@@ -2151,6 +2175,15 @@ class GPUQueue:
                 self._write_json_atomic(job_dir / "receipt.json", receipt)
                 if not ownership_unresolved:
                     self._move_job(job_dir, dest_status)
+            if dispatch_policy.get('runtime_history'):
+                from .runtime_history import record_completion
+                try:
+                    record_completion(self.queue_dir,dispatch_policy['runtime_history']['index'],final_job_dir,history_generation_before)
+                except Exception as error:
+                    # A stale generation disables empirical Quick classification;
+                    # cache failure never hides a completed workload's receipt.
+                    self._write_json_atomic(self.queue_dir/'runtime-history-error.json',
+                        {'job_id':request.job_id,'error':str(error),'at':time.time()})
             if request.performance_window is not None:
                 performance_notice = (final_job_dir, request, receipt)
             if shutdown_exception is not None:

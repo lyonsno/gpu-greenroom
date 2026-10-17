@@ -15,6 +15,8 @@ CAPABILITY = 'two-class-dispatch.v1'
 SCHEMA = 'gpu-greenroom.dispatch-policy.v1'
 OVERRIDE_SCHEMA = 'gpu-greenroom.dispatch-policy.v2'
 OVERRIDE_CAPABILITY = 'operator-dispatch-override.v1'
+HISTORY_SCHEMA = 'gpu-greenroom.dispatch-policy.v3'
+HISTORY_CAPABILITY = 'runtime-profile.v1'
 
 
 def validate_override(value):
@@ -64,7 +66,7 @@ def atomic_write(path, payload):
 
 
 def validate(value):
-    if not isinstance(value,dict) or value.get('schema') not in (SCHEMA, OVERRIDE_SCHEMA) or not isinstance(value.get('mode'),str) or value['mode'] not in {'fifo','two-class'}:
+    if not isinstance(value,dict) or value.get('schema') not in (SCHEMA, OVERRIDE_SCHEMA,HISTORY_SCHEMA) or not isinstance(value.get('mode'),str) or value['mode'] not in {'fifo','two-class'}:
         raise ValueError('invalid dispatch policy schema or mode')
     for key in ('quick_job_types','quick_routes'):
         rules=value.get(key,{})
@@ -72,6 +74,19 @@ def validate(value):
                                            or not isinstance(basis,str) or not basis.strip() for name,basis in rules.items()):
             raise ValueError('quick eligibility needs exact names and nonblank evidence references')
     overrides, receipts = value.get('job_overrides', {}), value.get('action_receipts', {})
+    history = value.get('runtime_history')
+    if history is not None:
+        if value['schema'] != HISTORY_SCHEMA or not isinstance(history,dict):
+            raise ValueError('runtime history requires v3 dispatch policy')
+        if not isinstance(history.get('index'),str) or not Path(history['index']).is_absolute() or not isinstance(history.get('profiles'),dict):
+            raise ValueError('runtime history requires an absolute index and explicit profiles')
+        for name, rule in history['profiles'].items():
+            if (not isinstance(name,str) or not name.strip() or not isinstance(rule,dict)
+                    or type(rule.get('minimum_samples')) is not int or rule['minimum_samples'] < 1
+                    or type(rule.get('max_seconds')) not in (int,float) or not math.isfinite(rule['max_seconds']) or rule['max_seconds'] <= 0
+                    or not isinstance(rule.get('profile_digest'),str) or not re.fullmatch(r'[a-f0-9]{64}',rule['profile_digest'])
+                    or not isinstance(rule.get('evidence'),str) or not rule['evidence'].strip()):
+                raise ValueError('runtime history rule requires samples, threshold and evidence')
     if value['schema'] == SCHEMA and (overrides or receipts):
         raise ValueError('dispatch overrides require v2 policy and worker capability')
     if not isinstance(overrides, dict) or not isinstance(receipts, dict):
@@ -92,7 +107,7 @@ def policy(root):
         return {'schema':SCHEMA,'mode':'fifo','quick_job_types':{},'quick_routes':{}}
 
 
-def classify(request, config, *, request_digest=None):
+def classify(request, config, *, request_digest=None, queue_dir=None):
     if not isinstance(request,dict):
         raise ValueError('job request must be an object')
     declared=request.get('service_class')
@@ -106,6 +121,19 @@ def classify(request, config, *, request_digest=None):
     basis = (config['quick_routes'].get(request.get('route_identity')) if request.get('command_argv') is not None
              else config['quick_job_types'].get(request.get('job_type')))
     eligible=config['mode']=='two-class' and bool(basis)
+    profile = request.get('runtime_profile')
+    history = config.get('runtime_history')
+    if (not eligible and declared != 'normal' and config['mode']=='two-class' and isinstance(profile,dict)
+            and history and queue_dir is not None and profile.get('name') in history['profiles']):
+        from .runtime_history import estimate, definition_digest
+        from .models import JobRequest
+        rule = history['profiles'][profile['name']]
+        result = (estimate(queue_dir,history['index'],JobRequest.from_json(json.dumps(request)),profile,
+                          minimum_samples=rule['minimum_samples'],max_seconds=rule['max_seconds'])
+                  if definition_digest(profile) == rule['profile_digest'] else {'eligible':False})
+        if result['eligible']:
+            eligible = True
+            basis = 'runtime-history:' + result['profile_key'] + '; samples=' + str(result['samples'])
     if declared=='quick' and not eligible:
         raise ValueError('requested quick class is not admitted by the current dispatch policy')
     return ('quick' if eligible and declared!='normal' else 'normal'),basis
@@ -140,7 +168,7 @@ def pending_order(root, config=None):
         request, digest = read_request(path/'request.json')
         if not isinstance(request, dict) or request.get('job_id') != path.name:
             raise ValueError('pending request identity is unverified')
-        (quick if classify(request,config,request_digest=digest)[0]=='quick' else normal).append(path)
+        (quick if classify(request,config,request_digest=digest,queue_dir=root)[0]=='quick' else normal).append(path)
     result=[]
     previous=last_class(root)
     while normal or quick:

@@ -55,6 +55,7 @@ class JobRequest:
     service_class: str | None = None
     cooperative_checkpoint: bool = False
     performance_window: str | None = None
+    runtime_profile: dict | None = None
     job_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     submitted_at: float = field(default_factory=time.time)
 

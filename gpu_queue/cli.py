@@ -244,6 +244,7 @@ def _command_payload(args):
         "cooperative_checkpoint": payload['cooperative_checkpoint'],
         "preflight": payload['preflight'],
         "performance_window": payload.get('performance_window'),
+        "runtime_profile": payload.get('runtime_profile'),
     }
 
 
@@ -277,7 +278,7 @@ def cmd_submit_command(args):
         print(json.dumps(report, indent=2), file=sys.stderr)
         sys.exit(2)
 
-    if payload['command_schema'] == 'gpu-greenroom.command.v3':
+    if payload['command_schema'] == 'gpu-greenroom.command.v3' or (payload['command_schema'] == 'gpu-greenroom.command.v4' and payload['preflight'] is not None):
         try:
             plan = admission.prepare(queue, {**payload, 'schema': payload['command_schema']})
             job_dir = admission.submit_prepared(queue, plan)
@@ -306,8 +307,9 @@ def cmd_submit_command(args):
         service_class=payload['service_class'],
         cooperative_checkpoint=payload['cooperative_checkpoint'],
         performance_window=payload.get('performance_window'),
+        runtime_profile=payload.get('runtime_profile'),
     )
-    if payload['command_schema']=='gpu-greenroom.command.v2':
+    if payload['command_schema'] in ('gpu-greenroom.command.v2','gpu-greenroom.command.v4'):
         request.required_worker_capabilities.append('structured-command.v2')
     try:
         job_dir = queue.submit(request)
@@ -802,6 +804,22 @@ def cmd_lineage(args):
         print(lineage_mod.render_text(graph))
 
 
+def cmd_history(args):
+    from . import runtime_history
+    if args.history_action == 'refresh':
+        result = runtime_history.refresh(args.queue_dir, args.index)
+    else:
+        if not args.manifest:
+            raise ValueError('history estimate requires --manifest')
+        payload = admission.normalize_manifest(json.loads(Path(args.manifest).read_text()))
+        request = JobRequest(job_type='command', input_path='', command_argv=payload['argv'],
+            command_cwd=payload['cwd'], command_env=payload['env'], output_dir=payload['output_dir'],
+            repo_root=payload['repo_root'])
+        result = runtime_history.estimate(args.queue_dir,args.index,request,payload.get('runtime_profile'),
+            minimum_samples=args.minimum_samples,max_seconds=args.max_seconds)
+    print(json.dumps(result,indent=2))
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="gpu-greenroom",
@@ -818,6 +836,13 @@ def main():
     )
 
     sub = parser.add_subparsers(dest="command")
+    p_history = sub.add_parser('history', help='Read-only compatible command runtime history')
+    p_history.add_argument('history_action', choices=['refresh','estimate'])
+    p_history.add_argument('--index', required=True)
+    p_history.add_argument('--manifest', help='Existing command.v2/v3 manifest with runtime_profile')
+    p_history.add_argument('--minimum-samples', type=int, default=3)
+    p_history.add_argument('--max-seconds', type=float, default=30)
+    p_history.set_defaults(func=cmd_history)
 
     # submit
     p_submit = sub.add_parser("submit", help="Submit a job")

@@ -15,6 +15,35 @@ from .models import JobState
 from .cancellation import read_request as read_cancellation
 
 
+def run_units(units, *, perform, quiesce, continuation, on_submitted):
+    """Resume a finite JSON-described case list at completed-unit boundaries.
+
+    ``perform`` returns a durable result descriptor. Producer callbacks own GPU
+    synchronization/release and completion registration, not this loop helper.
+    """
+    from .cancellation import cancellation
+    digest = hashlib.sha256(json.dumps(units,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+    saved = load_checkpoint()
+    state = saved or {'unit_list_sha256':digest,'next_unit':0,'results':[]}
+    if (state.get('unit_list_sha256') != digest or type(state.get('next_unit')) is not int
+            or not 0 <= state['next_unit'] <= len(units) or not isinstance(state.get('results'),list)
+            or len(state['results']) != state['next_unit']):
+        raise ValueError('finite-unit checkpoint does not match this batch')
+    with cancellation() as stop:
+        for index in range(state['next_unit'],len(units)):
+            stop.checkpoint()
+            result = perform(units[index])
+            # Check serializability before acknowledging the unit in a handoff.
+            json.dumps(result)
+            state['results'].append(result)
+            state['next_unit'] = index+1
+            stop.checkpoint()
+            if index+1 < len(units):
+                yield_if_requested(save_checkpoint=lambda directory:state,quiesce=quiesce,
+                    continuation=continuation,on_submitted=on_submitted)
+    return state['results']
+
+
 def _context():
     path=os.environ.get('GPU_GREENROOM_CONTEXT')
     if not path:
@@ -76,7 +105,7 @@ def yield_if_requested(*,save_checkpoint,quiesce,continuation,on_submitted=None)
     config=dispatch.policy(queue.queue_dir)
     pending=dispatch.pending_order(queue.queue_dir,config)
     pending_request, pending_digest = dispatch.read_request(pending[0]/'request.json') if pending else (None, None)
-    quick_waiting=bool(pending and dispatch.classify(pending_request,config,request_digest=pending_digest)[0]=='quick')
+    quick_waiting=bool(pending and dispatch.classify(pending_request,config,request_digest=pending_digest,queue_dir=queue.queue_dir)[0]=='quick')
     if not queue.is_paused() and (state.get('dispatch',{}).get('service_class')!='normal' or not quick_waiting):
         return False
     directory=queue.queue_dir/'outputs'/request.job_id/'checkpoints'

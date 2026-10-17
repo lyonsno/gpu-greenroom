@@ -1,5 +1,9 @@
 # Quick Dispatch And Cooperative Checkpoints
 
+Compatible empirical profile admission and the finite-case adapter are described
+in [Runtime History](runtime-history.md). Those opt-in profiles use dispatch
+policy v3; the existing exact-route and manual-choice contracts below remain.
+
 FIFO remains the default. Optional two-class dispatch uses the existing worker,
 execution flock, pause and lease checks. Each class is FIFO. When both classes
 have pending work, a quick job gets one turn, followed by a normal job. A stream

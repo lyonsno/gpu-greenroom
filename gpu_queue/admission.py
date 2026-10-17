@@ -34,6 +34,8 @@ def request_identity(request):
     # Preserve hashes of jobs prepared before the optional performance contract.
     if value.get('performance_window') is None:
         value.pop('performance_window', None)
+    if value.get('runtime_profile') is None:
+        value.pop('runtime_profile', None)
     value['params'].pop(DIGEST_PARAM, None)
     return digest(value)
 
@@ -115,22 +117,22 @@ def normalize_manifest(value):
     if unsupported:
         raise ValueError('unsupported command authority fields: ' + ', '.join(sorted(unsupported)))
     schema = payload.get('schema')
-    if schema not in {'gpu-greenroom.command.v1', 'gpu-greenroom.command.v2', 'gpu-greenroom.command.v3'}:
-        raise ValueError('command manifest schema must be gpu-greenroom.command.v1, v2 or v3')
+    if schema not in {'gpu-greenroom.command.v1', 'gpu-greenroom.command.v2', 'gpu-greenroom.command.v3','gpu-greenroom.command.v4'}:
+        raise ValueError('command manifest schema must be gpu-greenroom.command.v1, v2, v3 or v4')
     performance = payload.get('performance_window')
     if performance is not None and (schema == 'gpu-greenroom.command.v1'
             or not isinstance(performance, str) or not performance.strip()):
         raise ValueError('performance_window requires command.v2 or v3 and a nonblank reason')
     preflight = payload.get('preflight')
-    if 'preflight' in payload and schema != 'gpu-greenroom.command.v3':
-        raise ValueError('preflight requires gpu-greenroom.command.v3')
+    if 'preflight' in payload and schema not in ('gpu-greenroom.command.v3','gpu-greenroom.command.v4'):
+        raise ValueError('preflight requires gpu-greenroom.command.v3 or v4')
     service_class = payload.get('service_class')
     if service_class is not None and (schema == 'gpu-greenroom.command.v1' or service_class not in {'normal', 'quick'}):
         raise ValueError('service_class requires command.v2 or v3 and must be normal or quick')
     cooperative = payload.get('cooperative_checkpoint', False)
     if type(cooperative) is not bool or cooperative and schema == 'gpu-greenroom.command.v1':
         raise ValueError('cooperative_checkpoint requires command.v2 or v3 and a boolean')
-    if cooperative and schema == 'gpu-greenroom.command.v3':
+    if cooperative and (schema == 'gpu-greenroom.command.v3' or preflight is not None):
         raise ValueError('command.v3 cooperative continuation requires successor validation support; use the separate command.v2 checkpoint contract')
     owner = payload.get('agent_id')
     if owner is not None and (not isinstance(owner, str) or not owner.strip()):
@@ -177,6 +179,11 @@ def normalize_manifest(value):
         for path in preflight['inputs']:
             if not Path(path).is_file():
                 raise ValueError(f'preflight input is missing or not a file: {path}')
+    if payload.get('runtime_profile') is not None:
+        if schema != 'gpu-greenroom.command.v4':
+            raise ValueError('runtime_profile requires command.v4; old CLIs must reject rather than discard it')
+        if not isinstance(payload['runtime_profile'],dict):
+            raise ValueError('runtime_profile must be an object')
     return {**payload, 'output_dir': output, 'timeout': timeout,
             'service_class': service_class, 'cooperative_checkpoint': cooperative, 'preflight': preflight}
 
@@ -190,8 +197,8 @@ def prepare(queue, manifest):
         dispatch.atomic_write(receipt, {'schema': SCHEMA, 'valid': False, 'phase': 'input-normalization',
             'validated_at': time.time(), 'gpu_execution_authority': False, 'error': str(error)})
         raise ValueError(f'{error}; validation receipt: {receipt}') from error
-    if payload['schema'] != 'gpu-greenroom.command.v3':
-        raise ValueError('prepared commands require gpu-greenroom.command.v3')
+    if payload['schema'] not in ('gpu-greenroom.command.v3','gpu-greenroom.command.v4'):
+        raise ValueError('prepared commands require gpu-greenroom.command.v3 or v4')
     capabilities = ['structured-command.v1', 'structured-command.v2', CAPABILITY]
     if payload['service_class'] == 'quick':
         capabilities.append(dispatch.CAPABILITY)
@@ -204,12 +211,13 @@ def prepare(queue, manifest):
                          output_class=payload.get('output_class'), route_identity=payload['route_identity'],
                          service_class=payload['service_class'], cooperative_checkpoint=payload['cooperative_checkpoint'],
                          performance_window=payload.get('performance_window'),
+                         runtime_profile=payload.get('runtime_profile'),
                          required_worker_capabilities=capabilities)
     if request.performance_window:
         request.required_worker_capabilities.append('performance-window.v1')
     if not request.output_dir:
         request.output_dir = str(queue.queue_dir / 'outputs' / request.job_id)
-    dispatch.classify(json.loads(request.to_json()), dispatch.policy(queue.queue_dir))
+    dispatch.classify(json.loads(request.to_json()), dispatch.policy(queue.queue_dir),queue_dir=queue.queue_dir)
     report = validate(queue, request, payload['preflight'])
     request.params[DIGEST_PARAM] = digest(report)
     return {'schema': PLAN_SCHEMA, 'prepared_at': time.time(),

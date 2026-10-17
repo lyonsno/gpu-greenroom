@@ -372,7 +372,7 @@ def queue_snapshot(queue: GPUQueue | Path, view: str = "all", *, read_only: bool
                         row['dispatch_class'], row['dispatch_basis'] = observed['service_class'], observed.get('eligibility_basis')
                         row['dispatch_source'] = 'native-dispatch-receipt'
                     else:
-                        row['dispatch_class'], row['dispatch_basis'] = dispatch.classify(request, config, request_digest=digest)
+                        row['dispatch_class'], row['dispatch_basis'] = dispatch.classify(request, config, request_digest=digest,queue_dir=queue_dir)
                         row['dispatch_source'] = 'current-policy-projection'
                         row['dispatch_override'] = config.get('job_overrides', {}).get(row['job_id'])
                 except ValueError as error:
