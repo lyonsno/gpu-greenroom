@@ -291,26 +291,7 @@ def cmd_submit_command(args):
                           'request_path': str(job_dir / 'request.json'), 'output_dir': request.output_dir,
                           'validation': plan['validation'], 'required_worker_capabilities': request.required_worker_capabilities}, indent=2))
         return
-    request = JobRequest(
-        job_type="command",
-        input_path="",
-        output_dir=payload["output_dir"],
-        agent_id=payload["agent_id"],
-        repo_root=payload["repo_root"],
-        command_argv=payload["argv"],
-        command_cwd=payload["cwd"],
-        command_env=payload["env"],
-        route_identity=payload["route_identity"],
-        command_timeout=payload["timeout"],
-        output_class=payload["output_class"],
-        required_worker_capabilities=[STRUCTURED_COMMAND_CAPABILITY],
-        service_class=payload['service_class'],
-        cooperative_checkpoint=payload['cooperative_checkpoint'],
-        performance_window=payload.get('performance_window'),
-        runtime_profile=payload.get('runtime_profile'),
-    )
-    if payload['command_schema'] in ('gpu-greenroom.command.v2','gpu-greenroom.command.v4'):
-        request.required_worker_capabilities.append('structured-command.v2')
+    request = admission.command_request(payload)
     try:
         job_dir = queue.submit(request)
     except (ValueError,OSError) as error:
@@ -812,9 +793,7 @@ def cmd_history(args):
         if not args.manifest:
             raise ValueError('history estimate requires --manifest')
         payload = admission.normalize_manifest(json.loads(Path(args.manifest).read_text()))
-        request = JobRequest(job_type='command', input_path='', command_argv=payload['argv'],
-            command_cwd=payload['cwd'], command_env=payload['env'], output_dir=payload['output_dir'],
-            repo_root=payload['repo_root'])
+        request = admission.command_request(payload)
         result = runtime_history.estimate(args.queue_dir,args.index,request,payload.get('runtime_profile'),
             minimum_samples=args.minimum_samples,max_seconds=args.max_seconds)
     print(json.dumps(result,indent=2))

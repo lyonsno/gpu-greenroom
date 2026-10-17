@@ -188,6 +188,32 @@ def normalize_manifest(value):
             'service_class': service_class, 'cooperative_checkpoint': cooperative, 'preflight': preflight}
 
 
+def command_request(payload, *, prepared=False):
+    """One manifest-to-request mapping for submission, preparation and forecasts."""
+    schema = payload.get('schema',payload.get('command_schema'))
+    capabilities = ['structured-command.v1']
+    if schema != 'gpu-greenroom.command.v1':
+        capabilities.append('structured-command.v2')
+    if prepared:
+        capabilities.append(CAPABILITY)
+    if payload.get('service_class') == 'quick':
+        capabilities.append(dispatch.CAPABILITY)
+    if payload.get('cooperative_checkpoint'):
+        capabilities.append('checkpoint-continuation.v1')
+    if payload.get('runtime_profile') is not None:
+        from .runtime_history import CAPABILITY as PROFILE_CAPABILITY
+        capabilities.append(PROFILE_CAPABILITY)
+    if payload.get('performance_window') is not None:
+        capabilities.append('performance-window.v1')
+    return JobRequest(job_type='command',input_path='',agent_id=payload.get('agent_id'),
+        repo_root=payload['repo_root'],command_cwd=payload['cwd'],command_argv=payload['argv'],
+        command_env=payload.get('env'),command_timeout=payload.get('timeout'),output_dir=payload.get('output_dir',''),
+        output_class=payload.get('output_class'),route_identity=payload['route_identity'],
+        service_class=payload.get('service_class'),cooperative_checkpoint=payload.get('cooperative_checkpoint',False),
+        performance_window=payload.get('performance_window'),runtime_profile=payload.get('runtime_profile'),
+        required_worker_capabilities=capabilities)
+
+
 def prepare(queue, manifest):
     try:
         payload = normalize_manifest(manifest)
@@ -199,22 +225,7 @@ def prepare(queue, manifest):
         raise ValueError(f'{error}; validation receipt: {receipt}') from error
     if payload['schema'] not in ('gpu-greenroom.command.v3','gpu-greenroom.command.v4'):
         raise ValueError('prepared commands require gpu-greenroom.command.v3 or v4')
-    capabilities = ['structured-command.v1', 'structured-command.v2', CAPABILITY]
-    if payload['service_class'] == 'quick':
-        capabilities.append(dispatch.CAPABILITY)
-    if payload['cooperative_checkpoint']:
-        capabilities.append('checkpoint-continuation.v1')
-    request = JobRequest(job_type='command', input_path='', agent_id=payload.get('agent_id'),
-                         repo_root=payload['repo_root'], command_cwd=payload['cwd'],
-                         command_argv=payload['argv'], command_env=payload['env'],
-                         command_timeout=payload['timeout'], output_dir=payload['output_dir'],
-                         output_class=payload.get('output_class'), route_identity=payload['route_identity'],
-                         service_class=payload['service_class'], cooperative_checkpoint=payload['cooperative_checkpoint'],
-                         performance_window=payload.get('performance_window'),
-                         runtime_profile=payload.get('runtime_profile'),
-                         required_worker_capabilities=capabilities)
-    if request.performance_window:
-        request.required_worker_capabilities.append('performance-window.v1')
+    request = command_request(payload,prepared=True)
     if not request.output_dir:
         request.output_dir = str(queue.queue_dir / 'outputs' / request.job_id)
     dispatch.classify(json.loads(request.to_json()), dispatch.policy(queue.queue_dir),queue_dir=queue.queue_dir)

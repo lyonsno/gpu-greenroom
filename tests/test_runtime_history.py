@@ -329,3 +329,90 @@ def test_observed_installed_receipts_preserve_clocks_and_legacy_authority():
     assert rows[1]['command_wall_seconds'] == pytest.approx(.15263054200113402)
     assert rows[2]['successful'] is False
     assert all(row['profile_key'] is None for row in rows)
+
+
+def manifest_for(request,profile):
+    return {'schema':'gpu-greenroom.command.v4','agent_id':request.agent_id,
+        'argv':request.command_argv,'cwd':request.command_cwd,'repo_root':request.repo_root,
+        'route_identity':'fixture/manifest','output_dir':request.output_dir,'runtime_profile':profile}
+
+
+def test_prepared_profile_keeps_valid_identity_through_submission_and_claim(tmp_path):
+    from gpu_queue import admission,runtime_history
+    request,profile = recipe(tmp_path)
+    queue = GPUQueue(tmp_path/'queue')
+    plan = admission.prepare(queue,manifest_for(request,profile))
+    assert runtime_history.CAPABILITY in plan['job_request']['required_worker_capabilities']
+    directory = admission.submit_prepared(queue,plan)
+    submitted = JobRequest.from_json((directory/'request.json').read_text())
+    admission.assert_current(submitted,plan['validation'])
+    assert queue.run_one({})
+    assert (queue.queue_dir/'done'/directory.name).is_dir()
+
+
+@pytest.mark.parametrize('setting,value',[('timeout',120),('performance_window','CPU fixture, no operator dialog launched'),
+                                         ('cooperative_checkpoint',True)])
+def test_history_cli_and_direct_query_use_identical_manifest_settings(tmp_path,setting,value):
+    from gpu_queue import runtime_history as history
+    request,profile = recipe(tmp_path)
+    request.runtime_profile = profile
+    queue = GPUQueue(tmp_path/'queue')
+    queue.submit(request)
+    queue.run_one({})
+    index = tmp_path/'history.sqlite'
+    history.refresh(queue.queue_dir,index)
+    manifest = {**manifest_for(request,profile),setting:value}
+    path = tmp_path/'manifest.json'
+    path.write_text(json.dumps(manifest))
+    setattr(request,{'timeout':'command_timeout'}.get(setting,setting),value)
+    direct = history.estimate(queue.queue_dir,index,request,profile,minimum_samples=1,max_seconds=30)
+    cli = subprocess.run([sys.executable,'-m','gpu_queue.cli','--queue-dir',str(queue.queue_dir),
+        'history','estimate','--index',str(index),'--manifest',str(path),'--minimum-samples','1'],capture_output=True,text=True)
+    assert cli.returncode == 0, cli.stderr
+    returned = json.loads(cli.stdout)
+    assert returned['profile_key'] == direct['profile_key']
+    assert returned['eligible'] is direct['eligible'] is False
+
+
+def test_profiled_cli_with_application_preflight_submits_and_runs(tmp_path):
+    request,profile = recipe(tmp_path)
+    preflight = tmp_path/'preflight.py'
+    preflight.write_text('''import json,os,pathlib,sys
+value=json.load(sys.stdin)
+pathlib.Path(os.environ['GPU_GREENROOM_VALIDATION_OUTPUT']).write_text(json.dumps({
+ 'schema':'gpu-greenroom.preflight-result.v1','request_digest':value['request_digest'],
+ 'mode':'cpu-only','valid':True}))
+''')
+    manifest = {**manifest_for(request,profile),'preflight':{'argv':[sys.executable,str(preflight)],'inputs':[str(preflight)]}}
+    path = tmp_path/'manifest.json'
+    path.write_text(json.dumps(manifest))
+    queue = GPUQueue(tmp_path/'queue')
+    result = subprocess.run([sys.executable,'-m','gpu_queue.cli','--queue-dir',str(queue.queue_dir),
+        'submit-command','--manifest',str(path)],capture_output=True,text=True)
+    assert result.returncode == 0, result.stderr
+    returned = json.loads(result.stdout)
+    assert returned['status'] == 'submitted'
+    assert queue.run_one({})
+    assert (queue.queue_dir/'done'/returned['job_id']).is_dir()
+
+
+def test_history_cli_recognizes_matching_nondefault_timeout_history(tmp_path):
+    from gpu_queue import runtime_history as history
+    request,profile = recipe(tmp_path)
+    request.runtime_profile = profile
+    request.command_timeout = 120
+    queue = GPUQueue(tmp_path/'queue')
+    queue.submit(request)
+    queue.run_one({})
+    index = tmp_path/'history.sqlite'
+    history.refresh(queue.queue_dir,index)
+    manifest = {**manifest_for(request,profile),'timeout':120}
+    path = tmp_path/'manifest.json'
+    path.write_text(json.dumps(manifest))
+    result = subprocess.run([sys.executable,'-m','gpu_queue.cli','--queue-dir',str(queue.queue_dir),
+        'history','estimate','--index',str(index),'--manifest',str(path),'--minimum-samples','1'],capture_output=True,text=True)
+    assert result.returncode == 0, result.stderr
+    returned = json.loads(result.stdout)
+    direct = history.estimate(queue.queue_dir,index,request,profile,minimum_samples=1,max_seconds=30)
+    assert returned['profile_key'] == direct['profile_key']
+    assert returned['eligible'] is direct['eligible'] is True
