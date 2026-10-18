@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from . import admission, dispatch
+from . import admission, dispatch, performance_window
 
 import ctypes
 import fcntl
@@ -84,7 +84,7 @@ def _safe_substitute(template: str, mapping: dict) -> str:
 def effective_worker_capabilities() -> frozenset[str]:
     configured = os.environ.get("GPU_GREENROOM_WORKER_CAPABILITIES")
     if configured is None:
-        return DEFAULT_WORKER_CAPABILITIES | {dispatch.CAPABILITY,'structured-command.v2','checkpoint-continuation.v1',admission.CAPABILITY}
+        return DEFAULT_WORKER_CAPABILITIES | {dispatch.CAPABILITY,dispatch.OVERRIDE_CAPABILITY,'structured-command.v2','checkpoint-continuation.v1',admission.CAPABILITY,performance_window.CAPABILITY,'job-cancellation.v1',dispatch.HISTORY_CAPABILITY}
     return frozenset(
         capability.strip()
         for capability in configured.split(",")
@@ -130,6 +130,8 @@ def required_worker_capabilities(request: JobRequest) -> frozenset[str]:
     required = set(request.required_worker_capabilities)
     if request.command_argv is not None:
         required.add(STRUCTURED_COMMAND_CAPABILITY)
+    if request.performance_window is not None:
+        required.add(performance_window.CAPABILITY)
     return frozenset(required)
 
 
@@ -152,7 +154,7 @@ class GPUQueue:
         self._worker_shutdown_requested = False
         self._owned_child: subprocess.Popen | None = None
         self._owned_process_group: int | None = None
-        for sub in ("pending", "running", "done", "failed", "cancelled", "outputs"):
+        for sub in ("pending", "deferred", "running", "done", "failed", "cancelled", "outputs"):
             (self.queue_dir / sub).mkdir(parents=True, exist_ok=True)
         for sub in (
             "leases",
@@ -327,6 +329,8 @@ class GPUQueue:
             return True
         try:
             os.killpg(process_group, signal.SIGTERM)
+        except PermissionError:
+            return False
         except ProcessLookupError:
             if proc is not None and proc.poll() is None:
                 proc.wait()
@@ -469,6 +473,10 @@ class GPUQueue:
             receipt["delivered_at"] = time.time()
             self._write_json_atomic(receipt_path, receipt)
             return receipt
+
+    def request_cancel(self, **kwargs) -> dict:
+        from .cancellation import request
+        return request(self, **kwargs)
 
     def _mark_lease_unknown_locked(self, lease: ExternalLease, reason: str) -> ExternalLease:
         if lease.lifecycle_state == LeaseStatus.OWNERSHIP_UNKNOWN:
@@ -1077,6 +1085,23 @@ class GPUQueue:
         return any(resolved == p or resolved.startswith(p + "/")
                     for p in self.VOLATILE_PREFIXES)
 
+    def _submission_replay_locked(self, request):
+        existing = [self.queue_dir / state.value / request.job_id
+                    for state in JobStatus
+                    if (self.queue_dir / state.value / request.job_id).exists()]
+        if not existing:
+            return None
+        if len(existing) != 1:
+            raise ValueError('job identity is ambiguous')
+        raw, digest = dispatch.read_request(existing[0] / 'request.json')
+        previous = JobRequest.from_json(json.dumps(raw))
+        if not admission.same_request(previous, request):
+            raise ValueError('job identity already belongs to a different request')
+        override = dispatch.policy(self.queue_dir).get('job_overrides', {}).get(request.job_id)
+        if override and override['request_digest'] != digest:
+            raise ValueError('submitted replay request digest differs from operator override')
+        return existing[0]
+
     def submit(self, request: JobRequest, *, _staged=False, validation=None) -> Path:
         """Submit a job. Returns the job directory path.
 
@@ -1084,9 +1109,18 @@ class GPUQueue:
         queue_dir/outputs/<job_id>/. If output_dir is under /tmp or
         /private/tmp, records a volatile_output warning.
         """
-        dispatch.classify(json.loads(request.to_json()), dispatch.policy(self.queue_dir))
         if type(request.cooperative_checkpoint) is not bool:
             raise ValueError('cooperative_checkpoint must be a boolean')
+        if request.runtime_profile is not None:
+            from .runtime_history import identity, CAPABILITY
+            identity(request,request.runtime_profile)
+            if CAPABILITY not in request.required_worker_capabilities:
+                request.required_worker_capabilities.append(CAPABILITY)
+        if request.performance_window is not None:
+            if not isinstance(request.performance_window, str) or not request.performance_window.strip():
+                raise ValueError('performance_window must be a nonblank reason')
+            if performance_window.CAPABILITY not in request.required_worker_capabilities:
+                request.required_worker_capabilities.append(performance_window.CAPABILITY)
         if request.cooperative_checkpoint:
             if not request.command_argv or not isinstance(request.agent_id,str) or not request.agent_id.strip():
                 raise ValueError('checkpoint continuation requires a structured command and explicit owner')
@@ -1113,16 +1147,12 @@ class GPUQueue:
 
         if not _staged:
             with self._coordination_lock():
-                existing = [self.queue_dir / state / request.job_id
-                            for state in ('pending', 'running', 'done', 'failed', 'cancelled')
-                            if (self.queue_dir / state / request.job_id).exists()]
+                existing = self._submission_replay_locked(request)
                 if existing:
-                    if len(existing) != 1:
-                        raise ValueError('job identity is ambiguous')
-                    previous = JobRequest.from_json((existing[0] / 'request.json').read_text())
-                    if not admission.same_request(previous, request):
-                        raise ValueError('job identity already belongs to a different request')
-                    return existing[0]
+                    return existing
+                dispatch.classify(json.loads(request.to_json()), dispatch.policy(self.queue_dir),queue_dir=self.queue_dir)
+        else:
+            dispatch.classify(json.loads(request.to_json()), dispatch.policy(self.queue_dir),queue_dir=self.queue_dir)
 
         staging_root = self.queue_dir / 'submission-staging'
         staging_root.mkdir(exist_ok=True)
@@ -1155,17 +1185,10 @@ class GPUQueue:
         if not _staged:
             destination = self.queue_dir / 'pending' / request.job_id
             with self._coordination_lock():
-                existing = [self.queue_dir / bucket / request.job_id
-                            for bucket in ('pending', 'running', 'done', 'failed', 'cancelled')
-                            if (self.queue_dir / bucket / request.job_id).exists()]
+                existing = self._submission_replay_locked(request)
                 if existing:
-                    if len(existing) != 1:
-                        raise ValueError('job identity is ambiguous')
-                    previous = JobRequest.from_json((existing[0] / 'request.json').read_text())
-                    if not admission.same_request(previous, request):
-                        raise ValueError('job identity already belongs to a different request')
                     shutil.rmtree(job_dir)
-                    return existing[0]
+                    return existing
                 job_dir.rename(destination)
                 for directory in (staging_root, destination.parent):
                     directory_fd = os.open(directory, os.O_RDONLY)
@@ -1183,8 +1206,8 @@ class GPUQueue:
             if stage.parent.resolve()!=(self.queue_dir/'continuation-staging').resolve():
                 raise ValueError('continuation staging root differs from this queue')
             if not stage.exists():
-                matches=[self.queue_dir/state/stage.name for state in ('pending','running','done','failed','cancelled')
-                         if (self.queue_dir/state/stage.name/'checkpoint-handoff.json').is_file()]
+                matches=[self.queue_dir/state.value/stage.name for state in JobStatus
+                         if (self.queue_dir/state.value/stage.name/'checkpoint-handoff.json').is_file()]
                 if len(matches)==1:
                     stage=matches[0]
                 else:
@@ -1200,6 +1223,10 @@ class GPUQueue:
                 raise ValueError('continuation commit or request identity is unverified')
             if stage.parent.name!='continuation-staging':
                 return stage
+            from .cancellation import parent_request, cancel_successor
+            cancelled_parent = parent_request(self, commit['job_id'])
+            if cancelled_parent:
+                return cancel_successor(self,stage,commit['job_id'],cancelled_parent)
             if state.status!=JobStatus.PENDING or state.job_id!=stage.name:
                 raise ValueError('prepared continuation state is unverified')
             if commit.get('next_state_sha256')!=hashlib.sha256((stage/'status.json').read_bytes()).hexdigest():
@@ -1239,13 +1266,14 @@ class GPUQueue:
         return recovered
 
     def cancel(self, job_id: str) -> bool:
-        """Cancel a pending job. Returns True if cancelled, False if not found/not pending.
+        """Cancel a pending or deferred job without launching it.
 
         Uses the short transition lock shared with run_one().
         """
         with self._coordination_lock():
-            pending_dir = self.queue_dir / "pending" / job_id
-            if not pending_dir.exists():
+            pending_dir = next((self.queue_dir / sub / job_id for sub in ('pending', 'deferred')
+                                if (self.queue_dir / sub / job_id).is_dir()), None)
+            if pending_dir is None:
                 return False
 
             state = JobState.from_json((pending_dir / "status.json").read_text())
@@ -1260,7 +1288,7 @@ class GPUQueue:
     def list_jobs(self, status: JobStatus | None = None) -> list[JobState]:
         """List jobs, optionally filtered by status."""
         results = []
-        dirs = ["pending", "running", "done", "failed", "cancelled"]
+        dirs = ["pending", "deferred", "running", "done", "failed", "cancelled"]
         if status:
             dirs = [status.value]
         for sub in dirs:
@@ -1275,7 +1303,7 @@ class GPUQueue:
 
     def get_job(self, job_id: str) -> JobState | None:
         """Get a specific job's state."""
-        for sub in ("pending", "running", "done", "failed", "cancelled"):
+        for sub in ("pending", "deferred", "running", "done", "failed", "cancelled"):
             status_file = self.queue_dir / sub / job_id / "status.json"
             if status_file.exists():
                 return JobState.from_json(status_file.read_text())
@@ -1290,6 +1318,10 @@ class GPUQueue:
                 current=dispatch.policy(self.queue_dir)
             except (ValueError,OSError):
                 current={}
+            if current.get('schema') in (dispatch.OVERRIDE_SCHEMA,dispatch.HISTORY_SCHEMA):
+                value = {**value, 'schema': dispatch.HISTORY_SCHEMA if value.get('runtime_history') is not None else dispatch.OVERRIDE_SCHEMA,
+                         'job_overrides': current.get('job_overrides', {}),
+                         'action_receipts': current.get('action_receipts', {})}
             fields={key:item for key,item in current.items() if key not in {'epoch','owner','configured_at'}}
             if value==fields and not reset_fairness:
                 return current
@@ -1301,10 +1333,125 @@ class GPUQueue:
             self._emit_event_locked('dispatch_policy_changed',receipt['epoch'],receipt)
             return receipt
 
+    def override_dispatch(self, *, job_id, service_class, request_digest, request_id, requested_by):
+        receipt = dispatch.validate_override({
+            'schema': 'gpu-greenroom.dispatch-override.v1', 'job_id': job_id,
+            'service_class': service_class, 'request_digest': request_digest,
+            'request_id': request_id, 'requested_by': requested_by, 'at': time.time(),
+            'authority': 'authenticated-console; caller identity unverified',
+        })
+        with self._coordination_lock():
+            config = dispatch.policy(self.queue_dir)
+            prior = config.get('action_receipts', {}).get(request_id)
+            if prior:
+                if any(prior[key] != receipt[key] for key in ('job_id', 'service_class', 'request_digest', 'requested_by')):
+                    raise ValueError('dispatch request identity reused with a different action')
+                return prior
+            if config['mode'] != 'two-class':
+                raise ValueError('manual Quick moves require two-class dispatch')
+            directory = self.queue_dir / 'pending' / job_id
+            if not directory.is_dir():
+                raise ValueError('job is no longer pending')
+            state = JobState.from_json((directory / 'status.json').read_text())
+            request, digest = dispatch.read_request(directory / 'request.json')
+            if state.job_id != job_id or state.status != JobStatus.PENDING or not isinstance(request, dict) or request.get('job_id') != job_id:
+                raise ValueError('pending job identity or containment is unverified')
+            if digest != request_digest:
+                raise ValueError('pending request digest changed; refresh the queue')
+            # Classification and its retry receipt share one fsynced commit point.
+            updated = {**config, 'schema': dispatch.HISTORY_SCHEMA if config.get('runtime_history') is not None else dispatch.OVERRIDE_SCHEMA,
+                       'job_overrides': {**config.get('job_overrides', {}), job_id: receipt},
+                       'action_receipts': {**config.get('action_receipts', {}), request_id: receipt}}
+            dispatch.atomic_write(self.queue_dir / 'dispatch-policy.json', dispatch.validate(updated))
+            return receipt
+
     def _next_pending(self, config=None) -> Path | None:
         """Get the oldest pending job directory."""
         jobs=dispatch.pending_order(self.queue_dir,config)
         return jobs[0] if jobs else None
+
+    @staticmethod
+    def _read_performance_deferral(job_dir, request):
+        record = json.loads((job_dir / 'performance-defer.json').read_text())
+        report = performance_window.read_receipt(job_dir / 'performance-window.json', request)
+        digest = hashlib.sha256((job_dir / 'request.json').read_bytes()).hexdigest()
+        if (not isinstance(record, dict) or record.get('schema') != 'gpu-greenroom.performance-deferral.v1'
+                or record.get('job_id') != request.job_id or record.get('request_sha256') != digest
+                or record.get('performance_window') != report or report['status'] != 'deferred'
+                or record.get('quiescence') != 'confirmed'):
+            raise ValueError('Performance deferral identity or quiescence conflicts')
+        return record
+
+    def _apply_performance_deferral(self, job_dir, request, record):
+        # The receipt is committed before status/rename, so either interrupted
+        # write can be replayed under the original execution mutex.
+        attempt = JobState.from_json(json.dumps(record['attempt']))
+        if (not attempt.child_process_group or self._process_group_alive(attempt.child_process_group)
+                or self._process_start_identity(attempt.child_pid)):
+            raise ValueError('Deferred confirmation process is not quiescent')
+        if self._recover_cancelled_locked(job_dir, attempt):
+            return
+        report = record['performance_window']
+        state = JobState(job_id=request.job_id, status=JobStatus.DEFERRED, job_type=request.job_type,
+            input_path=request.input_path, output_dir=request.output_dir, params=request.params,
+            submitted_at=request.submitted_at,
+            performance_deferral={'deferred_until': report['deferred_until'],
+                                  'defer_seconds': report['defer_seconds'], 'attempt_id': report['attempt_id']})
+        performance_window.atomic_write(job_dir / 'status.json', json.loads(state.to_json()))
+        if job_dir.parent.name != 'deferred':
+            self._move_job(job_dir, 'deferred')
+
+    def _defer_performance_job(self, job_dir, request, state, report, worker):
+        record = {'schema': 'gpu-greenroom.performance-deferral.v1', 'job_id': request.job_id,
+            'request_sha256': hashlib.sha256((job_dir / 'request.json').read_bytes()).hexdigest(),
+            'performance_window': report, 'attempt': json.loads(state.to_json()),
+            'worker': worker, 'quiescence': 'confirmed', 'recorded_at': time.time()}
+        history = job_dir / 'performance-deferrals'
+        history.mkdir(exist_ok=True)
+        performance_window.atomic_write(history / (report['attempt_id'] + '.json'), record)
+        performance_window.atomic_write(job_dir / 'performance-defer.json', record)
+        self._apply_performance_deferral(job_dir, request, record)
+
+    def _recover_cancelled_locked(self, job_dir, state):
+        from .cancellation import read_request, cancel_handoff
+        record = read_request(job_dir,state)
+        if not record:
+            return False
+        if (not all((state.child_pid,state.child_process_group,state.child_start_identity))
+                or self._process_start_identity(state.child_pid)
+                or self._process_group_alive(state.child_process_group) is not False):
+            raise ValueError('Cancelled process-group quiescence is unverified')
+        cancel_handoff(self,job_dir,record)
+        state.status,state.finished_at = JobStatus.CANCELLED,time.time()
+        state.failure_phase = 'operator_cancelled_recovery'
+        state.error_message = 'Accepted cancellation recovered after exact process-group quiescence'
+        self._write_text_atomic(job_dir/'status.json',state.to_json())
+        self._write_json_atomic(job_dir/'receipt.json',{
+            'job_id':state.job_id,'job_type':state.job_type,'status':'cancelled',
+            'started_at':state.started_at,'finished_at':state.finished_at,
+            'child_pid':state.child_pid,'child_process_group':state.child_process_group,
+            'child_start_identity':state.child_start_identity,'failure_phase':state.failure_phase,
+            'error_message':state.error_message,'effective_route':state.effective_route,
+            'cancellation':record,'recovered_by':worker_identity()})
+        self._move_job(job_dir,'cancelled')
+        return True
+
+    def _promote_due_performance_jobs(self):
+        for job_dir in sorted((self.queue_dir / 'deferred').iterdir()):
+            try:
+                request = JobRequest.from_json((job_dir / 'request.json').read_text())
+                record = self._read_performance_deferral(job_dir, request)
+                state = JobState.from_json((job_dir / 'status.json').read_text())
+                if state.job_id != request.job_id or state.performance_deferral is None:
+                    raise ValueError('Deferred status identity missing')
+                if record['performance_window']['deferred_until'] > time.time():
+                    continue
+                state.status = JobStatus.PENDING
+                performance_window.atomic_write(job_dir / 'status.json', json.loads(state.to_json()))
+                self._move_job(job_dir, 'pending')
+            except (OSError, ValueError, TypeError, KeyError) as error:
+                performance_window.atomic_write(job_dir / 'deferral-error.json',
+                    {'phase': 'performance-deferral', 'error': str(error), 'observed_at': time.time()})
 
     def _write_metadata_sidecar(self, request: JobRequest, state: JobState):
         """Write metadata.json into output_dir for asset browser consumption."""
@@ -1419,6 +1566,7 @@ class GPUQueue:
         if lock_fd is None:
             return False
 
+        performance_notice = None
         try:
             with self._coordination_lock():
                 if self.is_paused():
@@ -1430,10 +1578,16 @@ class GPUQueue:
                 if any((self.queue_dir / "running").iterdir()):
                     return False
 
+                self._promote_due_performance_jobs()
+
                 effective_claimant = claimant or worker_identity()
                 try:
                     dispatch_policy=dispatch.policy(self.queue_dir)
                     if dispatch_policy['mode']=='two-class' and dispatch.CAPABILITY not in effective_claimant.get('capabilities',[]):
+                        return False
+                    if dispatch_policy['schema'] in (dispatch.OVERRIDE_SCHEMA,dispatch.HISTORY_SCHEMA) and dispatch.OVERRIDE_CAPABILITY not in effective_claimant.get('capabilities', []):
+                        return False
+                    if dispatch_policy['schema'] == dispatch.HISTORY_SCHEMA and dispatch.HISTORY_CAPABILITY not in effective_claimant.get('capabilities', []):
                         return False
                     job_dir = self._next_pending(dispatch_policy)
                 except (ValueError,KeyError,TypeError,OSError) as error:
@@ -1444,9 +1598,10 @@ class GPUQueue:
                 if job_dir is None:
                     return False
 
-                request = JobRequest.from_json((job_dir / "request.json").read_text())
+                raw_request, request_digest = dispatch.read_request(job_dir / 'request.json')
+                request = JobRequest.from_json(json.dumps(raw_request))
                 try:
-                    service_class,basis=dispatch.classify(json.loads(request.to_json()),dispatch_policy)
+                    service_class,basis=dispatch.classify(raw_request,dispatch_policy,request_digest=request_digest,queue_dir=self.queue_dir)
                 except ValueError as error:
                     dispatch.atomic_write(self.queue_dir/'dispatch-error.json',
                         {'schema':'gpu-greenroom.dispatch-error.v1','phase':'dispatch-policy','error':str(error),
@@ -1490,8 +1645,11 @@ class GPUQueue:
                 state.started_at = time.time()
                 state.pid = os.getpid()
                 state.worker_pid = os.getpid()
+                state.worker_capabilities = list(effective_claimant.get('capabilities', []))
                 state.dispatch={'mode':dispatch_policy['mode'],'service_class':service_class,
                                 'policy_epoch':dispatch_policy.get('epoch'),'eligibility_basis':basis}
+                if dispatch_policy['mode'] == 'two-class' and request.job_id in dispatch_policy.get('job_overrides', {}):
+                    state.dispatch['operator_override'] = dispatch_policy['job_overrides'][request.job_id]
                 if dispatch_policy['mode']=='two-class':
                     dispatch.atomic_write(self.queue_dir/'dispatch-state.json',
                         {'schema':'gpu-greenroom.dispatch-state.v1','last_class':service_class,
@@ -1597,6 +1755,7 @@ class GPUQueue:
             run_env.pop('GPU_GREENROOM_CONTEXT',None)
             run_env.pop('GPU_GREENROOM_READY_FD',None)
             run_env.pop('GPU_GREENROOM_RESUME_CHECKPOINT',None)
+            run_env['GPU_GREENROOM_CANCEL_REQUEST'] = str((job_dir/'cancel-request.json').resolve())
             if request.cooperative_checkpoint and (job_env or {}).get('GPU_GREENROOM_RESUME_CHECKPOINT'):
                 if not request.params.get('continuation_of') or not request.params.get('checkpoint_sha256'):
                     state.status=JobStatus.FAILED
@@ -1606,13 +1765,23 @@ class GPUQueue:
                 else:
                     run_env['GPU_GREENROOM_RESUME_CHECKPOINT']=job_env['GPU_GREENROOM_RESUME_CHECKPOINT']
 
+            from .runtime_history import generation
+            history_generation_before = generation(self.queue_dir)
             # Evidence-custody preflight: attest the input source and probe the
             # runtime before anything touches output_dir.
             input_artifact = None
             source_attestation = None
             runtime_identity = None
             artifact_manifest = None
+            profile_observation = None
             dest_status = "failed"
+            if state.status == JobStatus.RUNNING and request.runtime_profile is not None:
+                from .runtime_history import capture
+                try:
+                    profile_observation = capture(request,cmd,job_cwd)
+                except (ValueError,TypeError,KeyError,OSError) as error:
+                    state.status,state.failure_phase,state.exit_code = JobStatus.FAILED,'runtime_profile_preflight',-1
+                    state.error_message = str(error)
 
             if source_attestation_mode not in (None, "git-clean-input"):
                 state.status = JobStatus.FAILED
@@ -1679,10 +1848,20 @@ class GPUQueue:
             shutdown_exception = None
             ownership_unresolved = False
             ready_read=ready_write=None
+            launch_cmd = cmd
+            performance_report = None
 
             if state.status == JobStatus.RUNNING:
                 try:
+                    from .cancellation import read_request as read_cancellation
+                    if read_cancellation(job_dir, state):
+                        raise RuntimeError('Cancelled before workload launch')
                     os.makedirs(request.output_dir, exist_ok=True)
+                    if request.performance_window is not None:
+                        # Preserve old decisions in performance-deferrals/, but never
+                        # let recovery mistake one for this newly dispatched attempt.
+                        (job_dir / 'performance-defer.json').unlink(missing_ok=True)
+                        (job_dir / 'performance-window.json').unlink(missing_ok=True)
                     with open(stdout_path, "w") as out_f, open(stderr_path, "w") as err_f:
                         child_options={}
                         if request.cooperative_checkpoint:
@@ -1695,8 +1874,10 @@ class GPUQueue:
                             run_env['GPU_GREENROOM_CONTEXT']=str(context_path.resolve())
                             run_env['GPU_GREENROOM_READY_FD']=str(ready_read)
                             child_options['pass_fds']=(ready_read,)
+                        if request.performance_window is not None:
+                            launch_cmd = performance_window.runner_command(job_dir, request, cmd, job_timeout)
                         proc = subprocess.Popen(
-                            cmd,
+                            launch_cmd,
                             stdout=out_f,
                             stderr=err_f,
                             cwd=job_cwd,
@@ -1725,7 +1906,9 @@ class GPUQueue:
                                 pass
                             os.close(ready_write)
                             ready_write=None
-                        state.exit_code = proc.wait(timeout=job_timeout)
+                        from .cancellation import wait as wait_cancellable
+                        state.exit_code = wait_cancellable(self, job_dir, state, proc,
+                            None if request.performance_window is not None else job_timeout)
                         if self._worker_shutdown_requested:
                             raise KeyboardInterrupt
                     if not self._quiesce_owned_child(proc, state.child_process_group):
@@ -1793,6 +1976,40 @@ class GPUQueue:
                         state.warnings.append("ownership_unknown:process_group_live")
                         dest_status = None
 
+            if request.performance_window is not None and proc is not None:
+                try:
+                    performance_report = performance_window.read_receipt(job_dir / 'performance-window.json', request)
+                    if (performance_report['status'] == 'deferred' and not ownership_unresolved
+                            and state.failure_phase == 'execution'
+                            and state.exit_code == performance_window.DEFER_EXIT
+                            and not self._worker_shutdown_requested):
+                        with self._coordination_lock():
+                            if read_cancellation(job_dir, state) is None:
+                                self._defer_performance_job(job_dir, request, state, performance_report, effective_claimant)
+                                self._owned_child = self._owned_process_group = None
+                                for descriptor in (ready_read, ready_write):
+                                    if descriptor is not None:
+                                        os.close(descriptor)
+                                return True
+                    if not ownership_unresolved and state.failure_phase != 'worker_shutdown':
+                        if performance_report['status'] not in {'complete', 'failed', 'cancelled'}:
+                            state.status = JobStatus.FAILED
+                            state.failure_phase = 'performance_window_interrupted'
+                            state.error_message = 'Performance-window process stopped before its terminal report'
+                            dest_status = 'failed'
+                        elif performance_report['status'] != 'complete':
+                            state.status = JobStatus.FAILED
+                            state.failure_phase = 'performance_window_' + performance_report['phase']
+                            state.error_message = performance_report.get('error') or 'Performance measurement cancelled before launch'
+                            dest_status = 'failed'
+                except (OSError, ValueError, KeyError, TypeError) as error:
+                    if not ownership_unresolved and state.failure_phase != 'worker_shutdown':
+                        state.status = JobStatus.FAILED
+                        state.failure_phase = 'performance_window_receipt'
+                        state.error_message = str(error)
+                        state.exit_code = -1
+                        dest_status = 'failed'
+
             self._owned_child = None
             self._owned_process_group = None
 
@@ -1820,6 +2037,12 @@ class GPUQueue:
                     state.exit_code = -1
                     dest_status = "failed"
 
+            if profile_observation is not None:
+                from .runtime_history import identity
+                try:
+                    profile_observation['source_unchanged'] = identity(request,request.runtime_profile) == profile_observation['key']
+                except (ValueError,TypeError,KeyError,OSError) as error:
+                    profile_observation['error'] = str(error)
             state.finished_at = None if ownership_unresolved else time.time()
 
             # Metadata must exist before terminal artifacts are hashed.
@@ -1873,7 +2096,13 @@ class GPUQueue:
                 "repo_root": request.repo_root,
                 "requested_route": request.route_identity,
                 "effective_route": state.effective_route,
-                "effective_argv": cmd,
+                "effective_argv": launch_cmd,
+                "workload_argv": cmd,
+                "performance_window": performance_report,
+                "performance_window_effective_status": (
+                    'interrupted' if performance_report and not ownership_unresolved
+                    and performance_report['status'] in {'waiting', 'confirmed', 'running'}
+                    else performance_report.get('status') if performance_report else None),
                 "effective_cwd": job_cwd,
                 "effective_env": job_env,
                 "environment_inheritance": "worker-plus-overlay",
@@ -1882,6 +2111,7 @@ class GPUQueue:
                 "reserved_environment_policy": "managed context overwritten; legacy context/ready/resume removed",
                 "effective_defaults": job_defaults,
                 "effective_timeout": job_timeout,
+                "timeout_scope": "workload-after-operator-confirmation" if request.performance_window is not None else "command",
                 "worker_pid": state.worker_pid,
                 "child_pid": state.child_pid,
                 "child_process_group": state.child_process_group,
@@ -1900,12 +2130,62 @@ class GPUQueue:
                 "input_artifact": input_artifact,
                 "source_attestation": source_attestation,
                 "runtime_identity": runtime_identity,
+                "runtime_profile_observation": profile_observation,
                 "artifact_manifest": artifact_manifest,
             }
-            self._write_json_atomic(job_dir / "receipt.json", receipt)
-
-            if not ownership_unresolved:
-                self._move_job(job_dir, dest_status)
+            # Serialize the final decision with operator admission so an accepted
+            # request cannot disappear between the last read and terminal rename.
+            with self._coordination_lock():
+                from .cancellation import read_request as read_cancellation
+                try:
+                    cancellation_record = read_cancellation(job_dir, state)
+                except (ValueError, TypeError, KeyError, OSError) as error:
+                    cancellation_record = None
+                    receipt['cancellation_error'] = str(error)
+                    if not ownership_unresolved:
+                        state.status, dest_status = JobStatus.FAILED, 'failed'
+                        state.failure_phase, state.error_message = 'cancellation_invalid', str(error)
+                        receipt.update(status='failed', failure_phase=state.failure_phase, error_message=str(error))
+                if cancellation_record:
+                    receipt['cancellation'] = cancellation_record
+                    from .cancellation import cancel_handoff
+                    try:
+                        cancel_handoff(self,job_dir,cancellation_record)
+                    except (ValueError,TypeError,KeyError,OSError) as error:
+                        ownership_unresolved = True
+                        state.status,state.finished_at = JobStatus.RUNNING,None
+                        state.failure_phase = 'cancellation_handoff_unresolved'
+                        state.error_message = str(error)
+                        state.warnings.append('ownership_unknown:checkpoint_handoff_unresolved')
+                        final_job_dir = job_dir
+                        receipt.update(status='ownership_unknown',finished_at=None,
+                            failure_phase=state.failure_phase,error_message=str(error),warnings=state.warnings)
+                    if not ownership_unresolved:
+                        state.status = JobStatus.CANCELLED
+                        state.failure_phase = 'operator_cancelled'
+                        state.error_message = 'Cancelled by operator; owned process group quiesced'
+                        dest_status = 'cancelled'
+                        final_job_dir = self.queue_dir/dest_status/state.job_id
+                        receipt.update(status='cancelled', failure_phase=state.failure_phase,
+                                       error_message=state.error_message)
+                for key in ('request_path', 'stdout_path', 'stderr_path', 'managed_context_record'):
+                    if receipt.get(key):
+                        receipt[key] = str(final_job_dir/Path(receipt[key]).name)
+                self._write_text_atomic(job_dir/'status.json', state.to_json())
+                self._write_json_atomic(job_dir / "receipt.json", receipt)
+                if not ownership_unresolved:
+                    self._move_job(job_dir, dest_status)
+            if dispatch_policy.get('runtime_history'):
+                from .runtime_history import record_completion
+                try:
+                    record_completion(self.queue_dir,dispatch_policy['runtime_history']['index'],final_job_dir,history_generation_before)
+                except Exception as error:
+                    # A stale generation disables empirical Quick classification;
+                    # cache failure never hides a completed workload's receipt.
+                    self._write_json_atomic(self.queue_dir/'runtime-history-error.json',
+                        {'job_id':request.job_id,'error':str(error),'at':time.time()})
+            if request.performance_window is not None:
+                performance_notice = (final_job_dir, request, receipt)
             if shutdown_exception is not None:
                 raise shutdown_exception
             return True
@@ -1913,6 +2193,11 @@ class GPUQueue:
         finally:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
             lock_fd.close()
+            if performance_notice is not None:
+                try:
+                    performance_window.notify_completion(*performance_notice)
+                except Exception as error:
+                    print(f'Performance notification failed: {error}', file=sys.stderr)
 
     def recover_stale(self) -> list[str]:
         """Check for stale running jobs (process no longer alive) and move to failed.
@@ -1921,6 +2206,19 @@ class GPUQueue:
         Returns list of recovered job IDs.
         """
         lock_fd = open(self.lock_path, "w")
+        performance_notices = []
+        def record_notice(job_dir, receipt):
+            try:
+                request = JobRequest.from_json((job_dir / 'request.json').read_text())
+                if request.performance_window is not None:
+                    performance_notices.append((job_dir, request, receipt))
+            except (OSError, ValueError, TypeError):
+                pass
+
+        def record_unknown(job_dir, state):
+            if self._pid_alive(state.worker_pid) is False:
+                record_notice(job_dir, {'job_id': state.job_id, 'status': 'ownership_unknown',
+                                       'finished_at': None, 'failure_phase': 'stale_recovery'})
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
 
@@ -1937,6 +2235,20 @@ class GPUQueue:
                     state = JobState.from_json(status_file.read_text())
                 except (OSError, ValueError, json.JSONDecodeError):
                     continue
+                if (job_dir / 'performance-defer.json').exists():
+                    try:
+                        request = JobRequest.from_json((job_dir / 'request.json').read_text())
+                        record = self._read_performance_deferral(job_dir, request)
+                        with self._coordination_lock():
+                            self._apply_performance_deferral(job_dir, request, record)
+                        cancelled = self.queue_dir/'cancelled'/state.job_id
+                        if cancelled.exists():
+                            record_notice(cancelled,json.loads((cancelled/'receipt.json').read_text()))
+                        recovered.append(state.job_id)
+                        continue
+                    except (OSError, ValueError, TypeError, KeyError) as error:
+                        performance_window.atomic_write(job_dir / 'deferral-error.json',
+                            {'phase': 'performance-deferral-recovery', 'error': str(error), 'observed_at': time.time()})
                 exact_identity = all((
                     state.child_pid,
                     state.child_process_group,
@@ -1947,6 +2259,7 @@ class GPUQueue:
                     if warning not in state.warnings:
                         state.warnings.append(warning)
                         self._write_text_atomic(status_file, state.to_json())
+                    record_unknown(job_dir, state)
                     continue
 
                 observed_identity = self._process_start_identity(state.child_pid)
@@ -1970,13 +2283,41 @@ class GPUQueue:
                     if warning and warning not in state.warnings:
                         state.warnings.append(warning)
                         self._write_text_atomic(status_file, state.to_json())
+                    if warning:
+                        record_unknown(job_dir, state)
                     continue
                 if group_alive:
                     warning = "ownership_unknown:child_missing_group_live"
                     if warning not in state.warnings:
                         state.warnings.append(warning)
                         self._write_text_atomic(status_file, state.to_json())
+                    record_unknown(job_dir, state)
                     continue
+
+                try:
+                    with self._coordination_lock():
+                        if self._recover_cancelled_locked(job_dir,state):
+                            cancelled = self.queue_dir/'cancelled'/state.job_id
+                            record_notice(cancelled,json.loads((cancelled/'receipt.json').read_text()))
+                            recovered.append(state.job_id)
+                            continue
+                except (OSError,ValueError,TypeError,KeyError) as error:
+                    self._write_json_atomic(job_dir/'recovery-error.json',
+                        {'phase':'cancellation-recovery','error':str(error),'observed_at':time.time()})
+                    continue
+
+                try:
+                    request = JobRequest.from_json((job_dir / 'request.json').read_text())
+                    if request.performance_window is not None:
+                        report = performance_window.read_receipt(job_dir / 'performance-window.json', request)
+                        if report['status'] == 'deferred':
+                            with self._coordination_lock():
+                                self._defer_performance_job(job_dir, request, state, report,
+                                    {'recovered_by': worker_identity()})
+                            recovered.append(state.job_id)
+                            continue
+                except (OSError, ValueError, TypeError, KeyError):
+                    pass
 
                 state.status = JobStatus.FAILED
                 state.finished_at = time.time()
@@ -2002,9 +2343,15 @@ class GPUQueue:
                 }
                 self._write_json_atomic(job_dir / "receipt.json", receipt)
 
-                self._move_job(job_dir, "failed")
+                final_dir = self._move_job(job_dir, "failed")
+                record_notice(final_dir, receipt)
                 recovered.append(state.job_id)
             return recovered
         finally:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
             lock_fd.close()
+            for notice in performance_notices:
+                try:
+                    performance_window.notify_completion(*notice)
+                except Exception as error:
+                    print(f'Performance recovery notification failed: {error}', file=sys.stderr)

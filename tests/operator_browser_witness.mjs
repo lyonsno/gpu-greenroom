@@ -72,14 +72,14 @@ try {
     if (message.error) callbacks.reject(new Error(message.error.message));
     else callbacks.resolve(message.result);
   });
-  const command = (method, params = {}) => new Promise((resolve, reject) => {
+  const command = (method, params = {}, sessionId = undefined) => new Promise((resolve, reject) => {
     writeFileSync(join(artifactDirectory, `${scenario}-last-command.json`), JSON.stringify({phase, method}));
     const id = ++nextId;
     pending.set(id, {resolve, reject});
-    socket.send(JSON.stringify({id, method, params}));
+    socket.send(JSON.stringify({id, method, params, sessionId}));
   });
-  const evaluate = async expression => {
-    const result = await command('Runtime.evaluate', {expression, awaitPromise: true, returnByValue: true});
+  const evaluate = async (expression, sessionId) => {
+    const result = await command('Runtime.evaluate', {expression, awaitPromise: true, returnByValue: true}, sessionId);
     if (result.exceptionDetails) throw new Error(result.exceptionDetails.text);
     return result.result.value;
   };
@@ -87,11 +87,11 @@ try {
   await command('Page.enable');
   await command('Runtime.enable');
   markPhase('initial-render');
-  await command('Page.navigate', {url: `${base}/`});
+  await command('Page.navigate', {url: `${base}/#smoke-${requestId}`});
   try {
     await eventually(() => evaluate(`Boolean(document.querySelector('#smokeRequestList .smoke-card'))`), Boolean, 'initial Greenroom request render');
   } catch (error) {
-    writeFileSync(join(artifactDirectory, `${scenario}-document.json`), await evaluate(`JSON.stringify({href:location.href,body:document.body?.innerText,html:document.documentElement.outerHTML})`));
+    writeFileSync(join(artifactDirectory, `${scenario}-document.json`), await evaluate(`JSON.stringify({href:location.href,body:document.body?.innerText})`));
     throw error;
   }
   markPhase('initial-screenshot');
@@ -101,7 +101,231 @@ try {
   writeFileSync(artifact, Buffer.from(initialFrame.data, 'base64'));
   screenshotArtifact = artifact;
 
-  if (scenario === 'stale-submit') {
+  if (scenario === 'job-cancel') {
+    await eventually(() => evaluate(`document.querySelectorAll('.job-item').length`), n=>n===2, 'actual queue jobs');
+    await evaluate(`window.__cancelCalls=[];window.__realFetch=window.fetch.bind(window);window.fetch=async(input,options)=>{const r=await window.__realFetch(input,options);if(String(input).endsWith('/api/job-cancel'))window.__cancelCalls.push({status:r.status,body:JSON.parse(options.body)});return r}`);
+    for (const [width,height] of [[1440,1000],[390,844]]) {
+      await command('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:width===390});
+      await evaluate(`document.querySelector('[data-job-id="browser-pending"] button[title="Cancel job"]').click()`);
+      const modal=await evaluate(`(()=>{const d=document.querySelector('#cancelDialog'),r=d.getBoundingClientRect();return {open:d.open,text:d.innerText,left:r.left,right:r.right,bottom:r.bottom,top:r.top,width:innerWidth,height:innerHeight,focus:document.activeElement?.textContent}})()`);
+      assert.equal(modal.open,true);
+      assert.ok(modal.text.includes('fixture-queued-owner')&&modal.text.includes('fixture/browser-cancel-pending'));
+      assert.equal(modal.focus,'Keep job');
+      assert.ok(modal.left>=0&&modal.right<=width&&modal.top>=0&&modal.bottom<=height,JSON.stringify(modal));
+      const frame=await command('Page.captureScreenshot',{format:'png',fromSurface:true});
+      writeFileSync(join(artifactDirectory,`${scenario}-${width}.png`),Buffer.from(frame.data,'base64'));
+      await evaluate(`document.querySelector('#cancelDialog button[value="back"]').click()`);
+      assert.equal(await evaluate(`window.__cancelCalls.length`),0,'Keep job must not cancel');
+    }
+    await evaluate(`document.querySelector('[data-job-id="browser-pending"] button[title="Cancel job"]').click();document.querySelector('#confirmCancel').click()`);
+    await eventually(()=>evaluate(`window.__cancelCalls.length`),n=>n===1,'queued cancellation');
+    assert.equal(await evaluate(`window.__cancelCalls[0].status`),200);
+    await eventually(()=>evaluate(`!document.querySelector('[data-job-id="browser-pending"]')`),Boolean,'pending removed');
+    await evaluate(`document.querySelector('[data-job-id="browser-running"] button[title="Cancel job"]').click();document.querySelector('#confirmCancel').click()`);
+    await eventually(()=>evaluate(`document.querySelector('[data-job-id="browser-running"]')?.innerText`),text=>text?.includes('Cancelling; waiting for process exit'),'running cancelling state');
+    await evaluate(`document.querySelector('[data-job-id="browser-running"] button[title="Force stop job"]').click()`);
+    assert.ok(await evaluate(`document.querySelector('#cancelDialog').innerText.includes('Unsaved work may be lost')`));
+    await evaluate(`document.querySelector('#confirmCancel').click()`);
+    await eventually(()=>evaluate(`window.__cancelCalls.length`),n=>n===3,'force request');
+    await eventually(()=>evaluate(`load().then(()=>!document.querySelector('[data-job-id="browser-running"]'))`),Boolean,'running terminal cancellation');
+    assert.equal(await evaluate(`window.__cancelCalls.every(c=>c.status===200)`),true);
+    markPhase('owned-browser-shutdown');
+    await command('Browser.close');
+    console.log(JSON.stringify({scenario,sourceRevision,effectiveRoute:base,effectiveMode:'admission-control with disposable request fixture',apiBehavior:'real authenticated API',browser:browserVersion.Browser,artifact,assertions:['Keep job makes no request','modal identifies exact job and owner','desktop/mobile fit','queued cancellation','running cancellation waits','separate force confirmation','worker terminal cancellation']}));
+  } else if (scenario === 'performance-deferred') {
+    await eventually(() => evaluate(`Boolean(document.querySelector('.job-item .pill.deferred'))`), Boolean, 'deferred queue render');
+    for (const [width, height] of [[1440, 1000], [390, 844]]) {
+      await command('Emulation.setDeviceMetricsOverride', {width, height, deviceScaleFactor: 1, mobile: width === 390});
+      await evaluate(`document.querySelector('.job-item .pill.deferred').closest('article').scrollIntoView({block:'start'})`);
+      await evaluate(`scrollBy(0,-document.querySelector('header').getBoundingClientRect().height-8)`);
+      const state = await evaluate(`(()=>{const node=document.querySelector('.job-item .pill.deferred').closest('article'),button=node.querySelector('button');return {text:node.innerText,cancel:button?.title,enabled:button&&!button.disabled,overflow:document.documentElement.scrollWidth>innerWidth}})()`);
+      assert.ok(state.text.includes('Reminder after'), JSON.stringify(state));
+      assert.ok(state.text.includes('Other work may proceed'), JSON.stringify(state));
+      assert.equal(state.cancel, undefined, 'admission-only monitor must keep its existing control boundary');
+      assert.equal(state.overflow, false, 'page must fit the viewport');
+      const frame = await command('Page.captureScreenshot', {format:'png', fromSurface:true});
+      writeFileSync(join(artifactDirectory, `${scenario}-${width}.png`), Buffer.from(frame.data, 'base64'));
+    }
+    markPhase('owned-browser-shutdown');
+    await command('Browser.close');
+    console.log(JSON.stringify({scenario, sourceRevision, effectiveRoute:base, effectiveMode:'admission-control with disposable request fixture', apiBehavior:'real authenticated API', browser:browserVersion.Browser, artifact, assertions:['validated deferral visible', 'reminder time visible', 'existing control boundary preserved', 'desktop and mobile fit']}));
+  } else if (scenario === 'browser-entry') {
+    const selector=`#smoke-${requestId}`;
+    assert.equal(await evaluate(`document.querySelector('${selector} a')===null`),true,'request must not link to itself or open a second application');
+    assert.equal(await evaluate(`document.querySelector('${selector} .smokeFocus').disabled`),false);
+    const initialTargets=await command('Target.getTargets');
+    await evaluate(`window.__focusCalls=[];window.__realFetch=window.fetch.bind(window);window.fetch=async(input,options)=>{const r=await window.__realFetch(input,options);if(String(input).endsWith('/focus'))window.__focusCalls.push({status:r.status,body:await r.clone().json()});return r}`);
+    for(const [width,height] of [[1440,1000],[390,844]]){
+      markPhase(`browser-entry-${width}`);
+      await command('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:width===390});
+      await evaluate(`document.querySelector('${selector}').scrollIntoView({block:'start'})`);
+      const position=await evaluate(`(()=>{const r=document.querySelector('${selector} .smokeFocus').getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2}})()`);
+      const before=await evaluate(`window.__focusCalls.length`);
+      await command('Input.dispatchMouseEvent',{type:'mousePressed',button:'left',clickCount:1,...position});
+      await command('Input.dispatchMouseEvent',{type:'mouseReleased',button:'left',clickCount:1,...position});
+      await eventually(()=>evaluate(`window.__focusCalls.length`),n=>n>before,'new click response');
+      const receipt=await evaluate(`window.__focusCalls[${before}]`);
+      assert.equal(receipt.status,200,JSON.stringify(receipt));
+      assert.equal(receipt.body.request_id,requestId);
+      const action=await eventually(()=>evaluate(`(async()=>{await loadSmoke();return lastSmoke.items.find(i=>i.request.id==='${requestId}').display.focus_action})()`),
+        value=>value?.action_id===receipt.body.action_id&&value.status!=='pending','that click owner result');
+      assert.equal(await evaluate(`location.pathname`),'/');
+      assert.deepEqual((await command('Target.getTargets')).targetInfos.map(t=>t.targetId).sort(),initialTargets.targetInfos.map(t=>t.targetId).sort(),'entry must not create any browser page');
+      assert.equal(await evaluate(`document.documentElement.scrollWidth<=innerWidth`),true);
+      const frame=await command('Page.captureScreenshot',{format:'png',fromSurface:true});
+      writeFileSync(join(artifactDirectory,`browser-entry-${width}.png`),Buffer.from(frame.data,'base64'));
+      screenshotArtifact=join(artifactDirectory,`browser-entry-${width}.png`);
+      assert.equal(action.status,'complete',JSON.stringify(action));
+      assert.equal(action.receipt.foreground,true);
+      await eventually(()=>evaluate(`document.querySelector('${selector} .smokeFocus').disabled`),v=>v===false,'focus control restored');
+    }
+    console.log(JSON.stringify({scenario,sourceRevision,effectiveRoute:base,browser:browserVersion.Browser,artifact,
+      assertions:['real monitor button and authenticated focus API','owner-bound reveal transport','no URL navigation or new page','desktop/mobile fit'],
+      nativeForeground:'synthetic owner receipt; not claimed',simulation:'no GPU workload'}));
+  } else if (scenario === 'finished-session' || scenario === 'installed-finished') {
+    const selector=`#smoke-${requestId}`;
+    const card=await evaluate(`document.querySelector('${selector}').innerText`);
+    assert.ok(card.includes('Process completed')&&card.includes('Ended '),card);
+    assert.ok(!card.includes('Start session.')&&!card.includes('Open terminal'),card);
+    assert.ok(card.includes('Did you get to try this session?'),card);
+    await evaluate(`document.querySelector('${selector} details.smokeRun').open=true`);
+    await eventually(()=>evaluate(`document.querySelector('${selector} .smokeRun').innerText`),s=>s.includes('Process output')&&s.includes('Participation:'),'actual retained run');
+    const audioButton=await evaluate(`Boolean(document.querySelector('${selector} .smokeAudio'))`);
+    assert.equal(audioButton,true,'producer audio must be present for this witness');
+    await evaluate(`document.querySelector('${selector} .smokeAudio').click()`);
+    await eventually(()=>evaluate(`document.querySelector('${selector} audio')?.readyState`),s=>s>=1,'retained audio metadata');
+    await evaluate(`window.__retainedPlayer=document.querySelector('${selector} audio');window.__retainedPlayer.currentTime=0.02;loadSmoke()`);
+    assert.equal(await evaluate(`document.querySelector('${selector} audio')===window.__retainedPlayer`),true,'refresh must preserve the actual audio element');
+    for(const [width,height] of [[1440,1000],[390,844]]){
+      markPhase(`finished-${width}`);
+      await command('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:width===390});
+      await evaluate(`(()=>{const card=document.querySelector('${selector}');card.style.scrollMarginTop=(document.querySelector('header').getBoundingClientRect().height+12)+'px';card.scrollIntoView({block:'start'})})()`);
+      assert.equal(await evaluate(`document.documentElement.scrollWidth<=innerWidth`),true);
+      const frame=await command('Page.captureScreenshot',{format:'png',fromSurface:true});
+      writeFileSync(join(artifactDirectory,`finished-${width}.png`),Buffer.from(frame.data,'base64'));
+    }
+    if(scenario==='finished-session'){
+      markPhase('repeat-without-launch');
+      await evaluate(`document.querySelector('${selector} .smokeRepeat').click()`);
+      await eventually(()=>evaluate(`document.querySelector('${selector}').innerText`),s=>s.includes('Another session requested'),'repeat request receipt');
+      await evaluate(`(()=>{const radio=document.querySelector('${selector} input[value="not-tried"]');radio.click();const t=document.querySelector('${selector} textarea');t.value='Synthetic missed-session fixture';t.dispatchEvent(new Event('input'));return loadSmoke()})()`);
+      assert.equal(await evaluate(`document.querySelector('${selector} input[value="not-tried"]').checked`),true);
+      assert.equal(await evaluate(`document.querySelector('${selector} textarea').value`),'Synthetic missed-session fixture');
+      await evaluate(`document.querySelector('${selector} form').requestSubmit()`);
+      await eventually(()=>evaluate(`document.querySelector('${selector}').innerText`),s=>s.includes('Feedback saved')&&s.includes('Participation: not-tried'),'missed-session response');
+    }
+    console.log(JSON.stringify({scenario,sourceRevision,effectiveRoute:base,browser:browserVersion.Browser,artifact,
+      assertions:['finished not live','actual retained run and audio metadata','audio element preserved through refresh','desktop and mobile fit',
+        ...(scenario==='finished-session'?['repeat request without launch','missed-session response and draft continuity']:[])],operatorAudiblePlayback:'not claimed'}));
+  } else if (scenario === 'quick-drag') {
+    markPhase('quick-drag-native-input');
+    await command('Emulation.setDeviceMetricsOverride',{width:1440,height:1000,deviceScaleFactor:1,mobile:false});
+    await evaluate(`location.hash='';smokeFilter='active';renderSmoke(lastSmoke);load()`);
+    await eventually(()=>evaluate(`document.querySelectorAll('#jobs [draggable="true"]').length`),n=>n===2,'two draggable pending jobs');
+    assert.equal(await evaluate(`document.querySelector('#quickQueue').hidden`),false,'empty Quick must remain a drop target');
+    assert.equal(await evaluate(`document.querySelectorAll('#quickJobs .job-item').length`),0);
+    await evaluate(`window.__moves=[];window.__realFetch=window.fetch.bind(window);window.fetch=async(input,options)=>{const response=await window.__realFetch(input,options);if(String(input)==='/api/dispatch-class')window.__moves.push({status:response.status,body:await response.clone().json(),input:JSON.parse(options.body)});return response}`);
+    const positions=await evaluate(`(()=>{scrollTo(0,0);const item=document.querySelector('#jobs .job-item'),a=item.querySelector('strong').getBoundingClientRect(),b=document.querySelector('#quickQueue').getBoundingClientRect();window.__dragNode=item;return {id:item.dataset.jobId,a:{x:a.x+a.width/2,y:a.y+a.height/2},b:{x:b.x+b.width/2,y:b.y+100}}})()`);
+    await command('Input.dispatchMouseEvent',{type:'mouseMoved',...positions.a});
+    await command('Input.dispatchMouseEvent',{type:'mousePressed',button:'left',buttons:1,clickCount:1,...positions.a});
+    await command('Input.dispatchMouseEvent',{type:'mouseMoved',button:'left',buttons:1,x:positions.a.x+15,y:positions.a.y+15});
+    await command('Input.dispatchMouseEvent',{type:'mouseMoved',button:'left',buttons:1,x:positions.a.x+25,y:positions.a.y+20});
+    await eventually(()=>evaluate(`draggedJob?.job_id`),id=>id===positions.id,'native dragstart');
+    await evaluate(`load()`);
+    assert.equal(await evaluate(`window.__dragNode===document.querySelector('[data-job-id="${positions.id}"]')`),true,'refresh must not replace a dragged row');
+    await command('Input.dispatchMouseEvent',{type:'mouseMoved',button:'left',buttons:1,...positions.b});
+    await command('Input.dispatchMouseEvent',{type:'mouseMoved',button:'left',buttons:1,...positions.b});
+    await command('Input.dispatchMouseEvent',{type:'mouseReleased',button:'left',clickCount:1,...positions.b});
+    await eventually(()=>evaluate(`document.querySelector('#quickJobs [data-job-id="${positions.id}"]')?.innerText`),s=>s?.includes('Manual Quick'),'native drop confirmed by API and render');
+    const moved=await evaluate(`window.__moves[0]`);
+    assert.equal(moved.status,200);
+    assert.equal(moved.body.job_id,positions.id);
+    assert.equal(moved.body.service_class,'quick');
+    const replay=await evaluate(`(async()=>{const r=await window.__realFetch('/api/dispatch-class',{method:'POST',headers:auth(),body:JSON.stringify(window.__moves[0].input)});return {status:r.status,body:await r.json()}})()`);
+    assert.equal(replay.status,200);
+    assert.deepEqual(replay.body,moved.body,'replayed native drop is idempotent');
+    const frame=await command('Page.captureScreenshot',{format:'png',fromSurface:true});
+    writeFileSync(join(artifactDirectory,'quick-drag-1440.png'),Buffer.from(frame.data,'base64'));
+    await command('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});
+    assert.equal(await evaluate(`document.documentElement.scrollWidth<=innerWidth`),true);
+    await evaluate(`(()=>{const select=document.querySelector('#quickJobs .dispatchClass');select.scrollIntoView({block:'center'});select.focus();select.value='normal';select.dispatchEvent(new Event('change',{bubbles:true}))})()`);
+    await eventually(()=>evaluate(`document.querySelectorAll('#quickJobs .job-item').length`),n=>n===0,'mobile queue selector confirmation');
+    assert.equal(await evaluate(`document.querySelector('#quickQueue').hidden`),false,'empty Quick after move-back');
+    await evaluate(`document.querySelector('#automaticQueue').scrollIntoView({block:'start'})`);
+    const phone=await command('Page.captureScreenshot',{format:'png',fromSurface:true});
+    writeFileSync(join(artifactDirectory,'quick-drag-390.png'),Buffer.from(phone.data,'base64'));
+    markPhase('quick-drag-stale-request');
+    const rejected=await evaluate(`(async()=>{const j=last.jobs[0];const r=await window.__realFetch('/api/dispatch-class',{method:'POST',headers:auth(),body:JSON.stringify({job_id:j.job_id,service_class:'quick',request_digest:'0'.repeat(64),request_id:crypto.randomUUID()})});return {status:r.status,body:await r.json()}})()`);
+    assert.equal(rejected.status,409);
+    assert.ok(rejected.body.error.includes('digest'));
+    // A fresh normal override also demonstrates another action remains independent.
+    await evaluate(`moveJob(last.jobs.find(j=>j.job_id==='${positions.id}'),'quick')`);
+    await evaluate(`moveJob(last.jobs.find(j=>j.job_id==='${positions.id}'),'normal')`);
+    markPhase('quick-drag-visible-rejection');
+    await evaluate(`(()=>{last.jobs.find(j=>j.job_id==='${positions.id}').request_digest='0'.repeat(64);render(last);const select=document.querySelector('[data-job-id="${positions.id}"] .dispatchClass');select.value='quick';select.dispatchEvent(new Event('change',{bubbles:true}))})()`);
+    await eventually(()=>evaluate(`window.__moves.length`),n=>n===5,'real stale UI move response');
+    assert.equal(await evaluate(`window.__moves[4].status`),409);
+    assert.equal(await evaluate(`document.querySelector('#error').style.display==='block'&&document.querySelector('#error').textContent.includes('digest')`),true,'rejected UI move must display its actual error');
+    assert.equal(await evaluate(`document.querySelector('[data-job-id="${positions.id}"] .dispatchClass').value`),'normal','failed move retains confirmed Automatic class');
+    markPhase('quick-drag-refresh-outage');
+    await evaluate(`window.fetch=(input,options)=>String(input).startsWith('/api/state')?Promise.reject(new Error('synthetic queue read outage')):window.__realFetch(input,options);load()`);
+    assert.equal(await evaluate(`document.querySelectorAll('.job-item[draggable="true"]').length`),0);
+    assert.equal(await evaluate(`[...document.querySelectorAll('.dispatchClass')].every(n=>n.disabled)`),true);
+    console.log(JSON.stringify({scenario,sourceRevision,effectiveRoute:base,effectiveMode:'admission-control with disposable request fixture',apiBehavior:'real authenticated API; injected refresh outage only',browser:browserVersion.Browser,artifact,
+      assertions:['native mouse drag into empty Quick','real authenticated override','idempotent replay','refresh preserves active drag','mobile selector move-back','stale UI move displays error','stale digest rejected','failed refresh disables moves','desktop/mobile fit']}));
+  } else if (scenario === 'columns' || scenario === 'installed-columns') {
+    await evaluate(`location.hash='';smokeFilter='active';renderSmoke(lastSmoke);load()`);
+    if(scenario==='columns'){
+      await eventually(()=>evaluate(`document.querySelectorAll('#quickJobs .job-item').length`),n=>n===1,'one quick automatic job; smoke excluded');
+      assert.equal(await evaluate(`document.querySelectorAll('#quickJobs .quick').length`),1,'quick class comes from policy');
+      assert.equal(await evaluate(`document.querySelectorAll('#jobs .quick').length`),0,'quick automatic work is separate');
+    }else{
+      await evaluate(`load()`);
+      assert.equal(await evaluate(`(()=>{const linked=new Set(lastSmoke.items.map(item=>item.display?.job_id).filter(Boolean));return [...document.querySelectorAll('#jobs .job-item')].some(row=>linked.has(row.dataset.jobId))})()`),false,'installed smoke jobs not duplicated');
+    }
+    for(const [width,height] of [[1440,1000],[390,844]]){
+      await command('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:width===390});
+      const bounds=await evaluate(`(()=>{scrollTo(0,0);const a=document.querySelector('#automaticQueue').getBoundingClientRect(),b=document.querySelector('#operatorQueue').getBoundingClientRect(),q=document.querySelector('#quickQueue'),c=q.getBoundingClientRect();return {a:{x:a.x,y:a.y,right:a.right,bottom:a.bottom},b:{x:b.x,y:b.y,right:b.right,bottom:b.bottom},quick:!q.hidden,c:{x:c.x,y:c.y}}})()`);
+      if(width===1440){assert.ok(bounds.a.right<bounds.b.x);assert.ok(Math.abs(bounds.a.y-bounds.b.y)<2)}
+      else assert.ok(bounds.b.y>=bounds.a.bottom);
+      if(bounds.quick){if(width===1440){assert.ok(bounds.b.right<bounds.c.x);assert.ok(Math.abs(bounds.b.y-bounds.c.y)<2)}else assert.ok(bounds.c.y>=bounds.b.bottom)}
+      assert.equal(await evaluate(`document.documentElement.scrollWidth<=innerWidth`),true);
+      const frame=await command('Page.captureScreenshot',{format:'png',fromSurface:true});
+      writeFileSync(join(artifactDirectory,`columns-${width}.png`),Buffer.from(frame.data,'base64'));
+    }
+    console.log(JSON.stringify({scenario,sourceRevision,effectiveRoute:base,browser:browserVersion.Browser,artifact,
+      assertions:['separate automatic/operator columns','conditional quick column','native quick badge','no duplicate smoke job','desktop/mobile fit']}));
+  } else if (scenario === 'destinations') {
+    for (const [width, height] of [[1440,1000],[390,844]]) {
+      markPhase(`destinations-${width}`);
+      await command('Emulation.setDeviceMetricsOverride', {width,height,deviceScaleFactor:1,mobile:width===390});
+      await evaluate(`location.hash='';smokeFilter='active';renderSmoke(lastSmoke)`);
+      assert.equal(await evaluate(`document.querySelectorAll('.smoke-card').length`),2);
+      assert.equal(await evaluate(`document.documentElement.scrollWidth<=innerWidth`),true);
+      const frame=await command('Page.captureScreenshot',{format:'png',fromSurface:true});
+      writeFileSync(join(artifactDirectory,`active-${width}.png`),Buffer.from(frame.data,'base64'));
+      const expectedPane=await evaluate(`Number(document.querySelector('.smokeFocus').textContent.split('pane ')[1])`);
+      await evaluate(`(()=>{const realFetch=window.fetch.bind(window);window.fetch=async (...args)=>{const r=await realFetch(...args);if(String(args[0]).endsWith('/focus'))window.__focusReceipt={status:r.status,body:await r.clone().json()};return r};window.__focusReceipt=null;document.querySelector('.smokeFocus').click()})()`);
+      const focused=await eventually(()=>evaluate(`window.__focusReceipt`),Boolean,'real terminal focus receipt');
+      assert.equal(focused.status,200,JSON.stringify(focused));
+      assert.equal(focused.body.pane_id,expectedPane);
+      const bounds=await evaluate(`(()=>{const link=document.querySelector('a');link.scrollIntoView({block:'center'});const r=link.getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2}})()`);
+      await command('Input.dispatchMouseEvent',{type:'mousePressed',button:'left',clickCount:1,...bounds});
+      await command('Input.dispatchMouseEvent',{type:'mouseReleased',button:'left',clickCount:1,...bounds});
+      const targets=await eventually(()=>command('Target.getTargets'),value=>value.targetInfos.some(x=>x.url===base+'/actual-smoke'),'application popup');
+      const app=targets.targetInfos.find(x=>x.url===base+'/actual-smoke');
+      const {sessionId}=await command('Target.attachToTarget',{targetId:app.targetId,flatten:true});
+      const heading=await eventually(()=>evaluate(`document.querySelector('h1')?.textContent`,sessionId),x=>x==='Actual smoke application','actual application content');
+      assert.equal(heading,'Actual smoke application');
+      const appFrame=await command('Page.captureScreenshot',{format:'png'},sessionId);
+      writeFileSync(join(artifactDirectory,`application-${width}.png`),Buffer.from(appFrame.data,'base64'));
+      await command('Target.closeTarget',{targetId:app.targetId});
+      await evaluate(`document.querySelector('[data-smoke-filter="history"]').click()`);
+      assert.equal(await evaluate(`document.querySelectorAll('.smoke-card').length`),1);
+      assert.equal(await evaluate(`document.querySelector('.smoke-card h3').textContent`),'Synthetic diagnostic');
+    }
+    console.log(JSON.stringify({scenario,sourceRevision,effectiveRoute:base,browser:browserVersion.Browser,artifact,assertions:['actual browser destination opened','real observed terminal focused','active/history filters','desktop and mobile fit']}));
+  } else if (scenario === 'stale-submit') {
     markPhase('draft-and-stale-submit');
     const typing = await evaluate(`(()=>{const t=document.querySelector('textarea.smoke-response');t.value='the draft survives';t.focus();t.setSelectionRange(4,10);return true})()`);
     assert.equal(typing, true);

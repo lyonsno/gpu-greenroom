@@ -88,6 +88,7 @@ def cmd_submit(args):
         params=params,
         agent_id=_optional_agent_id(args.agent_id),
         service_class=getattr(args,'service_class',None),
+        performance_window=getattr(args, 'performance_window', None),
     )
     try:
         definitions = _load_job_types(args.queue_dir, strict=True)
@@ -137,6 +138,10 @@ def cmd_smoke_request(args):
         print(json.dumps(store.update(args.request_id, payload), indent=2))
     elif args.smoke_action == 'start':
         print(json.dumps(store.start(args.request_id, args.request_digest), indent=2))
+    elif args.smoke_action in {'configure', 'session'}:
+        payload = json.loads(Path(args.update_file).expanduser().read_text())
+        method = store.configure if args.smoke_action == 'configure' else store.publish_session
+        print(json.dumps(method(args.request_id, payload), indent=2))
 
 
 def cmd_prepared_command(args):
@@ -192,6 +197,8 @@ def cmd_dispatch_policy(args):
 def _command_payload(args):
     manifest_path = None
     if args.manifest:
+        if getattr(args, 'performance_window', None) is not None:
+            raise ValueError('--performance-window cannot override a manifest')
         if args.agent_id is not None:
             raise ValueError("--agent-id cannot be used with --manifest; declare agent_id in the manifest")
         if getattr(args,'service_class',None) is not None:
@@ -205,7 +212,7 @@ def _command_payload(args):
         if argv and argv[0] == "--":
             argv = argv[1:]
         payload = {
-            "schema": "gpu-greenroom.command.v2" if getattr(args,'service_class',None) is not None or getattr(args,'cooperative_checkpoint',None) else "gpu-greenroom.command.v1",
+            "schema": "gpu-greenroom.command.v2" if getattr(args,'service_class',None) is not None or getattr(args,'cooperative_checkpoint',None) or getattr(args, 'performance_window', None) is not None else "gpu-greenroom.command.v1",
             "agent_id": args.agent_id,
             "repo_root": args.repo_root,
             "cwd": args.cwd,
@@ -217,6 +224,7 @@ def _command_payload(args):
             "timeout": args.timeout,
             "service_class": getattr(args,'service_class',None),
             "cooperative_checkpoint": bool(getattr(args,'cooperative_checkpoint',False)),
+            "performance_window": getattr(args, 'performance_window', None),
         }
 
     payload = admission.normalize_manifest(payload)
@@ -235,6 +243,8 @@ def _command_payload(args):
         "command_schema": payload['schema'],
         "cooperative_checkpoint": payload['cooperative_checkpoint'],
         "preflight": payload['preflight'],
+        "performance_window": payload.get('performance_window'),
+        "runtime_profile": payload.get('runtime_profile'),
     }
 
 
@@ -268,7 +278,7 @@ def cmd_submit_command(args):
         print(json.dumps(report, indent=2), file=sys.stderr)
         sys.exit(2)
 
-    if payload['command_schema'] == 'gpu-greenroom.command.v3':
+    if payload['command_schema'] == 'gpu-greenroom.command.v3' or (payload['command_schema'] == 'gpu-greenroom.command.v4' and payload['preflight'] is not None):
         try:
             plan = admission.prepare(queue, {**payload, 'schema': payload['command_schema']})
             job_dir = admission.submit_prepared(queue, plan)
@@ -281,24 +291,7 @@ def cmd_submit_command(args):
                           'request_path': str(job_dir / 'request.json'), 'output_dir': request.output_dir,
                           'validation': plan['validation'], 'required_worker_capabilities': request.required_worker_capabilities}, indent=2))
         return
-    request = JobRequest(
-        job_type="command",
-        input_path="",
-        output_dir=payload["output_dir"],
-        agent_id=payload["agent_id"],
-        repo_root=payload["repo_root"],
-        command_argv=payload["argv"],
-        command_cwd=payload["cwd"],
-        command_env=payload["env"],
-        route_identity=payload["route_identity"],
-        command_timeout=payload["timeout"],
-        output_class=payload["output_class"],
-        required_worker_capabilities=[STRUCTURED_COMMAND_CAPABILITY],
-        service_class=payload['service_class'],
-        cooperative_checkpoint=payload['cooperative_checkpoint'],
-    )
-    if payload['command_schema']=='gpu-greenroom.command.v2':
-        request.required_worker_capabilities.append('structured-command.v2')
+    request = admission.command_request(payload)
     try:
         job_dir = queue.submit(request)
     except (ValueError,OSError) as error:
@@ -349,6 +342,18 @@ def cmd_status(args):
 
 def cmd_cancel(args):
     queue = get_queue(args)
+    if getattr(args, 'running', False) or getattr(args, 'force', False):
+        import hashlib
+        import uuid
+        state = queue.get_job(args.job_id)
+        if state is None or state.status.value != 'running':
+            raise ValueError('running job not found')
+        digest = hashlib.sha256((queue.queue_dir/'running'/args.job_id/'request.json').read_bytes()).hexdigest()
+        result = queue.request_cancel(job_id=args.job_id, request_digest=digest,
+            expected_status='running', expected_started_at=state.started_at,
+            request_id=uuid.uuid4().hex, requested_by='cli', force=bool(args.force))
+        print(json.dumps(result))
+        return
     if queue.cancel(args.job_id):
         print(f"Cancelled job {args.job_id}")
     else:
@@ -366,6 +371,7 @@ def cmd_operator(args):
         admission_control=args.admission_control,
         identity_label=args.identity_label,
         local_operator=args.local_operator,
+        job_control=args.job_control,
     )
 
 
@@ -779,6 +785,20 @@ def cmd_lineage(args):
         print(lineage_mod.render_text(graph))
 
 
+def cmd_history(args):
+    from . import runtime_history
+    if args.history_action == 'refresh':
+        result = runtime_history.refresh(args.queue_dir, args.index)
+    else:
+        if not args.manifest:
+            raise ValueError('history estimate requires --manifest')
+        payload = admission.normalize_manifest(json.loads(Path(args.manifest).read_text()))
+        request = admission.command_request(payload)
+        result = runtime_history.estimate(args.queue_dir,args.index,request,payload.get('runtime_profile'),
+            minimum_samples=args.minimum_samples,max_seconds=args.max_seconds)
+    print(json.dumps(result,indent=2))
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="gpu-greenroom",
@@ -795,6 +815,13 @@ def main():
     )
 
     sub = parser.add_subparsers(dest="command")
+    p_history = sub.add_parser('history', help='Read-only compatible command runtime history')
+    p_history.add_argument('history_action', choices=['refresh','estimate'])
+    p_history.add_argument('--index', required=True)
+    p_history.add_argument('--manifest', help='Existing command.v2/v3 manifest with runtime_profile')
+    p_history.add_argument('--minimum-samples', type=int, default=3)
+    p_history.add_argument('--max-seconds', type=float, default=30)
+    p_history.set_defaults(func=cmd_history)
 
     # submit
     p_submit = sub.add_parser("submit", help="Submit a job")
@@ -810,6 +837,7 @@ def main():
     )
     p_submit.set_defaults(func=cmd_submit)
     p_submit.add_argument('--service-class',choices=['normal','quick'],default=None)
+    p_submit.add_argument('--performance-window', metavar='REASON', help='Ask the operator for a quiet performance window at dispatch')
 
     # submit-command
     p_command = sub.add_parser(
@@ -832,6 +860,7 @@ def main():
     p_command.set_defaults(func=cmd_submit_command)
     p_command.add_argument('--service-class',choices=['normal','quick'],default=None)
     p_command.add_argument('--cooperative-checkpoint',action='store_true',default=None)
+    p_command.add_argument('--performance-window', metavar='REASON', help='Ask the operator for a quiet performance window at dispatch')
 
     p_prepare = sub.add_parser('prepare-command', help='Validate and preserve a command without enqueueing')
     p_prepare.add_argument('--manifest', required=True)
@@ -849,7 +878,7 @@ def main():
 
     # list
     p_list = sub.add_parser("list", help="List jobs")
-    p_list.add_argument("-s", "--status", choices=["pending", "running", "done", "failed", "cancelled"])
+    p_list.add_argument("-s", "--status", choices=[status.value for status in JobStatus])
     p_list.set_defaults(func=cmd_list)
 
     # status
@@ -858,8 +887,10 @@ def main():
     p_status.set_defaults(func=cmd_status)
 
     # cancel
-    p_cancel = sub.add_parser("cancel", help="Cancel a pending job")
+    p_cancel = sub.add_parser("cancel", help="Cancel queued work or explicitly stop a running job")
     p_cancel.add_argument("job_id")
+    p_cancel.add_argument('--running', action='store_true', help='request cancellation of this running job')
+    p_cancel.add_argument('--force', action='store_true', help='force stop this running job; unsaved work may be lost')
     p_cancel.set_defaults(func=cmd_cancel)
 
     # Interactive-smoke requests are Greenroom-owned records, separate from GPU jobs.
@@ -881,12 +912,18 @@ def main():
     p_smoke_update.add_argument('request_id')
     p_smoke_update.add_argument('update_file')
     p_smoke_update.set_defaults(func=cmd_smoke_request)
+    for action in ('configure', 'session'):
+        p = smoke_sub.add_parser(action, help='Publish local smoke destination or observed terminal phase')
+        p.add_argument('request_id')
+        p.add_argument('update_file')
+        p.set_defaults(func=cmd_smoke_request)
 
     # operator console
     p_operator = sub.add_parser("operator", help="Run the authenticated localhost operator console")
     p_operator.add_argument("--port", type=int, default=8765)
     p_operator.add_argument("--identity-label", default="Agent")
     p_operator.add_argument("--local-operator", action="store_true")
+    p_operator.add_argument('--job-control', action='store_true', help='enable confirmed exact-job cancellation')
     operator_modes = p_operator.add_mutually_exclusive_group()
     operator_modes.add_argument("--read-only", action="store_true")
     operator_modes.add_argument("--admission-control", action="store_true")

@@ -91,3 +91,21 @@ def test_smoke_request_scan_keeps_valid_records_visible_beside_corruption(tmp_pa
     assert [record["request"]["id"] for record in records] == [request_payload["id"]]
     assert len(errors) == 1
     assert broken_id in errors[0]
+
+
+def test_snapshot_reuses_one_display_observation_for_delivery(tmp_path, request_payload, monkeypatch):
+    store = SmokeRequests(tmp_path / "smoke-requests")
+    store.submit(request_payload)
+    original = store.display
+    calls = []
+
+    def display(record):
+        calls.append(record["request"]["id"])
+        return original(record)
+
+    monkeypatch.setattr(store, "display", display)
+    snapshot = store.snapshot()
+    assert snapshot["errors"] == []
+    assert snapshot["items"][0]["display"]["phase"] == "operator-needed"
+    assert snapshot["items"][0]["delivery"] == {}
+    assert calls == [request_payload["id"]]

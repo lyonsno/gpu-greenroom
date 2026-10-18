@@ -10,11 +10,12 @@ from gpu_queue.models import JobRequest
 from gpu_queue.queue import GPUQueue
 
 
+@pytest.mark.parametrize('manual', [False, True])
 @pytest.mark.parametrize('tamper',[False,True])
-def test_native_checkpoint_continuation_releases_mutex_before_quick_then_resumes(tmp_path,tamper):
+def test_native_checkpoint_continuation_releases_mutex_before_quick_then_resumes(tmp_path,tamper,manual):
     queue=GPUQueue(tmp_path/'queue')
     queue.configure_dispatch({'schema':'gpu-greenroom.dispatch-policy.v1','mode':'two-class',
-                              'quick_job_types':{},'quick_routes':{'fixture/quick':'observed CPU fixture'}},owner='fixture-operator')
+                              'quick_job_types':{},'quick_routes':{} if manual else {'fixture/quick':'observed CPU fixture'}},owner='fixture-operator')
     script=tmp_path/'work.py'
     script.write_text('''import json,os,pathlib,sys,time
 from gpu_queue.cooperative import load_checkpoint,yield_if_requested
@@ -37,11 +38,17 @@ if state['unit']==0:
     queue.submit(parent)
     worker=threading.Thread(target=queue.run_one,args=({},))
     worker.start()
-    while not marker.exists() and worker.is_alive(): time.sleep(.01)
+    while worker.is_alive() and (not marker.exists() or marker.read_text() != '0'): time.sleep(.01)
     assert marker.read_text()=='0'
     quick=JobRequest(job_type='command',input_path='',command_argv=[sys.executable,'-c','pass'],
                      command_cwd=str(tmp_path),route_identity='fixture/quick')
     queue.submit(quick)
+    if manual:
+        import hashlib
+        from uuid import uuid4
+        queue.override_dispatch(job_id=quick.job_id, service_class='quick',
+            request_digest=hashlib.sha256((queue.queue_dir/'pending'/quick.job_id/'request.json').read_bytes()).hexdigest(),
+            request_id=str(uuid4()), requested_by='synthetic-console')
     proceed.touch()
     worker.join()
     assert (queue.queue_dir/'done'/parent.job_id).is_dir()

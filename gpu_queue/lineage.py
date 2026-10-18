@@ -268,7 +268,7 @@ class Records:
             pf, cs = producer.get("finished_at"), consumer.get("started_at")
             if accepted and producer.get("record_unreadable"):
                 accepted, reason = False, f"producer record unreadable ({', '.join(producer['record_unreadable'])}); nothing it says is trusted"
-            elif accepted and producer.get("status") in ("pending", "running") and producer.get("record_source") != "gc-receipt":
+            elif accepted and producer.get("status") in ("pending", "deferred", "running") and producer.get("record_source") != "gc-receipt":
                 accepted, reason = False, f"producer has not finished (status {producer.get('status')})"
             elif accepted and producer.get("never_started") and producer.get("record_source") != "gc-receipt":
                 accepted, reason = False, "producer was cancelled before it started"   # the shape GPUQueue.cancel writes, judged by records.JobRecord

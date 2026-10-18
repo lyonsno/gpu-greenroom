@@ -40,7 +40,8 @@ The producer registers that ID's terminal delivery before publishing the human
 handoff. The monitor's Start session button activates it. Headless consumers use
 smoke-request start with the exact request digest. Repeated/concurrent starts
 and recovery after enqueue-before-activation-record preserve the same job ID.
-An operator response is unavailable before the prepared execution finishes.
+An operator response is unavailable before Start; it becomes available at a
+published usable session or after native execution ends.
 
 HTTP Start accepts only a known request identity and digest. HTTP creation cannot
 publish commands, and HTTP reads hide argv/environment/preflight details. The
@@ -109,3 +110,96 @@ supported safe release boundary and return to CPU-side waiting. A field saying
 awaiting_operator does not authorize release of a loaded model. For RAON's
 current implementation, process exit and a fresh Start is the source-owned
 integration recommendation; deleting the session alone retains the model.
+
+## Finished Sessions
+
+Process completion does not record that the operator tried the application.
+Finished cards show the native end time and exit status, remove live directions
+and terminal navigation, and ask whether the operator tried or missed the session.
+Responses retain optional participation (`tried` or `not-tried`) separately from
+their text; legacy responses make no participation claim. Needs attention counts
+unresolved requests, not running applications.
+
+View last run reads the exact linked native job's complete stdout/stderr. Producers
+may add retained audio through the existing local configuration command:
+
+```json
+{"review_artifacts":[{"path":"conversation/playback.wav","label":"Recorded playback"}]}
+```
+
+Paths must be relative to that job's recorded output directory. Configuration
+binds the file bytes; missing, changed, empty or escaped files are unavailable,
+not playable evidence. Audio requires the same bearer credential as the API.
+HTTP accepts a published artifact index, never a caller-selected file path.
+
+Request another session records an idempotent `repeat_request` in the existing
+request. It grants no execution authority. The producer consumes this receipt,
+prepares a distinct request/job with an independent output directory, registers
+its completion delivery, and links it through local configuration:
+
+```json
+{"next_request_id":"<new prepared request UUID>"}
+```
+
+The finished card then offers Start new session against that new request's digest;
+after activation it offers View new session. Original request, finished job and
+retained output remain unchanged. Preparation itself never enqueues a GPU job.
+Missing or invalid successor preparation is explicit; the UI cannot guess argv,
+reuse a finished job, or silently restart a model. Producers own repeat-request
+consumption and publication of the successor, just as they own first preparation.
+
+## Usable Application Publication And Returns
+
+Prepare once through the existing smoke-request file contract. In the live
+application, publish at the usable boundary (after warmup, before waiting for
+the human):
+
+```python
+from gpu_queue.smoke_session import publish
+
+publish(request_id, queue_dir='/durable/queue',
+        label='Warmup complete; microphone remains closed')
+```
+
+The terminal hook derives its own PID and WEZTERM_PANE, then verifies actual
+kernel process identity and tty. Call it in the terminal application's process,
+not an unrelated shell. Existing local smoke-request session publication remains
+available for an observer with exact child coordinates. Browser applications
+publish their actual application URL explicitly:
+
+```python
+publish(request_id, queue_dir='/durable/queue',
+        browser_url='http://127.0.0.1:9000/live', label='Application accepting input')
+```
+
+This browser phase is producer-reported, not a browser-rendering attestation.
+Both hooks require the exact owner-linked native job to be running. Loading,
+prepared, stale/dead terminal and completed sessions do not generate a live
+notification. Phase-only changes do not repeat notifications. A notification
+link names the exact request and destination digest; after a change or end, it
+opens the retained request instead of focusing a different process.
+
+The optional host adapter is set by the monitor's environment through
+GPU_GREENROOM_SMOKE_DELIVERY_ADAPTER, an absolute executable accepting JSON stdin
+with operation (deliver/status) and a gpu-greenroom.smoke-event.v1 event. It
+returns event_id and a status bound to that event. Usable events accept notified,
+failed or uncertain; feedback/repeat events accept queued, submitted, consumed,
+failed or uncertain. API clients cannot choose this executable. The adapter is
+notification/feedback transport only and grants no execution authority.
+
+The monitor durably claims each event before transport. Restart or lost
+acknowledgement uses status observation, never blind resend. Definite failures
+offer explicit delivery retry; uncertain delivery retains that uncertainty.
+Feedback is saved before transport and exact text/participation survive a
+delivery failure. Queued does not mean the owner read it; consumed requires a
+receiver disposition. Activating the adapter does not broadcast old saved
+responses or old sessions. Their records remain available for explicit return.
+
+Automatic work and operator smokes are separate monitor columns over the same
+native execution queue. Quick automatic work gets a third visual column when
+present, not another execution queue. Quick badges use native dispatch receipts when present,
+otherwise current policy projection; pending positions use native selection
+order. An activated smoke is not duplicated as automatic work. These columns
+neither create a second GPU mutex nor reorder work. Start continues to wait for
+normal release or already-supported cooperative yielding; it does not signal,
+kill, or automatically interrupt a current holder.

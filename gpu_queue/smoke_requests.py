@@ -19,6 +19,8 @@ from .models import JobRequest
 
 
 SCHEMA = "gpu-greenroom.interactive-smoke.v1"
+AUDIO_TYPES = {'.wav': 'audio/wav', '.m4a': 'audio/mp4', '.mp3': 'audio/mpeg', '.ogg': 'audio/ogg'}
+READER_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 
 class SmokeRequestConflict(ValueError):
@@ -58,6 +60,23 @@ def _timestamp(value: object, field: str) -> str:
     return value
 
 
+def _target(value):
+    if not isinstance(value, dict) or value.get('kind') not in {'browser', 'terminal'}:
+        raise ValueError('target must be a browser application or terminal')
+    if value['kind'] == 'terminal':
+        if set(value) != {'kind'}:
+            raise ValueError('terminal identity is published separately through the local CLI')
+        return {'kind': 'terminal'}
+    url = value.get('url')
+    if not isinstance(url, str):
+        raise ValueError('browser target URL is required')
+    parsed = urlsplit(url)
+    if (parsed.scheme not in {'http', 'https'} or not parsed.hostname or parsed.username
+            or parsed.password or any(ord(char) < 32 for char in url)):
+        raise ValueError('browser target URL must be HTTP(S), without credentials')
+    return {'kind': 'browser', 'url': url}
+
+
 def validate_request(value: object) -> dict:
     if not isinstance(value, dict) or value.get("schema") != SCHEMA:
         raise ValueError(f"request schema must be {SCHEMA}")
@@ -73,19 +92,12 @@ def validate_request(value: object) -> dict:
     repo_root = source.get("repo_root")
     if not isinstance(repo_root, str) or not Path(repo_root).is_absolute():
         raise ValueError("source repo_root must be absolute")
-    for field in ("title", "prompt", "url", "availability_note"):
+    for field in ("title", "prompt", "availability_note"):
         field_value = value.get(field)
         if not isinstance(field_value, str) or not field_value.strip():
             raise ValueError(f"missing {field}")
-    url = urlsplit(value["url"])
-    if (
-        url.scheme not in {"http", "https"}
-        or not url.hostname
-        or url.username
-        or url.password
-        or any(ord(char) < 32 for char in value["url"])
-    ):
-        raise ValueError("smoke URL must be HTTP(S), without credentials or control characters")
+    if 'url' in value or 'target' not in value:
+        _target({'kind': 'browser', 'url': value.get('url')})
     if value.get("availability") not in {"prepared", "preparation-needed", "unavailable"}:
         raise ValueError("invalid reported availability")
     job_id = value.get("job_id")
@@ -93,6 +105,10 @@ def validate_request(value: object) -> dict:
         raise ValueError("job_id must be a non-empty string when supplied")
     if job_id is not None and (not all(c.isalnum() or c in '_-' for c in job_id)):
         raise ValueError("job_id must be a single safe queue identity")
+    if 'target' in value:
+        _target(value['target'])
+    if value.get('purpose', 'operator') not in {'operator', 'diagnostic'}:
+        raise ValueError('purpose must be operator or diagnostic')
     return deepcopy(value)
 
 
@@ -181,11 +197,55 @@ class SmokeRequests:
             if response.get("actor") != {"kind": "unverified-caller", "id": None}:
                 raise ValueError("response actor attribution must remain unverified")
             _timestamp(response.get("responded_at"), "responded_at")
+            if response.get('participation') not in {None, 'tried', 'not-tried'}:
+                raise ValueError('invalid operator participation')
+        if 'repeat_request' in record:
+            repeat = record['repeat_request']
+            if (not isinstance(repeat, dict) or repeat.get('request_digest') != record['request_digest']
+                    or repeat.get('gpu_execution_authority') is not False):
+                raise ValueError('invalid repeat request receipt')
+            _timestamp(repeat.get('requested_at'), 'repeat requested_at')
         if 'progress' in record:
             _progress(record['progress'])
             if type(record['progress'].get('revision')) is not int or record['progress']['revision'] < 1:
                 raise ValueError('invalid progress revision')
             _timestamp(record['progress'].get('updated_at'), 'updated_at')
+        if 'presentation' in record:
+            presentation = record['presentation']
+            if not isinstance(presentation, dict) or presentation.get('purpose', 'operator') not in {'operator', 'diagnostic'}:
+                raise ValueError('invalid smoke presentation')
+            if 'target' in presentation:
+                _target(presentation['target'])
+            if 'next_request_id' in presentation:
+                _canonical_id(presentation['next_request_id'])
+            if 'review_artifacts' in presentation:
+                self._artifact_list(presentation['review_artifacts'], bound=True)
+        if 'session' in record:
+            session = record['session']
+            if (not isinstance(session, dict) or session.get('schema') != 'gpu-greenroom.smoke-session.v1'
+                    or session.get('request_digest') != record['request_digest']
+                    or session.get('phase') not in {'loading', 'operator-needed', 'interactive'}
+                    or type(session.get('pane_id')) is not int or session['pane_id'] < 0
+                    or type(session.get('pid')) is not int or session['pid'] <= 0
+                    or not isinstance(session.get('tty_name'), str) or not session['tty_name'].startswith('/dev/')
+                    or not isinstance(session.get('process_start_identity'), str) or not session['process_start_identity']
+                    or not isinstance(session.get('label'), str) or not session['label'].strip()
+                    or not isinstance(session.get('job_id'), str) or not session['job_id']
+                    or not all(c.isalnum() or c in '_-' for c in session['job_id'])):
+                raise ValueError('invalid terminal session record')
+            _timestamp(session.get('observed_at'), 'session observed_at')
+        if 'application_session' in record:
+            application = record['application_session']
+            if (not isinstance(application, dict) or application.get('request_digest') != record['request_digest']
+                    or application.get('phase') not in {'loading', 'operator-needed', 'interactive'}
+                    or not isinstance(application.get('job_id'), str) or not application['job_id']
+                    or not isinstance(application.get('label'), str) or not application['label'].strip()):
+                raise ValueError('invalid application session record')
+            _target({'kind': 'browser', 'url': application.get('url')})
+            _timestamp(application.get('observed_at'), 'application observed_at')
+            if 'reveal' in application:
+                from .smoke_browser import validate
+                validate(application['reveal'])
         if 'operator_command' in request:
             plan = record.get('prepared')
             if not isinstance(plan, dict) or plan.get('schema') != admission.PLAN_SCHEMA:
@@ -200,6 +260,294 @@ class SmokeRequests:
                     or job.params.get(admission.DIGEST_PARAM) != admission.digest(validation)):
                 raise ValueError('prepared command owner or validation identity conflicts')
         return record
+
+    def configure(self, identity, payload):
+        if not isinstance(payload, dict) or not payload or set(payload) - {'target', 'purpose', 'next_request_id', 'review_artifacts'}:
+            raise ValueError('configuration accepts target, purpose, next_request_id and review_artifacts only')
+        if 'target' in payload:
+            _target(payload['target'])
+        if 'purpose' in payload and payload['purpose'] not in {'operator', 'diagnostic'}:
+            raise ValueError('purpose must be operator or diagnostic')
+        with self._locked(identity):
+            record = self.get(identity)
+            changed = deepcopy(payload)
+            if 'next_request_id' in changed:
+                self._successor(record, changed['next_request_id'])
+            if 'review_artifacts' in changed:
+                _, _, _, job = self._terminal_job(record)
+                self._artifact_list(changed['review_artifacts'])
+                changed['review_artifacts'] = [{**item, **self._artifact_binding(job, item)}
+                                               for item in changed['review_artifacts']]
+            record['presentation'] = {**record.get('presentation', {}), **changed}
+            if 'target' in payload and payload['target']['kind'] != 'terminal':
+                record.pop('session', None)
+            return self._write(record)
+
+    def _linked_job(self, record):
+        job_id = (record.get('activation') or {}).get('job_id') or (record.get('progress') or {}).get('current_job_id') or record['request'].get('job_id')
+        if not isinstance(job_id, str) or not job_id or not all(c.isalnum() or c in '_-' for c in job_id):
+            raise ValueError('linked job identity is missing or invalid')
+        root = self.directory.parent
+        paths = [root / stage / job_id for stage in ('pending', 'deferred', 'running', 'done', 'failed', 'cancelled')
+                 if (root / stage / job_id).is_dir()]
+        if len(paths) != 1:
+            raise ValueError('linked job is missing or ambiguous')
+        path = paths[0]
+        if path.is_symlink() or path.resolve().parent != path.parent.resolve():
+            raise ValueError('linked job directory escaped its queue')
+        state = self._job_file(path, 'status.json', json_value=True)
+        job = self._job_file(path, 'request.json', json_value=True)
+        if (state.get('job_id') != job_id or state.get('status') != path.parent.name
+                or job.get('job_id') != job_id or job.get('agent_id') != record['request']['source']['agent_id']):
+            raise ValueError('linked job owner, identity or state conflicts')
+        return path.parent.name, path, state, job
+
+    @staticmethod
+    def _job_file(path, name, *, json_value=False):
+        source = path / name
+        if source.is_symlink() or source.resolve().parent != path.resolve():
+            raise ValueError('native run file escaped its job directory')
+        text = source.read_text(encoding='utf-8', errors='replace')
+        if not json_value:
+            return text
+        value = json.loads(text)
+        if not isinstance(value, dict):
+            raise ValueError('linked job record is malformed')
+        return value
+
+    def _terminal_job(self, record):
+        linked = self._linked_job(record)
+        if linked[0] not in {'done', 'failed', 'cancelled'}:
+            raise ValueError('last run has not ended')
+        return linked
+
+    @staticmethod
+    def _artifact_list(items, *, bound=False):
+        if not isinstance(items, list):
+            raise ValueError('review_artifacts must be a list')
+        for item in items:
+            keys = {'path', 'label', 'sha256', 'size'} if bound else {'path', 'label'}
+            if (not isinstance(item, dict) or set(item) != keys
+                    or not isinstance(item.get('label'), str) or not item['label'].strip()
+                    or not isinstance(item.get('path'), str) or not item['path']
+                    or Path(item['path']).is_absolute() or '..' in Path(item['path']).parts
+                    or Path(item['path']).suffix.lower() not in AUDIO_TYPES):
+                raise ValueError('review artifact needs a label and relative audio path')
+            if bound and (not isinstance(item['sha256'], str) or len(item['sha256']) != 64
+                          or type(item['size']) is not int or item['size'] <= 0):
+                raise ValueError('review artifact byte binding is invalid')
+
+    @staticmethod
+    def _artifact_path(job, item):
+        root_value = job.get('output_dir')
+        if not isinstance(root_value, str) or not Path(root_value).is_absolute():
+            raise ValueError('native output root is missing')
+        root = Path(root_value).resolve()
+        path = (root / item['path']).resolve()
+        if not path.is_relative_to(root) or not path.is_file() or path.stat().st_size == 0:
+            raise ValueError('review artifact is missing, empty or outside the native output root')
+        return path
+
+    def _artifact_binding(self, job, item):
+        binding = admission.file_binding(self._artifact_path(job, item))
+        return {key: binding[key] for key in ('sha256', 'size')}
+
+    def review_artifact(self, identity, index, expected_sha256=None):
+        record = self.get(identity)
+        _, _, _, job = self._terminal_job(record)
+        items = record.get('presentation', {}).get('review_artifacts', [])
+        if type(index) is not int or not 0 <= index < len(items):
+            raise ValueError('review artifact is not published')
+        item = items[index]
+        if expected_sha256 is not None and expected_sha256 != item['sha256']:
+            raise ValueError('recording publication changed; refresh before loading')
+        if self._artifact_binding(job, item) != {key: item[key] for key in ('sha256', 'size')}:
+            raise ValueError('retained audio bytes changed; producer must republish')
+        path = self._artifact_path(job, item)
+        return path, AUDIO_TYPES[path.suffix.lower()]
+
+    def run_details(self, identity):
+        record = self.get(identity)
+        stage, path, state, _ = self._terminal_job(record)
+        result = {'schema': 'gpu-greenroom.smoke-run.v1', 'request_digest': record['request_digest'],
+                  'job_id': path.name, 'native_state': stage,
+                  'review_digest': _digest(record.get('presentation', {}).get('review_artifacts', [])),
+                  'participation': (record.get('response') or {}).get('participation', 'not-recorded'),
+                  **{key: state.get(key) for key in ('started_at', 'finished_at', 'exit_code', 'failure_phase', 'error_message')},
+                  'artifacts': [], 'errors': []}
+        for key, name in (('stdout', 'stdout.log'), ('stderr', 'stderr.log')):
+            try:
+                result[key] = self._job_file(path, name)
+            except (OSError, ValueError) as error:
+                result[key] = None
+                result['errors'].append(f'{name}: {error}')
+        for index, item in enumerate(record.get('presentation', {}).get('review_artifacts', [])):
+            try:
+                self.review_artifact(identity, index)
+                result['artifacts'].append({'index': index, 'label': item['label'], 'sha256': item['sha256'], 'size': item['size']})
+            except (OSError, ValueError) as error:
+                result['errors'].append(f'{item["label"]}: {error}')
+        return result
+
+    def request_repeat(self, identity, request_digest):
+        with self._locked(identity):
+            record = self.get(identity)
+            if request_digest != record['request_digest']:
+                raise SmokeRequestConflict('smoke request changed; refresh before requesting another session')
+            _, path, _, _ = self._terminal_job(record)
+            if 'repeat_request' not in record:
+                record['repeat_request'] = {'request_digest': request_digest, 'job_id': path.name,
+                    'requested_at': _now(), 'gpu_execution_authority': False,
+                    'actor': {'kind': 'unverified-caller', 'id': None}}
+                self._write(record)
+            return record
+
+    def _successor(self, record, identity):
+        self._terminal_job(record)
+        if _canonical_id(identity) == record['request']['id']:
+            raise ValueError('next session must be a different request')
+        following = self.get(identity)
+        if following['request']['source'] != record['request']['source'] or 'prepared' not in following:
+            raise ValueError('next session needs a prepared command from the same owner and repo')
+        _, _, _, prior = self._terminal_job(record)
+        planned = JobRequest.from_json(json.dumps(following['prepared']['job_request']))
+        old_root, new_root = Path(prior.get('output_dir', '')).resolve(), Path(planned.output_dir).resolve()
+        if (planned.job_id == prior['job_id'] or new_root.is_relative_to(old_root) or old_root.is_relative_to(new_root)):
+            raise ValueError('next session must use a new job and independent output root')
+        if not following.get('activation'):
+            admission.assert_current(planned, following['prepared']['validation'])
+        return following
+
+    def _running_job(self, record):
+        job_id = (record.get('activation') or {}).get('job_id') or (record.get('progress') or {}).get('current_job_id') or record['request'].get('job_id')
+        if not job_id:
+            raise ValueError('terminal session needs a running linked job')
+        if not isinstance(job_id, str) or not job_id or not all(c.isalnum() or c in '_-' for c in job_id):
+            raise ValueError('invalid running terminal job identity')
+        root = self.directory.parent
+        paths = [root / state / job_id for state in ('pending', 'deferred', 'running', 'done', 'failed', 'cancelled')
+                 if (root / state / job_id).is_dir()]
+        if len(paths) != 1 or paths[0].parent.name != 'running':
+            raise ValueError('terminal session needs an unambiguous running linked job')
+        path = paths[0]
+        try:
+            job = json.loads((path / 'request.json').read_text())
+            state = json.loads((path / 'status.json').read_text())
+        except FileNotFoundError as error:
+            raise ValueError('terminal session needs a running linked job') from error
+        if (not isinstance(job, dict) or not isinstance(state, dict)
+                or job.get('job_id') != job_id or job.get('agent_id') != record['request']['source']['agent_id']
+                or state.get('job_id') != job_id or state.get('status') != 'running'):
+            raise ValueError('running terminal job owner or identity conflicts')
+        return job_id
+
+    def publish_session(self, identity, payload):
+        from . import smoke_navigation
+        if (not isinstance(payload, dict) or set(payload) - {'pane_id', 'pid', 'phase', 'label'}
+                or payload.get('phase') not in {'loading', 'operator-needed', 'interactive'}
+                or not isinstance(payload.get('label'), str) or not payload['label'].strip()):
+            raise ValueError('session needs pane, process, phase and label')
+        with self._locked(identity):
+            record = self.get(identity)
+            if record['status'] == 'responded':
+                raise SmokeRequestConflict('smoke already has a response')
+            job_id = self._running_job(record)
+            observed = smoke_navigation.observe(payload.get('pane_id'), payload.get('pid'))
+            record['session'] = {**observed, 'schema': 'gpu-greenroom.smoke-session.v1',
+                                 'request_digest': record['request_digest'], 'job_id': job_id,
+                                 'phase': payload['phase'], 'label': payload['label'], 'observed_at': _now()}
+            record['presentation'] = {**record.get('presentation', {}), 'target': {'kind': 'terminal'}}
+            return self._write(record)
+
+    def destination(self, record):
+        target = record.get('presentation', {}).get('target', record['request'].get('target'))
+        if target is None:
+            return {'kind': 'context', 'url': record['request']['url']}
+        target = _target(target)
+        if target['kind'] == 'terminal':
+            session = record.get('session')
+            if session:
+                identity = {key: session[key] for key in ('request_digest', 'job_id', 'pane_id',
+                            'pid', 'tty_name', 'process_start_identity')}
+                return {**target, 'pane_id': session['pane_id'], 'identity_digest': _digest(identity)}
+        if target['kind'] == 'browser' and record.get('application_session'):
+            session = record['application_session']
+            identity = {key: session[key] for key in ('request_digest', 'job_id', 'url')}
+            if 'reveal' in session:
+                identity['reveal'] = session['reveal']
+            return {**target, 'identity_digest': _digest(identity)}
+        return target
+
+    def publish_application(self, identity, payload):
+        if (not isinstance(payload, dict) or not {'url', 'phase', 'label'} <= set(payload)
+                or set(payload) - {'url', 'phase', 'label', 'reveal'}
+                or payload.get('phase') not in {'loading', 'operator-needed', 'interactive'}
+                or not isinstance(payload.get('label'), str) or not payload['label'].strip()):
+            raise ValueError('application publication needs URL, phase and label')
+        target = _target({'kind': 'browser', 'url': payload['url']})
+        with self._locked(identity):
+            record = self.get(identity)
+            if record['status'] == 'responded':
+                raise SmokeRequestConflict('smoke already has a response')
+            job_id = self._running_job(record)
+            record['application_session'] = {**payload, 'request_digest': record['request_digest'],
+                'job_id': job_id, 'observed_at': _now()}
+            record['presentation'] = {**record.get('presentation', {}), 'target': target}
+            if 'reveal' in payload:
+                self._verify_application(record)
+            return self._write(record)
+
+    def _verify_application(self, record):
+        from . import smoke_browser
+        application = record.get('application_session')
+        if (not isinstance(application, dict) or application.get('request_digest') != record['request_digest']
+                or application.get('job_id') != self._running_job(record)
+                or self.destination(record).get('url') != application.get('url')):
+            raise ValueError('browser application conflicts with its running job')
+        identity = smoke_browser.verify(application.get('reveal'))
+        _, _, state, _ = self._linked_job(record)
+        if (type(state.get('pid')) is not int or not smoke_browser.descendant(identity['owner_pid'], state['pid'])
+                or not smoke_browser.descendant(identity['browser_pid'], identity['owner_pid'])):
+            raise ValueError('browser reveal processes do not belong to the running job')
+        return application
+
+    def _current_application(self, identity, digest):
+        with self._locked(identity):
+            record = self.get(identity)
+            if record['status'] == 'responded' or self.destination(record).get('identity_digest') != digest:
+                raise ValueError('browser session ended or changed before reveal completed')
+            return self._verify_application(record)
+
+    def _verify_session(self, record):
+        from . import smoke_navigation
+        session = record.get('session')
+        if (not isinstance(session, dict) or session.get('schema') != 'gpu-greenroom.smoke-session.v1'
+                or session.get('request_digest') != record['request_digest']
+                or session.get('phase') not in {'loading', 'operator-needed', 'interactive'}
+                or session.get('job_id') != self._running_job(record)):
+            raise ValueError('terminal session is missing or conflicts with the running job')
+        smoke_navigation.verify(session)
+        return session
+
+    def focus(self, identity, request_digest, destination_digest):
+        from . import smoke_navigation
+        with self._locked(identity):
+            record = self.get(identity)
+            if record['status'] == 'responded':
+                raise SmokeRequestConflict('smoke already has a response')
+            destination = self.destination(record)
+            if request_digest != record['request_digest'] or destination['kind'] not in {'terminal', 'browser'}:
+                raise ValueError('application request identity changed')
+            if not destination_digest or destination_digest != destination.get('identity_digest'):
+                raise ValueError('terminal destination changed; refresh before opening')
+            if destination['kind'] == 'browser':
+                application = self._verify_application(record)
+            else:
+                session = self._verify_session(record)
+                return smoke_navigation.focus(session)
+        from . import smoke_browser_actions
+        return smoke_browser_actions.start(self.directory, application, identity, destination_digest,
+            lambda: self._current_application(identity, destination_digest))
 
     @staticmethod
     def public_record(record):
@@ -227,7 +575,7 @@ class SmokeRequests:
             planned = JobRequest.from_json(json.dumps(plan['job_request']))
             queue = GPUQueue(self.directory.parent)
             existing = [queue.queue_dir / state / planned.job_id
-                        for state in ('pending', 'running', 'done', 'failed', 'cancelled')
+                        for state in ('pending', 'deferred', 'running', 'done', 'failed', 'cancelled')
                         if (queue.queue_dir / state / planned.job_id).is_dir()]
             if existing:
                 if len(existing) != 1:
@@ -278,6 +626,20 @@ class SmokeRequests:
                   'label': progress['label'] if progress else request['availability_note'],
                   'progress': progress, 'source_authority': 'caller-declared',
                   'created_at': record['created_at'], 'job_id': (progress or {}).get('current_job_id', request.get('job_id'))}
+        result['section'] = 'history' if (record['status'] == 'responded' or
+            record.get('presentation', {}).get('purpose', request.get('purpose')) == 'diagnostic') else 'active'
+        if record.get('presentation', {}).get('next_request_id'):
+            try:
+                following = self._successor(record, record['presentation']['next_request_id'])
+                next_phase = 'responded' if following['status'] == 'responded' else 'awaiting-start'
+                if following.get('activation'):
+                    next_phase = self._linked_job(following)[0]
+                    if next_phase == 'pending':
+                        next_phase = 'waiting-gpu'
+                result['next_session'] = {'id': following['request']['id'], 'request_digest': following['request_digest'],
+                    'phase': next_phase}
+            except (OSError, ValueError, TypeError, KeyError) as error:
+                result['next_session_error'] = str(error)
         if 'prepared' in record:
             if record.get('activation'):
                 result['job_id'] = record['activation']['job_id']
@@ -288,43 +650,88 @@ class SmokeRequests:
             else:
                 return {**result, 'phase': 'awaiting-start', 'job_id': None,
                         'label': 'Prepared; GPU not acquired'}
-        if not result['job_id'] or record['status'] == 'responded':
+        if not result['job_id']:
             return result
         try:
-            root, job_id = self.directory.parent, result['job_id']
-            matches = [root/state/job_id for state in ('pending','running','done','failed','cancelled')
-                       if (root/state/job_id).is_dir()]
-            if len(matches) != 1:
-                raise ValueError('linked job is missing or ambiguous')
-            path = matches[0]
-            state = json.loads((path/'status.json').read_text())
-            job = json.loads((path/'request.json').read_text())
-            if not isinstance(state, dict) or not isinstance(job, dict):
-                raise ValueError('linked job records are malformed')
-            if state.get('job_id') != job_id or state.get('status') != path.parent.name:
-                raise ValueError('linked job identity or state conflicts with containment')
-            if job.get('job_id') != job_id or job.get('agent_id') != request['source']['agent_id']:
-                raise ValueError('linked job owner or identity conflicts with smoke request')
-            stage = path.parent.name
-            if stage != 'done':
-                result['phase'] = {'pending':'waiting-gpu','running':'running',
+            stage, path, state, job = self._linked_job(record)
+            root = self.directory.parent
+            if stage != 'done' and record['status'] != 'responded':
+                result['phase'] = {'pending':'waiting-gpu','deferred':'deferred','running':'running',
                                    'failed':'failed','cancelled':'cancelled'}[stage]
             result['job_state'] = stage
+            result.update(finished_at=state.get('finished_at'), exit_code=state.get('exit_code'),
+                          run_available=stage in {'done', 'failed', 'cancelled'},
+                          review_digest=_digest(record.get('presentation', {}).get('review_artifacts', [])))
+            if stage in {'failed', 'cancelled'}:
+                result.update(section='history', error=state.get('error_message'),
+                              failure_phase=state.get('failure_phase'), exit_code=state.get('exit_code'),
+                              progress=None, label='Execution failed' if stage == 'failed' else 'Job cancelled')
+            if record['status'] != 'responded' and stage == 'running' and self.destination(record)['kind'] == 'terminal' and record.get('session'):
+                session = self._verify_session(record)
+                result.update(phase=session['phase'], label=session['label'], terminal_verified=True,
+                              phase_reported_at=session['observed_at'])
+            if record['status'] != 'responded' and stage == 'done' and self.destination(record)['kind'] in {'terminal', 'browser'}:
+                result.update(phase='awaiting-response', label='Last session ended; your experience has not been recorded', progress=None)
             result['started_at'] = state.get('started_at')
+            if stage == 'deferred':
+                from .performance_window import read_receipt
+                reminder = read_receipt(path / 'performance-window.json', JobRequest.from_json(json.dumps(job)))
+                if (reminder['status'] != 'deferred'
+                        or (state.get('performance_deferral') or {}).get('deferred_until') != reminder['deferred_until']):
+                    raise ValueError('Deferred smoke reminder identity conflicts')
+                result.update(deferred_until=reminder['deferred_until'],
+                              label='Measurement deferred; other queued work may proceed')
+            application = record.get('application_session')
+            if record['status'] != 'responded' and stage == 'running' and application:
+                if (application.get('request_digest') != record['request_digest'] or application.get('job_id') != job['job_id']
+                        or self.destination(record).get('kind') != 'browser'
+                        or self.destination(record).get('url') != application['url']):
+                    raise ValueError('application destination conflicts with running job')
+                result.update(phase=application['phase'], label=application['label'], application_reported=True,
+                              phase_reported_at=application['observed_at'])
+                if 'reveal' in application:
+                    try:
+                        self._verify_application(record)
+                        result['application_navigation_available'] = True
+                    except (OSError, ValueError, TypeError, KeyError) as error:
+                        result['navigation_error'] = str(error)
+                from . import smoke_browser_actions
+                action = smoke_browser_actions.latest(self.directory, record['request']['id'],
+                    self.destination(record).get('identity_digest'))
+                if action:
+                    result['focus_action'] = action
+                    if action['status'] == 'failed':
+                        result['navigation_error'] = action['error']
             if stage == 'pending':
                 result['queue_position'] = dispatch.pending_order(root).index(path)+1
+            if stage == 'running' and (path/'cancel-request.json').exists():
+                from .cancellation import read_request as read_cancellation
+                from .models import JobState
+                cancellation = read_cancellation(path, JobState.from_json(json.dumps(state)))
+                result.update(phase='cancelling', label='Force stop requested; waiting for process exit'
+                    if cancellation['force'] else 'Cancelling; cleanup may still be running', progress=None)
         except (OSError, ValueError, TypeError, KeyError) as error:
-            result.update(phase='unknown', progress=None, error=str(error))
+            result.update(phase='responded' if record['status'] == 'responded' else 'unknown', progress=None, error=str(error))
+        if record['status'] == 'responded':
+            result['phase'] = 'responded'
         return result
 
     def snapshot(self):
+        from .smoke_delivery import SmokeDelivery
         if not self.directory.parent.is_dir():
             raise ValueError('Greenroom queue root is unavailable')
         records, errors = self.scan()
+        delivery = SmokeDelivery(self)
+        items = []
+        for record in records:
+            display = self.display(record)
+            items.append({**self.public_record(record), 'display': display,
+                          'destination': self.destination(record),
+                          'delivery': delivery.summary(record, display=display)})
         return {'schema': 'gpu-greenroom.smoke-request-list.v1', 'observed_at': _now(),
-                'reader_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                'reader_sha256': READER_SHA256,
                 'queue_dir': str(self.directory.parent.resolve()),
-                'items': [{**self.public_record(record), 'display': self.display(record)} for record in records],
+                'items': items,
                 'errors': errors}
 
     def submit(self, value: object) -> tuple[dict, bool]:
@@ -359,17 +766,19 @@ class SmokeRequests:
                 record['prepared'] = plan
             return self._write(record), True
 
-    def respond(self, identity: str, text: object) -> dict:
+    def respond(self, identity: str, text: object, *, participation=None) -> dict:
         request_id = _canonical_id(identity)
         if not isinstance(text, str) or not text.strip():
             raise ValueError("response text must be a non-empty string")
+        if participation not in {None, 'tried', 'not-tried'}:
+            raise ValueError('participation must be tried or not-tried')
         with self._locked(request_id):
             record = self.get(request_id)
             if record["status"] == "responded":
-                if record["response"]["text"] != text:
+                if record["response"]["text"] != text or record['response'].get('participation') != participation:
                     raise SmokeRequestConflict("smoke request already has a different response")
                 return record
-            if self.display(record)['phase'] != 'operator-needed':
+            if self.display(record)['phase'] not in {'operator-needed', 'interactive', 'awaiting-response'}:
                 raise SmokeRequestConflict('smoke is not available for operator response')
             record["response"] = {
                 "request_digest": record["request_digest"],
@@ -377,6 +786,8 @@ class SmokeRequests:
                 "actor": {"kind": "unverified-caller", "id": None},
                 "responded_at": _now(),
             }
+            if participation is not None:
+                record['response']['participation'] = participation
             record["status"] = "responded"
             return self._write(record)
 

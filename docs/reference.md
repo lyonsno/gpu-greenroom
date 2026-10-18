@@ -4,14 +4,136 @@ Exhaustive CLI, on-disk layout, job type configuration, receipt schema, and
 failure phases. The [README](../README.md) explains why the system is shaped
 this way; this file is the manual.
 
+## Cancelling Jobs
+
+The operator console offers confirmed cancellation when job controls are enabled
+(`operator --job-control`, also usable with `--admission-control`). The dialog
+names the job, its owner and route. Pending and deferred jobs are removed without
+starting. For a running job, acceptance means **cancelling**, not stopped: the
+worker sends SIGTERM to its own recorded process group and keeps the execution
+mutex until that group is quiescent. Cleanup has no new timer. A separately
+confirmed **Force stop** sends SIGKILL and can lose unsaved work. Existing worker
+cleanup of surviving descendants after the command leader exits still applies.
+An unresolved process group remains in `running/` with `ownership_unknown`;
+neither a cancellation request nor a signal is proof that the GPU is free.
+
+Cancellation preserves saved outputs, other jobs and the current queue pause.
+It affects managed jobs, not external leases. A running worker must advertise
+`job-cancellation.v1`; older workers are explicitly refused rather than silently
+pretending that a request worked. The browser binds confirmation to the displayed
+request digest, status and start timestamp, so a stale dialog cannot cancel a
+later dispatch attempt. Requests have idempotent action receipts under
+`operator-actions/`, with the accepted request and signal progress retained beside
+the job and the final cancellation included in `receipt.json`.
+
+Job authors need no adapter for basic process termination. For graceful Python
+cleanup, install the optional hook once and call its safe point between units:
+
+```python
+from gpu_queue.cancellation import cancellation
+
+with cancellation() as stop:
+    try:
+        for batch in batches:
+            stop.checkpoint()
+            process(batch)
+    finally:
+        save_partial_results()
+        close_resources()
+```
+
+`stop.requested` supports custom control flow; `stop.wait()` supports an idle
+event wait. Managed SIGTERM sets the event; `checkpoint()` raises `Cancelled`
+(a `SystemExit(130)`), running normal `finally` cleanup. The context restores the
+previous handler afterward. Outside a managed worker it leaves signal handling
+unchanged. Install the context from Python's main thread before starting work;
+thread workers can share the returned token. Keep cleanup inside the context.
+
+Other runtimes use their normal SIGTERM handler and `finally`/exit cleanup.
+The worker exports `GPU_GREENROOM_CANCEL_REQUEST`, the absolute path to the
+durable JSON request, for tools that check a file at a safe point. The file is a
+request to stop, not permission to launch a continuation or release the lock.
+For example, a Node runner can set an `AbortController` from
+`process.on('SIGTERM', () => controller.abort())`, then use its signal at async
+boundaries and close resources in `finally`. A new checkpoint continuation should
+not be submitted on cancellation; this is distinct from yielding to queued work.
+The existing checkpoint helper and worker enforce this at handoff and recovery:
+an exact unstarted successor is cancelled with its parent while checkpoint bytes
+are preserved. The worker also closes handoffs from older producer helpers before
+releasing execution authority. Conflicting handoff identity is held for recovery,
+not treated as permission to execute another unit. Performance deferral recovery
+likewise resolves an accepted cancellation before reoffering the measurement.
+
+CLI control uses `cancel JOB` for queued work, `cancel --running JOB` for graceful
+running cancellation and `cancel --force JOB` for explicit force stop. The HTTP
+control is `POST /api/job-cancel` with the existing operator authentication and
+`job_id`, `request_digest`, `expected_status`, `expected_started_at`, `request_id`
+and boolean `force`. It offers no arbitrary PID or command surface.
+
+## Performance-Sensitive Runs
+
+Use `--performance-window "reason for measurement"` on `submit` or
+`submit-command` for jobs that need operator coordination before timing.
+Command.v2 and command.v3 manifests accept the same nonblank
+`performance_window` field. Ordinary jobs do not prompt.
+
+At dispatch, a macOS native confirmation asks the operator to quit Chrome or
+stop live rendering and other GPU-heavy activity. Cancel run is the default;
+only Start measurement launches the underlying command. Missing console,
+unsupported host, or dialog failure refuses launch. Greenroom does not close,
+suspend, or signal unrelated applications.
+
+The prompt includes **Remind me later** and an editable **Remind me in
+(minutes)** field, initially **5**. Choosing that action puts this same job in
+`deferred/` after confirmation-process quiescence, releases the execution lock,
+and lets other queued work proceed. Positive fractional minutes are supported;
+invalid input reopens the prompt with a correction message. At the chosen time
+the job regains ordinary dispatch eligibility under the current queue policy.
+It does not interrupt running work or bypass pause, leases, or its service class,
+and a fresh Start measurement confirmation is still required. The delay and
+request digest are receipted in `performance-deferrals/`; deferral survives a
+worker restart and is not a failed or cancelled run. Older workers cannot
+dispatch a job while it remains in `deferred/`.
+
+Until the operator chooses an action, the job holds its assigned execution slot
+without a response timeout. Cancel releases it after normal process-group quiescence.
+The caller's command timeout starts after confirmation, not during the prompt.
+Existing queue pause, leases, ordering, Stop and worker shutdown remain in force.
+Workers need `performance-window.v1`; an older worker leaves the request pending
+rather than silently running without confirmation.
+
+`performance-window.json` in the native job directory records confirmation,
+operator wait, workload PID, workload command wall time, and terminal failure
+phase. The main receipt embeds this record, the actual wrapper argv and the
+underlying `workload_argv`. The console distinguishes waiting for confirmation
+from measuring. Confirmation is operator acknowledgement, not a GPU-quietness
+measurement: `quietness_proved` remains false. Workload-specific environmental
+telemetry still determines whether a performance comparison is informative.
+
+When the worker finishes cleanup and releases the execution mutex, a one-way
+native notice names the job and whether it finished, failed, was interrupted,
+or was cancelled. It does not wait for dismissal and does not hold the queue
+for another acknowledgement. It describes this job's performance window, not
+global GPU availability. Unknown process ownership produces a cleanup warning,
+never an end-of-window notice. Stale recovery uses the same distinction.
+
+`performance-completion-notice.json` records the per-job notice attempt;
+`performance-ownership-warning.json` records an unresolved-cleanup warning.
+Each is claimed once before the native call, preventing duplicate submission
+by concurrent recovery. A warning can later be followed by a distinct terminal
+notice when recovery confirms the processes have stopped. `submitted` means
+the native API accepted the notice, not that a human saw it. `failed` records
+an API failure; `submission-unknown` preserves an interrupted attempt without
+silently retrying it. Notification failure does not change or rerun the job.
+
 ## CLI
 
 ```bash
 # Jobs
 gpu-greenroom submit <job-type> <input-path> [output-dir] [-p key=value ...] [--cwd DIR]
-gpu-greenroom list [-s pending|running|done|failed|cancelled]
+gpu-greenroom list [-s pending|deferred|running|done|failed|cancelled]
 gpu-greenroom status <job-id>
-gpu-greenroom cancel <job-id>          # pending jobs only
+gpu-greenroom cancel <job-id>          # pending or deferred jobs
 
 # Exact-argv jobs (no job type, no substitution)
 gpu-greenroom submit-command --agent-id NAME --repo-root DIR --cwd DIR --route-identity LABEL \
@@ -352,6 +474,40 @@ authenticate a human identity. A stored response therefore does not by itself
 prove that Noah or another named operator supplied it.
 These narrow endpoints are available in admission-control mode and do not
 admit or execute GPU jobs. A read-only console still rejects writes.
+
+The optional `target` identifies the application to exercise, rather than a
+coordination page. Browser targets use `{"kind":"browser","url":"http://127.0.0.1:9901/app"}`.
+Terminal targets use `{"kind":"terminal"}`; once the linked job is running,
+the producer publishes its observed pane and owning process through the local
+CLI. Neither HTTP creation nor Focus accepts a command or a caller-selected
+pane. Requests without a typed target retain a plainly labeled context link.
+
+```bash
+gpu-greenroom smoke-request configure REQUEST_ID /path/to/destination.json
+gpu-greenroom smoke-request session REQUEST_ID /path/to/session.json
+```
+
+Configuration accepts `target` and `purpose` (`operator` or `diagnostic`),
+preserving the original request and its digest. A session file contains
+`pane_id`, `pid`, `phase` (`loading`, `operator-needed`, or `interactive`), and
+`label`. Publication verifies the running job's owner, pane TTY and kernel
+process-start identity. Producers republish on application phase changes.
+The phase remains a producer declaration; terminal identity verification
+establishes navigation, not operator participation. Focus rechecks the live
+identity and uses the configured shared terminal activation command.
+Set `GPU_GREENROOM_TERMINAL_NAVIGATOR` to its absolute executable path. The
+command implements `focus-pane --pane-id N --expected-tty /dev/ttysNNN --json`,
+returning the activated `pane_id`. This is local configuration, not an HTTP
+command selection. Missing navigation fails explicitly.
+The view carries a destination identity digest in addition to the immutable
+request digest. Focus compares both, so a stale button cannot open a newly
+published pane or process; phase-only updates keep the destination identity.
+Switching to a browser target discards the previous terminal session.
+Unavailable or changed identities refuse focus.
+
+The active view excludes diagnostic, answered, failed and cancelled requests.
+History retains them, including native failure phase, error and exit code.
+Queued jobs are not described as interactive or as waiting for the operator.
 
 ## Registered queues and execution-start pause
 
