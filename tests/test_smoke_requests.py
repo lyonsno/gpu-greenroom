@@ -94,6 +94,8 @@ def test_smoke_request_scan_keeps_valid_records_visible_beside_corruption(tmp_pa
 
 
 def test_snapshot_reuses_one_display_observation_for_delivery(tmp_path, request_payload, monkeypatch):
+    # Delivery binds its own clock on import; keep the snapshot clock local.
+    __import__("gpu_queue.smoke_delivery")
     store = SmokeRequests(tmp_path / "smoke-requests")
     store.submit(request_payload)
     original = store.display
@@ -104,8 +106,13 @@ def test_snapshot_reuses_one_display_observation_for_delivery(tmp_path, request_
         return original(record)
 
     monkeypatch.setattr(store, "display", display)
+    def observed():
+        calls.append("observed")
+        return "2030-01-01T00:00:00+00:00"
+    monkeypatch.setattr("gpu_queue.smoke_requests._now", observed)
     snapshot = store.snapshot()
     assert snapshot["errors"] == []
     assert snapshot["items"][0]["display"]["phase"] == "operator-needed"
     assert snapshot["items"][0]["delivery"] == {}
-    assert calls == [request_payload["id"]]
+    assert snapshot["observed_at"] == "2030-01-01T00:00:00+00:00"
+    assert calls == ["observed", request_payload["id"]]

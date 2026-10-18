@@ -721,6 +721,7 @@ class SmokeRequests:
         if not self.directory.parent.is_dir():
             raise ValueError('Greenroom queue root is unavailable')
         records, errors = self.scan()
+        observed_at = _now()
         delivery = SmokeDelivery(self)
         items = []
         for record in records:
@@ -728,7 +729,7 @@ class SmokeRequests:
             items.append({**self.public_record(record), 'display': display,
                           'destination': self.destination(record),
                           'delivery': delivery.summary(record, display=display)})
-        return {'schema': 'gpu-greenroom.smoke-request-list.v1', 'observed_at': _now(),
+        return {'schema': 'gpu-greenroom.smoke-request-list.v1', 'observed_at': observed_at,
                 'reader_sha256': READER_SHA256,
                 'queue_dir': str(self.directory.parent.resolve()),
                 'items': items,
