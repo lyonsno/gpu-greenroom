@@ -41,9 +41,12 @@ def comparison(hint, receipt):
     if type(actual) not in (int, float) or not math.isfinite(actual) or actual < 0:
         actual = None
     expected = hint['expected_seconds']
+    ratio = actual / expected if actual is not None else None
+    unrepresentable = ratio is not None and not math.isfinite(ratio)
     return {'expected_seconds': expected, 'reason': hint.get('reason'),
             'authority': 'producer-estimated', 'actual_seconds': actual,
             'execution_wall_seconds': wall, 'clock': clock, 'condition': 'unknown',
             'successful': actual is not None and receipt.get('status') == 'done' and receipt.get('exit_code') == 0,
-            'ratio': actual / expected if actual is not None else None,
+            'ratio': None if unrepresentable else ratio,
+            'ratio_unrepresentable': unrepresentable,
             'over_estimate': actual > expected if actual is not None else None}

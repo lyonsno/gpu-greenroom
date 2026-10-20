@@ -151,6 +151,16 @@ def test_absent_hint_preserves_old_prepared_request_digest(tmp_path):
     assert admission.request_identity(request) == admission.digest(before)
 
 
+def test_extreme_valid_hint_keeps_comparison_json_finite():
+    from gpu_queue.runtime_hints import comparison
+    result = comparison({'expected_seconds': 1e-320},
+        {'started_at': 1, 'finished_at': 2, 'child_pid': 1, 'status': 'done', 'exit_code': 0})
+    json.dumps(result, allow_nan=False)
+    assert result['actual_seconds'] == 1
+    assert result['ratio'] is None
+    assert result['ratio_unrepresentable'] is True
+
+
 def test_console_projects_hint_and_terminal_comparison(tmp_path):
     from gpu_queue.operator_server import queue_snapshot
     queue = GPUQueue(tmp_path/'queue')
