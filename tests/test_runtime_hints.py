@@ -213,3 +213,36 @@ def test_invalid_cli_hint_has_durable_validation_failure(tmp_path, flags, comman
     assert report['failure_phase'] == 'submission-validation'
     assert list((queue/'submission-failures').glob('*.json'))
     assert not list((queue/'pending').iterdir())
+
+
+@pytest.mark.parametrize('mutation', ['duration','missing'])
+def test_performance_hint_requires_agreeing_command_clock(tmp_path, monkeypatch, mutation):
+    from gpu_queue import performance_window
+    from gpu_queue.operator_server import queue_snapshot
+    original = performance_window.runner_command
+    def accepted_cpu_gate(job_dir, request, argv, timeout):
+        actual = original(job_dir, request, argv, timeout)
+        return [sys.executable,'-c',
+            'import json,sys;from pathlib import Path;from gpu_queue import performance_window as p;'
+            'p.native_notice=lambda *a,**k:None;'
+            'sys.exit(p.run(json.loads(Path(sys.argv[1]).read_text()),prompt=lambda _:True))',actual[-1]]
+    monkeypatch.setattr(performance_window, 'runner_command', accepted_cpu_gate)
+    monkeypatch.setattr(performance_window, 'native_notice', lambda *a, **k: None)
+    queue = GPUQueue(tmp_path/'queue')
+    request = admission.command_request(admission.normalize_manifest(
+        manifest(tmp_path, performance_window='Isolated CPU fixture')))
+    queue.submit(request)
+    assert queue.run_one({})
+    valid = queue_snapshot(queue, 'done')['jobs'][0]
+    assert valid['runtime_hint_comparison']['clock'] == 'performance-command-wall'
+    assert valid['runtime_hint_comparison']['actual_seconds'] == valid['performance_window']['command_wall_seconds']
+    path = queue.queue_dir/'done'/request.job_id/'receipt.json'
+    receipt = json.loads(path.read_text())
+    if mutation == 'duration':
+        receipt['performance_window']['command_wall_seconds'] = 1000
+    else:
+        receipt['performance_window'] = None
+    path.write_text(json.dumps(receipt))
+    row = queue_snapshot(queue, 'done')['jobs'][0]
+    assert row.get('runtime_hint_error')
+    assert 'runtime_hint_comparison' not in row

@@ -341,6 +341,7 @@ def queue_snapshot(queue: GPUQueue | Path, view: str = "all", *, read_only: bool
             row["status"] = containment_status if consistent else "inconsistent"
             request_path = job_dir / "request.json"
             if request_path.is_file():
+                hint_receipt = None
                 digest = None
                 try:
                     request, digest = dispatch.read_request(request_path)
@@ -374,7 +375,7 @@ def queue_snapshot(queue: GPUQueue | Path, view: str = "all", *, read_only: bool
                                 if (receipt.get('workload_argv') != request.get('command_argv')
                                         or receipt.get('effective_cwd') != request.get('command_cwd')):
                                     raise ValueError('Execution receipt conflicts with requested command')
-                            row['runtime_hint_comparison'] = runtime_hints.comparison(row['runtime_hint'], receipt)
+                            hint_receipt = receipt
                     except (OSError, ValueError, TypeError, AttributeError) as error:
                         row['runtime_hint_error'] = str(error)
                 row['performance_window_reason'] = request.get('performance_window')
@@ -398,6 +399,24 @@ def queue_snapshot(queue: GPUQueue | Path, view: str = "all", *, read_only: bool
                             row['performance_window_error'] = 'Confirmation receipt missing'
                     except (OSError, ValueError, KeyError, TypeError) as error:
                         row['performance_window_error'] = str(error)
+                if hint_receipt is not None:
+                    try:
+                        embedded = hint_receipt.get('performance_window')
+                        if request.get('performance_window') is not None:
+                            performance = row.get('performance_window')
+                            fields = ('schema', 'job_id', 'reason', 'owner', 'route', 'authority',
+                                      'quietness_proved', 'status', 'phase', 'workload_started',
+                                      'command_wall_seconds', 'workload_started_at', 'finished_at',
+                                      'confirmed_at', 'operator_wait_seconds', 'workload_pid', 'exit_code')
+                            if (row.get('performance_window_error') or not isinstance(performance, dict)
+                                    or not isinstance(embedded, dict)
+                                    or any(embedded.get(key) != performance.get(key) for key in fields)):
+                                raise ValueError('Performance command observation is missing or conflicts')
+                        elif embedded is not None:
+                            raise ValueError('Unexpected performance clock for ordinary request')
+                        row['runtime_hint_comparison'] = runtime_hints.comparison(row['runtime_hint'], hint_receipt)
+                    except (ValueError, TypeError, AttributeError) as error:
+                        row['runtime_hint_error'] = str(error)
                 if request.get('job_id') == job_dir.name:
                     row['request_digest'] = digest
                 try:
