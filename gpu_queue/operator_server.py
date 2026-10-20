@@ -363,6 +363,17 @@ def queue_snapshot(queue: GPUQueue | Path, view: str = "all", *, read_only: bool
                                     or receipt.get('status') != declared_status
                                     or receipt.get('runtime_hint') != row['runtime_hint']):
                                 raise ValueError('Execution receipt does not match this request')
+                            for field in ('started_at', 'finished_at', 'exit_code'):
+                                if row.get(field) != receipt.get(field):
+                                    raise ValueError('Execution receipt conflicts with status: ' + field)
+                            if (receipt.get('job_type') != request.get('job_type')
+                                    or receipt.get('requested_route') != request.get('route_identity')
+                                    or receipt.get('repo_root') != request.get('repo_root')):
+                                raise ValueError('Execution receipt conflicts with requested identity')
+                            if request.get('job_type') == 'command' and receipt.get('child_pid') is not None:
+                                if (receipt.get('workload_argv') != request.get('command_argv')
+                                        or receipt.get('effective_cwd') != request.get('command_cwd')):
+                                    raise ValueError('Execution receipt conflicts with requested command')
                             row['runtime_hint_comparison'] = runtime_hints.comparison(row['runtime_hint'], receipt)
                     except (OSError, ValueError, TypeError, AttributeError) as error:
                         row['runtime_hint_error'] = str(error)

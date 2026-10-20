@@ -90,9 +90,9 @@ def cmd_submit(args):
         agent_id=_optional_agent_id(args.agent_id),
         service_class=getattr(args,'service_class',None),
         performance_window=getattr(args, 'performance_window', None),
-        runtime_hint=runtime_hints.from_args(args),
     )
     try:
+        request.runtime_hint = runtime_hints.from_args(args)
         definitions = _load_job_types(args.queue_dir, strict=True)
         if request.job_type not in definitions:
             raise ValueError(f'Unknown job type: {request.job_type}')

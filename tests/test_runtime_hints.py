@@ -180,3 +180,36 @@ def test_console_projects_hint_and_terminal_comparison(tmp_path):
     mismatched = queue_snapshot(queue, 'done')['jobs'][0]
     assert 'does not match' in mismatched['runtime_hint_error']
     assert 'runtime_hint_comparison' not in mismatched
+
+
+@pytest.mark.parametrize('field,value', [('started_at', 1), ('finished_at', 1000),
+    ('workload_argv', ['different-command']), ('effective_cwd', '/different'),
+    ('requested_route', 'wrong-route')])
+def test_console_rejects_conflicting_observation_identity(tmp_path, field, value):
+    from gpu_queue.operator_server import queue_snapshot
+    queue = GPUQueue(tmp_path/'queue')
+    request = admission.command_request(admission.normalize_manifest(manifest(tmp_path)))
+    queue.submit(request)
+    assert queue.run_one({})
+    path = queue.queue_dir/'done'/request.job_id/'receipt.json'
+    receipt = json.loads(path.read_text())
+    receipt[field] = value
+    path.write_text(json.dumps(receipt))
+    row = queue_snapshot(queue, 'done')['jobs'][0]
+    assert row.get('runtime_hint_error')
+    assert 'runtime_hint_comparison' not in row
+
+
+@pytest.mark.parametrize('flags', [['--expected-seconds','-1'],['--runtime-reason','orphan']])
+@pytest.mark.parametrize('command', ['submit', 'submit-command'])
+def test_invalid_cli_hint_has_durable_validation_failure(tmp_path, flags, command):
+    queue = tmp_path/'queue'
+    args = [sys.executable,'-m','gpu_queue.cli','--queue-dir',str(queue),command]
+    args += ['echo','input'] if command == 'submit' else [
+        '--repo-root',str(tmp_path),'--cwd',str(tmp_path),'--route-identity','invalid-hint']
+    result = subprocess.run(args+flags,capture_output=True,text=True)
+    assert result.returncode == 2, result.stderr
+    report = json.loads(result.stderr)
+    assert report['failure_phase'] == 'submission-validation'
+    assert list((queue/'submission-failures').glob('*.json'))
+    assert not list((queue/'pending').iterdir())
