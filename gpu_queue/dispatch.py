@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import tempfile
 from .models import JobState, JobStatus
+from . import runtime_hints
 
 CAPABILITY = 'two-class-dispatch.v1'
 SCHEMA = 'gpu-greenroom.dispatch-policy.v1'
@@ -17,6 +18,7 @@ OVERRIDE_SCHEMA = 'gpu-greenroom.dispatch-policy.v2'
 OVERRIDE_CAPABILITY = 'operator-dispatch-override.v1'
 HISTORY_SCHEMA = 'gpu-greenroom.dispatch-policy.v3'
 HISTORY_CAPABILITY = 'runtime-profile.v1'
+HINT_SCHEMA = 'gpu-greenroom.dispatch-policy.v4'
 
 
 def validate_override(value):
@@ -66,7 +68,7 @@ def atomic_write(path, payload):
 
 
 def validate(value):
-    if not isinstance(value,dict) or value.get('schema') not in (SCHEMA, OVERRIDE_SCHEMA,HISTORY_SCHEMA) or not isinstance(value.get('mode'),str) or value['mode'] not in {'fifo','two-class'}:
+    if not isinstance(value,dict) or value.get('schema') not in (SCHEMA, OVERRIDE_SCHEMA,HISTORY_SCHEMA,HINT_SCHEMA) or not isinstance(value.get('mode'),str) or value['mode'] not in {'fifo','two-class'}:
         raise ValueError('invalid dispatch policy schema or mode')
     for key in ('quick_job_types','quick_routes'):
         rules=value.get(key,{})
@@ -76,7 +78,7 @@ def validate(value):
     overrides, receipts = value.get('job_overrides', {}), value.get('action_receipts', {})
     history = value.get('runtime_history')
     if history is not None:
-        if value['schema'] != HISTORY_SCHEMA or not isinstance(history,dict):
+        if value['schema'] not in (HISTORY_SCHEMA,HINT_SCHEMA) or not isinstance(history,dict):
             raise ValueError('runtime history requires v3 dispatch policy')
         if not isinstance(history.get('index'),str) or not Path(history['index']).is_absolute() or not isinstance(history.get('profiles'),dict):
             raise ValueError('runtime history requires an absolute index and explicit profiles')
@@ -87,6 +89,13 @@ def validate(value):
                     or not isinstance(rule.get('profile_digest'),str) or not re.fullmatch(r'[a-f0-9]{64}',rule['profile_digest'])
                     or not isinstance(rule.get('evidence'),str) or not rule['evidence'].strip()):
                 raise ValueError('runtime history rule requires samples, threshold and evidence')
+    hints = value.get('producer_hints')
+    if hints is not None:
+        if value['schema'] != HINT_SCHEMA:
+            raise ValueError('producer_hints require v4 dispatch policy')
+        if (not isinstance(hints,dict) or type(hints.get('max_seconds')) not in (int,float)
+                or not math.isfinite(hints['max_seconds']) or hints['max_seconds'] <= 0):
+            raise ValueError('producer_hints require a positive finite max_seconds')
     if value['schema'] == SCHEMA and (overrides or receipts):
         raise ValueError('dispatch overrides require v2 policy and worker capability')
     if not isinstance(overrides, dict) or not isinstance(receipts, dict):
@@ -113,6 +122,7 @@ def classify(request, config, *, request_digest=None, queue_dir=None):
     declared=request.get('service_class')
     if declared not in (None,'normal','quick'):
         raise ValueError('service_class must be normal or quick')
+    hint = runtime_hints.validate(request.get('runtime_hint'))
     override = config.get('job_overrides', {}).get(request.get('job_id'))
     if override and config['mode'] == 'two-class':
         if override['request_digest'] != request_digest:
@@ -134,6 +144,11 @@ def classify(request, config, *, request_digest=None, queue_dir=None):
         if result['eligible']:
             eligible = True
             basis = 'runtime-history:' + result['profile_key'] + '; samples=' + str(result['samples'])
+    hints = config.get('producer_hints')
+    if (not eligible and declared != 'normal' and config['mode'] == 'two-class'
+            and hints and hint and hint['expected_seconds'] <= hints['max_seconds']):
+        eligible = True
+        basis = 'producer-estimated: expected_seconds=' + str(hint['expected_seconds'])
     if declared=='quick' and not eligible:
         raise ValueError('requested quick class is not admitted by the current dispatch policy')
     return ('quick' if eligible and declared!='normal' else 'normal'),basis

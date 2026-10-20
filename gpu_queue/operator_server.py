@@ -87,6 +87,16 @@ for(const [id,serviceClass] of [['automaticQueue','normal'],['quickQueue','quick
 }
 }
 function duration(seconds){if(seconds==null)return 'not recorded';const s=Math.floor(seconds);return s>=3600?`${Math.floor(s/3600)}h ${Math.floor(s%3600/60)}m`:s>=60?`${Math.floor(s/60)}m ${s%60}s`:`${s}s`}
+function runtimeHint(j){
+  if(j.runtime_hint_error)return '<div class="meta failed">Runtime estimate unverified: '+esc(j.runtime_hint_error)+'</div>';
+  if(!j.runtime_hint)return '';
+  const h=j.runtime_hint,c=j.runtime_hint_comparison;
+  const seconds=n=>Number(n).toLocaleString(undefined,{maximumFractionDigits:2})+'s';
+  return '<div class="meta">Estimated execution: '+seconds(h.expected_seconds)+' (producer)'
+    +(h.reason?' · '+esc(h.reason):'')
+    +(c?'<br>Observed: '+(c.actual_seconds==null?'not recorded':seconds(c.actual_seconds))
+      +' · '+esc(c.clock)+(c.over_estimate?' · Above estimate':''):'')+'</div>';
+}
 function nativeActions(j){
   if(!j?.consistent||document.body.dataset.readOnly==='true')return '';
   if(last?.job_control){
@@ -138,7 +148,7 @@ function render(s){
   const jobMarkup=items=>items.map(j=>{
     const a=nativeActions(j);
     const route=j.requested_route||j.effective_route||j.job_type;
-    const conflict=performanceWindow(j)+(j.consistent?'':`<div class="meta">containment: ${esc(j.containment_status)} · declared: ${esc(j.declared_status)}</div>`);
+    const conflict=performanceWindow(j)+runtimeHint(j)+(j.consistent?'':`<div class="meta">containment: ${esc(j.containment_status)} · declared: ${esc(j.declared_status)}</div>`);
     const manual=j.dispatch_override||j.dispatch?.operator_override;
     const choice=canMove(j)?`<label class="queue-choice">Queue <select class="dispatchClass" aria-label="Queue for ${esc(j.job_id)}" data-job-id="${esc(j.job_id)}"><option value="normal" ${j.dispatch_class==='normal'?'selected':''}>Automatic</option><option value="quick" ${j.dispatch_class==='quick'?'selected':''}>Quick</option></select></label>`:'';
     return `<article class="job-item" data-job-id="${esc(j.job_id)}" draggable="${canMove(j)}"><div class="job-heading"><strong>${esc(j.job_id)}</strong><span class="pill ${esc(j.status)}">${esc(j.status)}</span>${j.dispatch_class==='quick'?`<span class="pill quick" title="${esc(j.dispatch_basis)}">${manual?'Manual Quick':'Quick'}</span>`:manual?'<span class="meta">Manual Automatic</span>':''}${j.queue_position?`<span class="meta">Queue ${esc(j.queue_position)}</span>`:''}</div>${conflict}<div class="route">${esc(route)}</div><div class="meta">${esc(document.body.dataset.identityLabel||'Agent')}: ${esc(j.agent_id||'not recorded')} · ${esc(j.job_type)}</div><div class="meta">${esc(j.repo_root||j.output_dir||j.record_error||'')}</div>${j.dispatch_error?'<div class="meta failed">Dispatch classification: '+esc(j.dispatch_error)+'</div>':''}<div class="job-timing"><div>Submitted: ${j.submitted_at?esc(new Date(j.submitted_at*1000).toLocaleString()):'not recorded'}</div><div>Queue wait: ${duration(j.queue_wait_seconds)}</div><div>Execution wall time: ${duration(j.execution_wall_seconds)}</div><div>GPU hold time: not recorded</div></div>${choice}<div class="job-actions actions">${a}</div></article>`;
@@ -341,6 +351,21 @@ def queue_snapshot(queue: GPUQueue | Path, view: str = "all", *, read_only: bool
                 row["agent_id"] = request.get("agent_id")
                 row["requested_route"] = request.get("route_identity")
                 row["repo_root"] = request.get("repo_root")
+                if request.get('runtime_hint') is not None:
+                    try:
+                        from . import runtime_hints
+                        if not consistent or request.get('job_id') != job_dir.name:
+                            raise ValueError('Job identity or state does not agree')
+                        row['runtime_hint'] = runtime_hints.validate(request['runtime_hint'])
+                        if declared_status in {'done', 'failed', 'cancelled'}:
+                            receipt = json.loads((job_dir / 'receipt.json').read_text())
+                            if (not isinstance(receipt, dict) or receipt.get('job_id') != job_dir.name
+                                    or receipt.get('status') != declared_status
+                                    or receipt.get('runtime_hint') != row['runtime_hint']):
+                                raise ValueError('Execution receipt does not match this request')
+                            row['runtime_hint_comparison'] = runtime_hints.comparison(row['runtime_hint'], receipt)
+                    except (OSError, ValueError, TypeError, AttributeError) as error:
+                        row['runtime_hint_error'] = str(error)
                 row['performance_window_reason'] = request.get('performance_window')
                 if request.get('performance_window') is not None:
                     try:

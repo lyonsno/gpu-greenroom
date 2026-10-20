@@ -72,6 +72,7 @@ def _agent_id_arg(value):
 
 
 def cmd_submit(args):
+    from . import runtime_hints
     queue = get_queue(args)
     params = {}
     if args.params:
@@ -89,6 +90,7 @@ def cmd_submit(args):
         agent_id=_optional_agent_id(args.agent_id),
         service_class=getattr(args,'service_class',None),
         performance_window=getattr(args, 'performance_window', None),
+        runtime_hint=runtime_hints.from_args(args),
     )
     try:
         definitions = _load_job_types(args.queue_dir, strict=True)
@@ -195,8 +197,11 @@ def cmd_dispatch_policy(args):
 
 
 def _command_payload(args):
+    from . import runtime_hints
     manifest_path = None
     if args.manifest:
+        if getattr(args, 'expected_seconds', None) is not None or getattr(args, 'runtime_reason', None) is not None:
+            raise ValueError('--expected-seconds/--runtime-reason cannot override a manifest')
         if getattr(args, 'performance_window', None) is not None:
             raise ValueError('--performance-window cannot override a manifest')
         if args.agent_id is not None:
@@ -227,6 +232,8 @@ def _command_payload(args):
             "performance_window": getattr(args, 'performance_window', None),
         }
 
+    if not args.manifest and runtime_hints.from_args(args) is not None:
+        payload.update(schema='gpu-greenroom.command.v5', runtime_hint=runtime_hints.from_args(args))
     payload = admission.normalize_manifest(payload)
     return {
         "output_class": payload.get('output_class'),
@@ -245,6 +252,7 @@ def _command_payload(args):
         "preflight": payload['preflight'],
         "performance_window": payload.get('performance_window'),
         "runtime_profile": payload.get('runtime_profile'),
+        "runtime_hint": payload.get('runtime_hint'),
     }
 
 
@@ -278,7 +286,7 @@ def cmd_submit_command(args):
         print(json.dumps(report, indent=2), file=sys.stderr)
         sys.exit(2)
 
-    if payload['command_schema'] == 'gpu-greenroom.command.v3' or (payload['command_schema'] == 'gpu-greenroom.command.v4' and payload['preflight'] is not None):
+    if payload['command_schema'] == 'gpu-greenroom.command.v3' or (payload['command_schema'] in ('gpu-greenroom.command.v4','gpu-greenroom.command.v5') and payload['preflight'] is not None):
         try:
             plan = admission.prepare(queue, {**payload, 'schema': payload['command_schema']})
             job_dir = admission.submit_prepared(queue, plan)
@@ -837,6 +845,8 @@ def main():
     )
     p_submit.set_defaults(func=cmd_submit)
     p_submit.add_argument('--service-class',choices=['normal','quick'],default=None)
+    p_submit.add_argument('--expected-seconds', type=float, help='Rough whole-job execution estimate; never a timeout')
+    p_submit.add_argument('--runtime-reason', help='Optional brief basis for the estimate')
     p_submit.add_argument('--performance-window', metavar='REASON', help='Ask the operator for a quiet performance window at dispatch')
 
     # submit-command
@@ -859,6 +869,8 @@ def main():
     p_command.add_argument("argv", nargs=argparse.REMAINDER)
     p_command.set_defaults(func=cmd_submit_command)
     p_command.add_argument('--service-class',choices=['normal','quick'],default=None)
+    p_command.add_argument('--expected-seconds', type=float, help='Rough whole-job execution estimate; never a timeout')
+    p_command.add_argument('--runtime-reason', help='Optional brief basis for the estimate')
     p_command.add_argument('--cooperative-checkpoint',action='store_true',default=None)
     p_command.add_argument('--performance-window', metavar='REASON', help='Ask the operator for a quiet performance window at dispatch')
 

@@ -84,7 +84,7 @@ def _safe_substitute(template: str, mapping: dict) -> str:
 def effective_worker_capabilities() -> frozenset[str]:
     configured = os.environ.get("GPU_GREENROOM_WORKER_CAPABILITIES")
     if configured is None:
-        return DEFAULT_WORKER_CAPABILITIES | {dispatch.CAPABILITY,dispatch.OVERRIDE_CAPABILITY,'structured-command.v2','checkpoint-continuation.v1',admission.CAPABILITY,performance_window.CAPABILITY,'job-cancellation.v1',dispatch.HISTORY_CAPABILITY}
+        return DEFAULT_WORKER_CAPABILITIES | {dispatch.CAPABILITY,dispatch.OVERRIDE_CAPABILITY,'structured-command.v2','checkpoint-continuation.v1',admission.CAPABILITY,performance_window.CAPABILITY,'job-cancellation.v1',dispatch.HISTORY_CAPABILITY,'runtime-hint.v1'}
     return frozenset(
         capability.strip()
         for capability in configured.split(",")
@@ -1111,6 +1111,10 @@ class GPUQueue:
         """
         if type(request.cooperative_checkpoint) is not bool:
             raise ValueError('cooperative_checkpoint must be a boolean')
+        from . import runtime_hints
+        runtime_hints.validate(request.runtime_hint)
+        if request.runtime_hint is not None and runtime_hints.CAPABILITY not in request.required_worker_capabilities:
+            request.required_worker_capabilities.append(runtime_hints.CAPABILITY)
         if request.runtime_profile is not None:
             from .runtime_history import identity, CAPABILITY
             identity(request,request.runtime_profile)
@@ -1318,8 +1322,8 @@ class GPUQueue:
                 current=dispatch.policy(self.queue_dir)
             except (ValueError,OSError):
                 current={}
-            if current.get('schema') in (dispatch.OVERRIDE_SCHEMA,dispatch.HISTORY_SCHEMA):
-                value = {**value, 'schema': dispatch.HISTORY_SCHEMA if value.get('runtime_history') is not None else dispatch.OVERRIDE_SCHEMA,
+            if current.get('schema') in (dispatch.OVERRIDE_SCHEMA,dispatch.HISTORY_SCHEMA,dispatch.HINT_SCHEMA):
+                value = {**value, 'schema': dispatch.HINT_SCHEMA if value.get('producer_hints') is not None else dispatch.HISTORY_SCHEMA if value.get('runtime_history') is not None else dispatch.OVERRIDE_SCHEMA,
                          'job_overrides': current.get('job_overrides', {}),
                          'action_receipts': current.get('action_receipts', {})}
             fields={key:item for key,item in current.items() if key not in {'epoch','owner','configured_at'}}
@@ -1359,7 +1363,7 @@ class GPUQueue:
             if digest != request_digest:
                 raise ValueError('pending request digest changed; refresh the queue')
             # Classification and its retry receipt share one fsynced commit point.
-            updated = {**config, 'schema': dispatch.HISTORY_SCHEMA if config.get('runtime_history') is not None else dispatch.OVERRIDE_SCHEMA,
+            updated = {**config, 'schema': dispatch.HINT_SCHEMA if config.get('producer_hints') is not None else dispatch.HISTORY_SCHEMA if config.get('runtime_history') is not None else dispatch.OVERRIDE_SCHEMA,
                        'job_overrides': {**config.get('job_overrides', {}), job_id: receipt},
                        'action_receipts': {**config.get('action_receipts', {}), request_id: receipt}}
             dispatch.atomic_write(self.queue_dir / 'dispatch-policy.json', dispatch.validate(updated))
@@ -1585,9 +1589,11 @@ class GPUQueue:
                     dispatch_policy=dispatch.policy(self.queue_dir)
                     if dispatch_policy['mode']=='two-class' and dispatch.CAPABILITY not in effective_claimant.get('capabilities',[]):
                         return False
-                    if dispatch_policy['schema'] in (dispatch.OVERRIDE_SCHEMA,dispatch.HISTORY_SCHEMA) and dispatch.OVERRIDE_CAPABILITY not in effective_claimant.get('capabilities', []):
+                    if dispatch_policy['schema'] in (dispatch.OVERRIDE_SCHEMA,dispatch.HISTORY_SCHEMA,dispatch.HINT_SCHEMA) and dispatch.OVERRIDE_CAPABILITY not in effective_claimant.get('capabilities', []):
                         return False
-                    if dispatch_policy['schema'] == dispatch.HISTORY_SCHEMA and dispatch.HISTORY_CAPABILITY not in effective_claimant.get('capabilities', []):
+                    if dispatch_policy['schema'] in (dispatch.HISTORY_SCHEMA,dispatch.HINT_SCHEMA) and dispatch.HISTORY_CAPABILITY not in effective_claimant.get('capabilities', []):
+                        return False
+                    if dispatch_policy['schema'] == dispatch.HINT_SCHEMA and 'runtime-hint.v1' not in effective_claimant.get('capabilities', []):
                         return False
                     job_dir = self._next_pending(dispatch_policy)
                 except (ValueError,KeyError,TypeError,OSError) as error:
@@ -2171,6 +2177,10 @@ class GPUQueue:
                 for key in ('request_path', 'stdout_path', 'stderr_path', 'managed_context_record'):
                     if receipt.get(key):
                         receipt[key] = str(final_job_dir/Path(receipt[key]).name)
+                from .runtime_hints import comparison
+                if request.runtime_hint is not None:
+                    receipt['runtime_hint'] = request.runtime_hint
+                    receipt['runtime_hint_comparison'] = comparison(request.runtime_hint, receipt)
                 self._write_text_atomic(job_dir/'status.json', state.to_json())
                 self._write_json_atomic(job_dir / "receipt.json", receipt)
                 if not ownership_unresolved:

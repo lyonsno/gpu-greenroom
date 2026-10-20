@@ -15,7 +15,7 @@ import subprocess
 import tempfile
 import time
 
-from . import dispatch, gc
+from . import dispatch, gc, runtime_hints
 from .models import JobRequest
 
 CAPABILITY = 'command-preflight.v1'
@@ -36,6 +36,8 @@ def request_identity(request):
         value.pop('performance_window', None)
     if value.get('runtime_profile') is None:
         value.pop('runtime_profile', None)
+    if value.get('runtime_hint') is None:
+        value.pop('runtime_hint', None)
     value['params'].pop(DIGEST_PARAM, None)
     return digest(value)
 
@@ -117,14 +119,14 @@ def normalize_manifest(value):
     if unsupported:
         raise ValueError('unsupported command authority fields: ' + ', '.join(sorted(unsupported)))
     schema = payload.get('schema')
-    if schema not in {'gpu-greenroom.command.v1', 'gpu-greenroom.command.v2', 'gpu-greenroom.command.v3','gpu-greenroom.command.v4'}:
-        raise ValueError('command manifest schema must be gpu-greenroom.command.v1, v2, v3 or v4')
+    if schema not in {'gpu-greenroom.command.v1', 'gpu-greenroom.command.v2', 'gpu-greenroom.command.v3','gpu-greenroom.command.v4','gpu-greenroom.command.v5'}:
+        raise ValueError('command manifest schema must be gpu-greenroom.command.v1, v2, v3, v4 or v5')
     performance = payload.get('performance_window')
     if performance is not None and (schema == 'gpu-greenroom.command.v1'
             or not isinstance(performance, str) or not performance.strip()):
         raise ValueError('performance_window requires command.v2 or v3 and a nonblank reason')
     preflight = payload.get('preflight')
-    if 'preflight' in payload and schema not in ('gpu-greenroom.command.v3','gpu-greenroom.command.v4'):
+    if 'preflight' in payload and schema not in ('gpu-greenroom.command.v3','gpu-greenroom.command.v4','gpu-greenroom.command.v5'):
         raise ValueError('preflight requires gpu-greenroom.command.v3 or v4')
     service_class = payload.get('service_class')
     if service_class is not None and (schema == 'gpu-greenroom.command.v1' or service_class not in {'normal', 'quick'}):
@@ -180,10 +182,14 @@ def normalize_manifest(value):
             if not Path(path).is_file():
                 raise ValueError(f'preflight input is missing or not a file: {path}')
     if payload.get('runtime_profile') is not None:
-        if schema != 'gpu-greenroom.command.v4':
+        if schema not in ('gpu-greenroom.command.v4','gpu-greenroom.command.v5'):
             raise ValueError('runtime_profile requires command.v4; old CLIs must reject rather than discard it')
         if not isinstance(payload['runtime_profile'],dict):
             raise ValueError('runtime_profile must be an object')
+    if payload.get('runtime_hint') is not None:
+        if schema != 'gpu-greenroom.command.v5':
+            raise ValueError('runtime_hint requires command.v5; old CLIs must reject rather than discard it')
+        runtime_hints.validate(payload['runtime_hint'])
     return {**payload, 'output_dir': output, 'timeout': timeout,
             'service_class': service_class, 'cooperative_checkpoint': cooperative, 'preflight': preflight}
 
@@ -205,12 +211,15 @@ def command_request(payload, *, prepared=False):
         capabilities.append(PROFILE_CAPABILITY)
     if payload.get('performance_window') is not None:
         capabilities.append('performance-window.v1')
+    if payload.get('runtime_hint') is not None:
+        capabilities.append(runtime_hints.CAPABILITY)
     return JobRequest(job_type='command',input_path='',agent_id=payload.get('agent_id'),
         repo_root=payload['repo_root'],command_cwd=payload['cwd'],command_argv=payload['argv'],
         command_env=payload.get('env'),command_timeout=payload.get('timeout'),output_dir=payload.get('output_dir',''),
         output_class=payload.get('output_class'),route_identity=payload['route_identity'],
         service_class=payload.get('service_class'),cooperative_checkpoint=payload.get('cooperative_checkpoint',False),
         performance_window=payload.get('performance_window'),runtime_profile=payload.get('runtime_profile'),
+        runtime_hint=payload.get('runtime_hint'),
         required_worker_capabilities=capabilities)
 
 
@@ -223,7 +232,7 @@ def prepare(queue, manifest):
         dispatch.atomic_write(receipt, {'schema': SCHEMA, 'valid': False, 'phase': 'input-normalization',
             'validated_at': time.time(), 'gpu_execution_authority': False, 'error': str(error)})
         raise ValueError(f'{error}; validation receipt: {receipt}') from error
-    if payload['schema'] not in ('gpu-greenroom.command.v3','gpu-greenroom.command.v4'):
+    if payload['schema'] not in ('gpu-greenroom.command.v3','gpu-greenroom.command.v4','gpu-greenroom.command.v5'):
         raise ValueError('prepared commands require gpu-greenroom.command.v3 or v4')
     request = command_request(payload,prepared=True)
     if not request.output_dir:
