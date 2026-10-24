@@ -36,7 +36,7 @@ class SmokeDelivery:
                 atomic_write(path, {'schema': 'gpu-greenroom.smoke-delivery-activation.v1',
                                     'activated_at': _now()})
 
-    def events(self, record):
+    def events(self, record, *, display=None):
         request = record['request']
         if record.get('presentation', {}).get('purpose', request.get('purpose')) == 'diagnostic':
             return []
@@ -45,7 +45,7 @@ class SmokeDelivery:
             values.append(('response', record['response'], record['response']['responded_at']))
         if record.get('repeat_request'):
             values.append(('repeat', record['repeat_request'], record['repeat_request']['requested_at']))
-        display = self.store.display(record)
+        display = self.store.display(record) if display is None else display
         if display.get('phase') in {'operator-needed', 'interactive'} and display.get('job_state') == 'running':
             target = self.store.destination(record)
             session = record.get('session') or record.get('application_session')
@@ -78,9 +78,9 @@ class SmokeDelivery:
             raise ValueError('smoke delivery receipt status is missing or unrecognized')
         return {key: value[key] for key in ('event_id', 'status', 'updated_at', 'error', 'receipt', 'explicit_retry') if key in value}
 
-    def summary(self, record):
+    def summary(self, record, *, display=None):
         result = {}
-        for event in self.events(record):
+        for event in self.events(record, display=display):
             try:
                 result[event['kind']] = self.receipt(event)
             except (OSError, ValueError, KeyError, TypeError) as error:
