@@ -12,6 +12,56 @@ from gpu_queue.queue import GPUQueue
 from tests.test_job_controls import job, cancelled
 
 
+def test_process_ownership_warning_does_not_claim_lane_unresolved(tmp_path):
+    chromium=os.environ.get('GREENROOM_TEST_CHROMIUM')
+    if not chromium:
+        pytest.skip('set independent Chromium executable')
+    from playwright.sync_api import sync_playwright
+    from gpu_queue.models import JobState, JobStatus
+    q=GPUQueue(tmp_path/'queue')
+    path=job(q)
+    state=JobState.from_json((path/'status.json').read_text())
+    state.status=JobStatus.RUNNING
+    state.started_at=1
+    state.warnings=['ownership_unknown:process_group_live']
+    (path/'status.json').write_text(state.to_json())
+    path.rename(q.queue_dir/'running'/path.name)
+    server=ThreadingHTTPServer(('127.0.0.1',0),make_handler(q,'fixture-secret',local_operator=True,job_control=True))
+    thread=threading.Thread(target=server.serve_forever,daemon=True)
+    thread.start()
+    try:
+        with sync_playwright() as p:
+            context=p.chromium.launch_persistent_context(str(tmp_path/'profile'),executable_path=chromium,
+                headless=True,args=['--use-mock-keychain','--password-store=basic','--disable-gpu'])
+            try:
+                page=context.new_page()
+                page.goto(f'http://127.0.0.1:{server.server_address[1]}',wait_until='networkidle')
+                row=page.locator(f'[data-job-id="{path.name}"].job-item')
+                assert 'Process ownership unresolved; cancellation unavailable' in row.inner_text()
+                assert row.get_by_role('button',name='Cancel',exact=True).count()==0
+                row.get_by_role('button',name='Ask lane to implement pause').click()
+                page.wait_for_function("()=>last.jobs.some(j=>j.pause_support_request==='saved') && !busy")
+                assert 'Request saved locally; delivery pending' in row.inner_text()
+                assert 'Request submitted to lane' not in row.inner_text()
+                event=next((q.queue_dir/'job-feedback').glob('*.json'))
+                record=json.loads(event.read_text())
+                assert record['target_diaulos']=='fixture-owner'
+                assert record['status']=='saved'
+                for status,label in [('queued','Request queued in lane inbox'),('submitted','Request submitted to lane'),('uncertain','Request delivery unconfirmed')]:
+                    record['status']=status
+                    event.write_text(json.dumps(record))
+                    page.reload(wait_until='networkidle')
+                    assert label in row.inner_text()
+                evidence=Path(os.environ.get('GREENROOM_TEST_EVIDENCE',str(tmp_path/'evidence')))
+                evidence.mkdir(parents=True,exist_ok=True)
+                page.screenshot(path=str(evidence/'process-ownership.png'))
+                assert not page.locator('#error').is_visible()
+            finally:
+                context.close()
+    finally:
+        server.shutdown();server.server_close();thread.join()
+
+
 def test_controls_through_browser(tmp_path):
     chromium=os.environ.get('GREENROOM_TEST_CHROMIUM')
     if not chromium:

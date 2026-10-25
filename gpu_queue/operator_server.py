@@ -102,7 +102,7 @@ function nativeActions(j){
   if(!j?.consistent||document.body.dataset.readOnly==='true')return '';
   if(last?.job_control){
     if(!['pending','deferred','running'].includes(j.status)||!j.request_digest)return '';
-    if(j.warnings?.some(w=>w.startsWith('ownership_unknown:')))return '<span class="meta failed">Ownership unresolved; recovery required</span>';
+    if(j.warnings?.some(w=>w.startsWith('ownership_unknown:')))return '<span class="meta failed" title="Execution process ownership is unresolved, not the submitting lane identity. Recovery is required before cancellation.">Process ownership unresolved; cancellation unavailable</span>';
     if(j.cancellation_error)return '<span class="meta failed">Cancellation unverified</span>';
     if(j.status==='running'&&!j.worker_capabilities?.includes('job-cancellation.v1'))return '<span class="meta">Cancellation requires worker update</span>';
     if(j.cancellation)return `<span class="meta">${j.cancellation.force?'Force stop requested':'Cancelling; waiting for process exit'}</span>${j.status==='running'&&!j.cancellation.force?` <button class="danger icon" title="Force stop job" onclick="askCancel('${esc(j.job_id)}',true)">■</button>`:''}`;
@@ -121,7 +121,8 @@ function jobControls(j){
   if(j.requeue_available)return `<button title="Restore cancelled performance job" onclick="askRequeue('${esc(j.job_id)}')" ${disabled}>↻ Requeue</button>`;
   if(!['pending','running'].includes(j.status)||j.cancellation)return '';
   const p=j.pause_control;
-  if(!p?.supported)return `<span class="meta">Pause unsupported${j.pause_support_request?' · Request '+esc(j.pause_support_request):''}</span> <button title="Send the submitting lane a pause-support request" onclick="jobAction('${esc(j.job_id)}','ask-pause')" ${disabled||(!j.agent_id||(j.pause_support_request&&j.pause_support_request!=='failed')?'disabled':'')}>${j.pause_support_request==='failed'?'Retry pause-support request':'Ask lane to implement pause'}</button>`;
+  const requestLabels={saved:'Request saved locally; delivery pending',sending:'Request delivery in progress',queued:'Request queued in lane inbox',submitted:'Request submitted to lane',consumed:'Request consumed by lane',failed:'Request delivery failed',uncertain:'Request delivery unconfirmed'};
+  if(!p?.supported)return `<span class="meta">Pause unsupported${j.pause_support_request?' · '+esc(requestLabels[j.pause_support_request]||'Request status unverified'):''}</span> <button title="Save a pause-support request for the submitting lane; inbox delivery and submission are reported separately" onclick="jobAction('${esc(j.job_id)}','ask-pause')" ${disabled||(!j.agent_id||(j.pause_support_request&&j.pause_support_request!=='failed')?'disabled':'')}>${j.pause_support_request==='failed'?'Retry pause-support request':'Ask lane to implement pause'}</button>`;
   const held=!!p.phase;
   return `<span class="meta">${held?(p.phase==='paused'?'Paused':'Pause requested; waiting for checkpoint'):''}</span><button title="${held?'Resume':'Pause'} job" onclick="jobAction('${esc(j.job_id)}','${held?'resume':'pause'}',{allow_bypass:document.getElementById('bypass-${esc(j.job_id)}').checked})" ${disabled}>${held?'▶':'Ⅱ'}</button><label class="meta"><input id="bypass-${esc(j.job_id)}" type="checkbox" ${p.allow_bypass?'checked':''} ${disabled} onchange="${held?`jobAction('${esc(j.job_id)}','pause',{allow_bypass:this.checked})`:''}"> Let queued jobs run while paused</label>`;
 }
