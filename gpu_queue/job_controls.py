@@ -171,7 +171,13 @@ def perform(queue, *, job_id, request_digest, expected_status, expected_started_
                             'No need to reply just to acknowledge.\n'
                             f'Job: {job_id}\nRoute: {request.route_identity or request.job_type}\n'
                             f'Request: {path / "request.json"}')})
-            return {'status':'saved', 'event_id':event_id}
+            record = json.loads(event_path.read_text())
+            if record['status'] == 'failed':
+                record = {**record, 'status':'saved', 'retried_at':time.time(),
+                          'attempts':[*record.get('attempts',[]),
+                                      {key:value for key,value in record.items() if key != 'attempts'}]}
+                dispatch.atomic_write(event_path,record)
+            return {'status':record['status'], 'event_id':event_id}
         updated = {**config, 'schema':SCHEMA}
         holds = dict(config.get('job_holds', {}))
         if action in {'pause','resume'}:
@@ -221,9 +227,13 @@ def perform(queue, *, job_id, request_digest, expected_status, expected_started_
                     if (candidate.submitted_at >= request.submitted_at and candidate.command_argv == request.command_argv
                             and candidate.command_cwd == request.command_cwd and candidate.command_env == request.command_env
                             and candidate.route_identity == request.route_identity and candidate.agent_id == request.agent_id
+                            and candidate.job_type == request.job_type and candidate.input_path == request.input_path
+                            and {k:v for k,v in candidate.params.items() if k != admission.DIGEST_PARAM}
+                                == {k:v for k,v in request.params.items() if k != admission.DIGEST_PARAM}
                             and candidate.performance_window == request.performance_window):
                         raise ValueError(f'equivalent replacement already exists: {candidate.job_id}; inspect before retrying')
-            pending = dispatch.pending_order(queue.queue_dir,config)
+            # Placement is among waiting jobs, not only currently dispatchable jobs.
+            pending = dispatch.pending_order(queue.queue_dir,{**config,'job_holds':{}})
             predecessors = ([p.name for p in pending if JobState.from_json((p/'status.json').read_text()).submitted_at < state.submitted_at]
                             if placement=='previous' else [p.name for p in pending[:1]] if placement=='second'
                             else [p.name for p in pending])

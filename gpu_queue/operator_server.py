@@ -35,6 +35,7 @@ PAGE = r"""<!doctype html>
 .queue-columns[data-quick="true"]{grid-template-columns:repeat(3,minmax(0,1fr))}@media(max-width:900px){.queue-columns[data-quick="true"]{grid-template-columns:minmax(0,1fr)}}
 .queue-column.drop-target{outline:2px solid var(--blue);outline-offset:6px}.queue-column[data-drop-class]{min-height:200px}.job-item[draggable="true"]{cursor:grab}.job-item[draggable="true"]:active{cursor:grabbing}.queue-choice{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted);margin-top:10px}.queue-choice select{font:inherit;color:var(--text);background:#25292d;border:1px solid var(--line);border-radius:4px;padding:7px;min-height:34px}
 dialog{width:480px;max-width:calc(100vw - 24px);max-height:calc(100dvh - 24px);overflow:auto;background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:20px}dialog::backdrop{background:#0009}dialog h2{font:600 18px/1.3 system-ui;margin:0 0 14px}dialog p{overflow-wrap:anywhere;white-space:pre-wrap}.dialog-actions{display:flex;justify-content:flex-end;flex-wrap:wrap;gap:10px;margin-top:20px}
+.job-actions.actions{width:100%;text-align:left;justify-content:flex-start;align-items:center;flex-wrap:wrap}.job-actions>button{flex-shrink:0;max-width:100%;height:auto;min-height:34px;white-space:normal;overflow-wrap:normal;padding:7px 10px}.job-actions>.meta{flex:0 1 auto;min-width:0}.job-actions>label{display:flex;align-items:center;gap:6px}.job-actions input{flex-shrink:0}#requeueDialog select{display:block;width:100%;margin-top:8px;min-height:36px;font:inherit;color:var(--text);background:#25292d;border:1px solid var(--line);border-radius:4px}#requeueDialog label{display:block}
 </style>
 </head>
 <body><header><h1>GPU Greenroom</h1><div class="state"><span id="dot" class="dot"></span><span id="queueState">loading</span></div><div class="spacer"></div><button id="pause" title="Pause queue" class="icon">Ⅱ</button><button id="resume" title="Resume queue" class="icon">▶</button><button id="refresh" title="Refresh" class="icon">↻</button></header>
@@ -119,13 +120,13 @@ function jobControls(j){
   if(j.requeue_available)return `<button title="Restore cancelled performance job" onclick="askRequeue('${esc(j.job_id)}')" ${disabled}>↻ Requeue</button>`;
   if(!['pending','running'].includes(j.status)||j.cancellation)return '';
   const p=j.pause_control;
-  if(!p?.supported)return `<span class="meta">Pause unsupported${j.pause_support_request?' · Request '+esc(j.pause_support_request):''}</span> <button title="Send the submitting lane a pause-support request" onclick="jobAction('${esc(j.job_id)}','ask-pause')" ${disabled||(!j.agent_id||j.pause_support_request?'disabled':'')}>Ask lane to implement pause</button>`;
+  if(!p?.supported)return `<span class="meta">Pause unsupported${j.pause_support_request?' · Request '+esc(j.pause_support_request):''}</span> <button title="Send the submitting lane a pause-support request" onclick="jobAction('${esc(j.job_id)}','ask-pause')" ${disabled||(!j.agent_id||(j.pause_support_request&&j.pause_support_request!=='failed')?'disabled':'')}>${j.pause_support_request==='failed'?'Retry pause-support request':'Ask lane to implement pause'}</button>`;
   const held=!!p.phase;
   return `<span class="meta">${held?(p.phase==='paused'?'Paused':'Pause requested; waiting for checkpoint'):''}</span><button title="${held?'Resume':'Pause'} job" onclick="jobAction('${esc(j.job_id)}','${held?'resume':'pause'}',{allow_bypass:document.getElementById('bypass-${esc(j.job_id)}').checked})" ${disabled}>${held?'▶':'Ⅱ'}</button><label class="meta"><input id="bypass-${esc(j.job_id)}" type="checkbox" ${p.allow_bypass?'checked':''} ${disabled} onchange="${held?`jobAction('${esc(j.job_id)}','pause',{allow_bypass:this.checked})`:''}"> Let queued jobs run while paused</label>`;
 }
 async function jobAction(id,action,extra={}){
   const job=last?.jobs.find(j=>j.job_id===id);if(!job)return;
-  try{const result=await post('/api/job-action',{job_id:id,request_digest:job.request_digest,expected_status:job.status,expected_started_at:job.started_at??null,action,...extra});if(action==='ask-pause')err('Pause-support request saved for delivery.')}catch(e){err(e.message)}
+  try{const result=await post('/api/job-action',{job_id:id,request_digest:job.request_digest,expected_status:job.status,expected_started_at:job.started_at??null,action,...extra});if(action==='ask-pause')err('Pause-support request: '+result.status+'.')}catch(e){err(e.message)}
 }
 function askRequeue(id){
   const job=last?.jobs.find(j=>j.job_id===id);if(!job)return;

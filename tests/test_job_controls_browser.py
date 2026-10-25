@@ -53,6 +53,9 @@ def test_controls_through_browser(tmp_path):
                 report['phase']='restore'
                 page.get_by_role('button',name='Restore cancelled',exact=True).click()
                 page.get_by_title('Restore cancelled performance job').click()
+                for width,height in [(1440,1000),(390,844)]:
+                    page.set_viewport_size({'width':width,'height':height})
+                    page.screenshot(path=str(evidence/f'requeue-dialog-{width}.png'))
                 page.locator('#requeuePlacement').select_option('second')
                 page.locator('#requeueConfirm').click()
                 page.wait_for_function("()=>!busy && last.view==='recoverable' && last.jobs.length===0")
@@ -64,6 +67,7 @@ def test_controls_through_browser(tmp_path):
                     page.set_viewport_size({'width':width,'height':height})
                     page.screenshot(path=str(evidence/f'controls-{width}.png'),full_page=True)
                     assert page.evaluate('document.documentElement.scrollWidth<=innerWidth')
+                    assert page.locator('.job-actions button').evaluate_all('(buttons)=>buttons.every(b=>b.scrollHeight<=b.clientHeight && b.scrollWidth<=b.clientWidth)')
                 assert not errors,errors
                 report.update(status='passed',phase='complete',errors=errors,
                     jobs=page.evaluate('last.jobs.map(j=>({id:j.job_id,position:j.queue_position}))'))

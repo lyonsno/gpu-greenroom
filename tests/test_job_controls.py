@@ -243,3 +243,61 @@ def test_current_config_and_quick_moves_preserve_holds(tmp_path):
                         request_id=str(uuid4()),requested_by='operator-console')
     q.configure_dispatch({'schema':dispatch.SCHEMA,'mode':'two-class'},owner='fixture')
     assert dispatch.pending_order(tmp_path)==[]
+
+
+@pytest.mark.parametrize('placement,index',[('previous',0),('second',1),('end',2)])
+def test_restore_placement_uses_waiting_order_even_when_dispatch_held(tmp_path,placement,index):
+    q=GPUQueue(tmp_path)
+    original=cancelled(q)
+    first=job(q,2,cooperative_checkpoint=True)
+    last=job(q,3)
+    act(q,first,'pause',allow_bypass=False)
+    result=act(q,original,'requeue',placement=placement)
+    assert dispatch.pending_order(tmp_path)==[]
+    act(q,first,'resume')
+    expected=[first,last]
+    expected.insert(index,tmp_path/'pending'/result['new_job_id'])
+    assert dispatch.pending_order(tmp_path)==expected
+
+
+@pytest.mark.parametrize('changed', [{'input_path':'/two'}, {'job_type':'other'}, {'params':{'setting':2}}, {}])
+def test_restore_compares_execution_bearing_identity(tmp_path,changed):
+    q=GPUQueue(tmp_path)
+    request=JobRequest(job_type='echo',input_path='/one',params={'setting':1},
+                       agent_id='owner',performance_window='measurement',submitted_at=1)
+    path=q.submit(request)
+    q.cancel(path.name)
+    from dataclasses import replace
+    q.submit(replace(request,job_id='later-job',submitted_at=2,**changed))
+    if changed:
+        assert act(q,tmp_path/'cancelled'/path.name,'requeue')['status']=='requeued'
+    else:
+        with pytest.raises(ValueError,match='equivalent replacement'):
+            act(q,tmp_path/'cancelled'/path.name,'requeue')
+
+
+def test_pause_request_retry_after_definite_failure_preserves_identity(tmp_path,monkeypatch):
+    from gpu_queue.job_controls import deliver_feedback
+    from subprocess import CompletedProcess
+    q=GPUQueue(tmp_path)
+    path=job(q)
+    first=act(q,path,'ask-pause')
+    record_path=tmp_path/'job-feedback'/f"{first['event_id']}.json"
+    calls=[]
+    def adapter(argv,**kwargs):
+        calls.append(json.loads(kwargs['input']))
+        return CompletedProcess(argv,0,json.dumps({'event_id':first['event_id'],
+            'status':'failed' if len(calls)==1 else 'queued','receipt':{'failure_phase':'endpoint-resolution'}}),'')
+    monkeypatch.setattr('subprocess.run',adapter)
+    deliver_feedback(tmp_path,sys.executable)
+    assert json.loads(record_path.read_text())['status']=='failed'
+    retry=act(q,path,'ask-pause')
+    assert retry['status']=='saved'
+    assert retry['event_id']==first['event_id']
+    deliver_feedback(tmp_path,sys.executable)
+    deliver_feedback(tmp_path,sys.executable)
+    final=json.loads(record_path.read_text())
+    assert final['status']=='queued'
+    assert final['attempts'][0]['status']=='failed'
+    assert len(calls)==2
+    assert act(q,path,'ask-pause')['status']=='queued'
