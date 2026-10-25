@@ -40,6 +40,8 @@ def test_controls_through_browser(tmp_path):
                 row=page.locator(f'[data-job-id="{support.name}"].job-item')
                 row.get_by_role('button',name='Ask lane to implement pause').click()
                 page.wait_for_function("()=>last.jobs.some(j=>j.pause_support_request==='saved')")
+                page.wait_for_function("()=>!busy")
+                assert not page.locator('#error').is_visible(),page.locator('#error').inner_text()
                 assert len(list((q.queue_dir/'job-feedback').glob('*.json')))==1
                 report['phase']='pause-resume'
                 row=page.locator(f'[data-job-id="{pausable.name}"].job-item')

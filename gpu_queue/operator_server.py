@@ -126,7 +126,7 @@ function jobControls(j){
 }
 async function jobAction(id,action,extra={}){
   const job=last?.jobs.find(j=>j.job_id===id);if(!job)return;
-  try{const result=await post('/api/job-action',{job_id:id,request_digest:job.request_digest,expected_status:job.status,expected_started_at:job.started_at??null,action,...extra});if(action==='ask-pause')err('Pause-support request: '+result.status+'.')}catch(e){err(e.message)}
+  try{await post('/api/job-action',{job_id:id,request_digest:job.request_digest,expected_status:job.status,expected_started_at:job.started_at??null,action,...extra})}catch(e){err(e.message)}
 }
 function askRequeue(id){
   const job=last?.jobs.find(j=>j.job_id===id);if(!job)return;
