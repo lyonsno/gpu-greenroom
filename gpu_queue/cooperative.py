@@ -106,7 +106,10 @@ def yield_if_requested(*,save_checkpoint,quiesce,continuation,on_submitted=None)
     pending=dispatch.pending_order(queue.queue_dir,config)
     pending_request, pending_digest = dispatch.read_request(pending[0]/'request.json') if pending else (None, None)
     quick_waiting=bool(pending and dispatch.classify(pending_request,config,request_digest=pending_digest,queue_dir=queue.queue_dir)[0]=='quick')
-    if not queue.is_paused() and (state.get('dispatch',{}).get('service_class')!='normal' or not quick_waiting):
+    hold = config.get('job_holds', {}).get(request.job_id)
+    if hold and hold['request_digest'] != hashlib.sha256((job/'request.json').read_bytes()).hexdigest():
+        raise ValueError('pause request identity changed')
+    if not hold and not queue.is_paused() and (state.get('dispatch',{}).get('service_class')!='normal' or not quick_waiting):
         return False
     directory=queue.queue_dir/'outputs'/request.job_id/'checkpoints'
     pins=RetentionPins(queue.queue_dir)
@@ -128,6 +131,8 @@ def yield_if_requested(*,save_checkpoint,quiesce,continuation,on_submitted=None)
         return False
     next_request=continuation(checkpoint)
     if next_request is None:
+        if hold:
+            raise ValueError('operator pause requires a resumable continuation')
         raise SystemExit(0)
     if (not isinstance(next_request,JobRequest) or next_request.job_id==request.job_id
             or next_request.agent_id!=request.agent_id or next_request.repo_root!=request.repo_root

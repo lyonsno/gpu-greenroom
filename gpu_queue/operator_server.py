@@ -40,7 +40,7 @@ dialog{width:480px;max-width:calc(100vw - 24px);max-height:calc(100dvh - 24px);o
 <body><header><h1>GPU Greenroom</h1><div class="state"><span id="dot" class="dot"></span><span id="queueState">loading</span></div><div class="spacer"></div><button id="pause" title="Pause queue" class="icon">Ⅱ</button><button id="resume" title="Resume queue" class="icon">▶</button><button id="refresh" title="Refresh" class="icon">↻</button></header>
 <main><div id="pauseMeta" class="meta" hidden></div><div id="lease" class="meta" hidden></div><div class="queue-columns"><section id="automaticQueue" class="queue-column" aria-labelledby="automaticHeading"><div class="column-heading"><h2 id="automaticHeading">Automatic work</h2><span id="automaticCount" class="meta"></span></div><div class="toolbar" id="filters"></div><div id="jobs"></div><div id="empty" class="empty" hidden>No jobs in this view.</div></section><div id="operatorQueue" class="queue-column"><section id="smokeRequests" aria-labelledby="smokeHeading"><div class="column-heading smoke-heading"><h2 id="smokeHeading">Operator smokes</h2><button id="refreshSmoke" type="button" class="icon" title="Refresh operator smokes">↻</button><span id="smokeStatus" class="meta" aria-live="polite">Loading</span></div><div id="smokeRequestList"><div class="empty">Loading requests…</div></div></section></div><section id="quickQueue" class="queue-column" aria-labelledby="quickHeading" hidden><div class="column-heading"><h2 id="quickHeading">Quick work</h2><span id="quickCount" class="meta"></span></div><div id="quickJobs"></div></section></div></main><div id="error" class="error"></div>
 <script>
-const hash=new URLSearchParams(location.hash.slice(1)),bootstrap=globalThis.__GREENROOM_BOOTSTRAP_TOKEN__||'';if(bootstrap){sessionStorage.setItem('greenroom-token',bootstrap)}else if(hash.get('token')){sessionStorage.setItem('greenroom-token',hash.get('token'));history.replaceState(null,'',location.pathname)}const token=sessionStorage.getItem('greenroom-token')||'';let filter='active',last=null;const statuses=['active','all','pending','running','done','failed','cancelled'];
+const hash=new URLSearchParams(location.hash.slice(1)),bootstrap=globalThis.__GREENROOM_BOOTSTRAP_TOKEN__||'';if(bootstrap){sessionStorage.setItem('greenroom-token',bootstrap)}else if(hash.get('token')){sessionStorage.setItem('greenroom-token',hash.get('token'));history.replaceState(null,'',location.pathname)}const token=sessionStorage.getItem('greenroom-token')||'';let filter='active',last=null;const statuses=['active','recoverable','all','pending','running','done','failed','cancelled'];
 const smokeDrafts=new Map(),smokeParticipation=new Map(),smokeRuns=new Map(),smokeRunVersions=new Map(),smokeRunLoads=new Set(),smokeRunOpen=new Set(),smokeAudio=new Map(),smokeAudioBindings=new Map(),smokeSubmitting=new Set(),smokeAccepted=new Set();let smokeLoadGeneration=0,smokeHasLoaded=false,smokeRefreshUnavailable=false,smokeArrivalHandled=false,smokeFilter='active',lastSmoke=null;
 const arrivalParams=new URLSearchParams(location.search||''),arrivalId=arrivalParams.get('smoke'),arrivalDigest=arrivalParams.get('destination');let arrivalOpened=false;if(arrivalId){history.replaceState(null,'',location.pathname+'#smoke-'+arrivalId)}
 function smokeRunVersion(item){return JSON.stringify([item?.request_digest,item?.display?.job_id,item?.presentation?.review_artifacts||[]])}
@@ -112,6 +112,28 @@ function nativeActions(j){
   if(j.status==='running')return `<button class="danger text" title="Stop running job" onclick="act('terminate','${esc(j.job_id)}')"><span>■</span> Stop</button> <button class="danger icon" title="Force stop running job" onclick="act('kill','${esc(j.job_id)}')">!</button>`;
   return '';
 }
+function jobControls(j){
+  if(!last?.job_control||!j.consistent||document.body.dataset.readOnly==='true')return '';
+  const disabled=busy||!queueAvailable?'disabled':'';
+  if(j.restored_as)return `<span class="meta">Restored as ${esc(j.restored_as)}</span>`;
+  if(j.requeue_available)return `<button title="Restore cancelled performance job" onclick="askRequeue('${esc(j.job_id)}')" ${disabled}>↻ Requeue</button>`;
+  if(!['pending','running'].includes(j.status)||j.cancellation)return '';
+  const p=j.pause_control;
+  if(!p?.supported)return `<span class="meta">Pause unsupported${j.pause_support_request?' · Request '+esc(j.pause_support_request):''}</span> <button title="Send the submitting lane a pause-support request" onclick="jobAction('${esc(j.job_id)}','ask-pause')" ${disabled||(!j.agent_id||j.pause_support_request?'disabled':'')}>Ask lane to implement pause</button>`;
+  const held=!!p.phase;
+  return `<span class="meta">${held?(p.phase==='paused'?'Paused':'Pause requested; waiting for checkpoint'):''}</span><button title="${held?'Resume':'Pause'} job" onclick="jobAction('${esc(j.job_id)}','${held?'resume':'pause'}',{allow_bypass:document.getElementById('bypass-${esc(j.job_id)}').checked})" ${disabled}>${held?'▶':'Ⅱ'}</button><label class="meta"><input id="bypass-${esc(j.job_id)}" type="checkbox" ${p.allow_bypass?'checked':''} ${disabled} onchange="${held?`jobAction('${esc(j.job_id)}','pause',{allow_bypass:this.checked})`:''}"> Let queued jobs run while paused</label>`;
+}
+async function jobAction(id,action,extra={}){
+  const job=last?.jobs.find(j=>j.job_id===id);if(!job)return;
+  try{const result=await post('/api/job-action',{job_id:id,request_digest:job.request_digest,expected_status:job.status,expected_started_at:job.started_at??null,action,...extra});if(action==='ask-pause')err('Pause-support request saved for delivery.')}catch(e){err(e.message)}
+}
+function askRequeue(id){
+  const job=last?.jobs.find(j=>j.job_id===id);if(!job)return;
+  let d=document.querySelector('#requeueDialog');
+  if(!d){d=document.createElement('dialog');d.id='requeueDialog';d.innerHTML='<form method="dialog"><h2>Restore this performance job?</h2><p id="requeueIdentity"></p><p>Creates a new attempt. Fresh performance confirmation is required.</p><label>Queue placement <select id="requeuePlacement"><option value="previous">Previous position among waiting jobs</option><option value="second">Second in the waiting queue</option><option value="end">End of the waiting queue</option></select></label><div class="dialog-actions"><button value="back">Keep cancelled</button><button id="requeueConfirm" type="button">Requeue</button></div></form>';document.body.append(d)}
+  d.querySelector('#requeueIdentity').textContent=`${job.job_id} · ${job.agent_id||'Agent not recorded'}\n${job.requested_route||job.job_type}`;
+  d.querySelector('#requeueConfirm').onclick=()=>{const placement=d.querySelector('select').value;d.close();jobAction(id,'requeue',{placement})};d.showModal();
+}
 function performanceWindow(j){
   if(!j.performance_window_reason)return '';
   const p=j.performance_window,labels={waiting:'Waiting for your confirmation',confirmed:'Confirmed; command not started',running:'Measuring',complete:'Command finished',cancelled:'Cancelled before command',failed:'Failed',interrupted:'Interrupted',unverified:'Unverified'};
@@ -133,7 +155,7 @@ function render(s){
   if(s.paused&&!p?.epoch)pm.textContent+=' · Legacy pause: epoch not recorded.'+(s.admission_control?' Verify pause ownership and recover through the native queue CLI; browser resume cannot bind this marker.':'');
   const lease=document.querySelector('#lease');lease.hidden=!s.lease;
   lease.textContent=s.lease?`Recorded external owner: ${s.lease.owner} · ${s.lease.effective_route} · ${s.lease.lifecycle_state}`:'';
-  document.querySelector('#filters').innerHTML=statuses.map(x=>`<button class="filter ${filter===x?'active':''}" data-filter="${x}">${x}</button>`).join('');
+  document.querySelector('#filters').innerHTML=statuses.map(x=>`<button class="filter ${filter===x?'active':''}" data-filter="${x}">${x==='recoverable'?'Restore cancelled':x}</button>`).join('');
   document.querySelectorAll('[data-filter]').forEach(b=>b.onclick=()=>{filter=b.dataset.filter;load()});
   const smokeJobs=new Set((lastSmoke?.items||[]).map(item=>item.display?.job_id).filter(Boolean));
   const rank=j=>j.status==='running'?0:j.status==='pending'?1:2;
@@ -146,7 +168,7 @@ function render(s){
   document.querySelector('#quickQueue').hidden=!showQuick;
   document.querySelector('.queue-columns').dataset.quick=String(showQuick);
   const jobMarkup=items=>items.map(j=>{
-    const a=nativeActions(j);
+    const a=jobControls(j)+nativeActions(j);
     const route=j.requested_route||j.effective_route||j.job_type;
     const conflict=performanceWindow(j)+runtimeHint(j)+(j.consistent?'':`<div class="meta">containment: ${esc(j.containment_status)} · declared: ${esc(j.declared_status)}</div>`);
     const manual=j.dispatch_override||j.dispatch?.operator_override;
@@ -292,6 +314,8 @@ def queue_snapshot(queue: GPUQueue | Path, view: str = "all", *, read_only: bool
     statuses = ("pending", "deferred", "running", "done", "failed", "cancelled")
     if view == "active":
         selected = ("pending", "deferred", "running")
+    elif view == "recoverable":
+        selected = ("failed", "cancelled")
     elif view == "all":
         selected = statuses
     elif view in statuses:
@@ -434,6 +458,13 @@ def queue_snapshot(queue: GPUQueue | Path, view: str = "all", *, read_only: bool
                     row['dispatch_error'] = str(error)
             row['queue_position'] = positions.get(row['job_id'])
             try:
+                from .job_controls import projection
+                from .models import JobState
+                row.update(projection(queue_dir,job_dir,JobRequest.from_json(json.dumps(request)),
+                                      JobState.from_json(status_path.read_text()),config or {}))
+            except (OSError, ValueError, TypeError, KeyError) as error:
+                row['job_control_error'] = str(error)
+            try:
                 from .cancellation import read_request as read_cancellation
                 from .models import JobState
                 row['cancellation'] = read_cancellation(job_dir, JobState.from_json(status_path.read_text())) if (job_dir/'cancel-request.json').exists() else None
@@ -448,7 +479,8 @@ def queue_snapshot(queue: GPUQueue | Path, view: str = "all", *, read_only: bool
             wait_end = started if started is not None else (now if declared_status in {'pending', 'deferred'} else None)
             row['queue_wait_seconds'] = difference(wait_end, submitted) if consistent else None
             row['execution_wall_seconds'] = difference(finished or (now if declared_status == 'running' else None), started) if consistent else None
-            jobs.append(row)
+            if view != 'recoverable' or row.get('requeue_available'):
+                jobs.append(row)
     jobs.sort(key=lambda item: (item.get("submitted_at") or 0), reverse=True)
     lease_payload = None
     pause_path = queue_dir / "paused"
@@ -702,6 +734,22 @@ def make_handler(queue: GPUQueue | Path, token: str, *, read_only: bool = False,
                 self._json(HTTPStatus.FORBIDDEN, {"error": "read_only_monitor"})
                 return
             smoke_route = self._is_smoke_post_path(path)
+            if path == '/api/job-action':
+                if not job_control:
+                    self._json(HTTPStatus.FORBIDDEN, {'error':'job_controls_disabled'})
+                    return
+                try:
+                    body = self._body()
+                    required = {'job_id','request_digest','expected_status','expected_started_at','request_id','action'}
+                    if not required.issubset(body) or set(body)-required-{'allow_bypass','placement'}:
+                        raise ValueError('job action requires the exact displayed attempt identity')
+                    root = queue if isinstance(queue,Path) else queue.queue_dir
+                    result = GPUQueue(root).operator_job_action(**body,requested_by='operator-console')
+                except (ValueError, TypeError, KeyError, OSError, RuntimeError) as error:
+                    self._json(HTTPStatus.CONFLICT, {'error':str(error)})
+                    return
+                self._json(HTTPStatus.OK,result)
+                return
             if path == '/api/job-cancel':
                 if not job_control:
                     self._json(HTTPStatus.FORBIDDEN, {'error': 'job_controls_disabled'})
@@ -811,6 +859,8 @@ def serve(queue_dir: str | Path, *, port: int = 8765, token: str | None = None, 
     if adapter and not read_only:
         from .smoke_delivery import SmokeDelivery
         SmokeDelivery(SmokeRequests(Path(queue_dir) / 'smoke-requests'), adapter).start()
+        from .job_controls import start_feedback
+        start_feedback(Path(queue_dir), adapter)
     print(operator_url(effective_port, token, local_operator=local_operator), flush=True)
     server.serve_forever()
 

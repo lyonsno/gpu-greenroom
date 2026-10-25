@@ -84,7 +84,7 @@ def _safe_substitute(template: str, mapping: dict) -> str:
 def effective_worker_capabilities() -> frozenset[str]:
     configured = os.environ.get("GPU_GREENROOM_WORKER_CAPABILITIES")
     if configured is None:
-        return DEFAULT_WORKER_CAPABILITIES | {dispatch.CAPABILITY,dispatch.OVERRIDE_CAPABILITY,'structured-command.v2','checkpoint-continuation.v1',admission.CAPABILITY,performance_window.CAPABILITY,'job-cancellation.v1',dispatch.HISTORY_CAPABILITY,'runtime-hint.v1'}
+        return DEFAULT_WORKER_CAPABILITIES | {dispatch.CAPABILITY,dispatch.OVERRIDE_CAPABILITY,'structured-command.v2','checkpoint-continuation.v1',admission.CAPABILITY,performance_window.CAPABILITY,'job-cancellation.v1',dispatch.HISTORY_CAPABILITY,'runtime-hint.v1','operator-job-controls.v1'}
     return frozenset(
         capability.strip()
         for capability in configured.split(",")
@@ -477,6 +477,10 @@ class GPUQueue:
     def request_cancel(self, **kwargs) -> dict:
         from .cancellation import request
         return request(self, **kwargs)
+
+    def operator_job_action(self, **kwargs):
+        from .job_controls import perform
+        return perform(self, **kwargs)
 
     def _mark_lease_unknown_locked(self, lease: ExternalLease, reason: str) -> ExternalLease:
         if lease.lifecycle_state == LeaseStatus.OWNERSHIP_UNKNOWN:
@@ -1237,6 +1241,8 @@ class GPUQueue:
                 raise ValueError('prepared continuation state changed after registration')
             if self.get_job(request.job_id) is not None:
                 raise ValueError('continuation identity is already admitted')
+            from .job_controls import inherit_hold
+            inherit_hold(self,commit['job_id'],request.job_id,commit['next_request_sha256'])
             destination=stage.rename(self.queue_dir/'pending'/request.job_id)
             for directory in (destination.parent,self.queue_dir/'continuation-staging'):
                 fd=os.open(directory,os.O_RDONLY)
@@ -1322,10 +1328,13 @@ class GPUQueue:
                 current=dispatch.policy(self.queue_dir)
             except (ValueError,OSError):
                 current={}
-            if current.get('schema') in (dispatch.OVERRIDE_SCHEMA,dispatch.HISTORY_SCHEMA,dispatch.HINT_SCHEMA):
+            if current.get('schema') in (dispatch.OVERRIDE_SCHEMA,dispatch.HISTORY_SCHEMA,dispatch.HINT_SCHEMA,dispatch.CONTROL_SCHEMA):
                 value = {**value, 'schema': dispatch.HINT_SCHEMA if value.get('producer_hints') is not None else dispatch.HISTORY_SCHEMA if value.get('runtime_history') is not None else dispatch.OVERRIDE_SCHEMA,
                          'job_overrides': current.get('job_overrides', {}),
                          'action_receipts': current.get('action_receipts', {})}
+            if current.get('schema') == dispatch.CONTROL_SCHEMA:
+                value.update(schema=dispatch.CONTROL_SCHEMA, **{key:current.get(key,{})
+                    for key in ('job_holds','job_positions','job_actions','job_restores')})
             fields={key:item for key,item in current.items() if key not in {'epoch','owner','configured_at'}}
             if value==fields and not reset_fairness:
                 return current
@@ -1366,6 +1375,8 @@ class GPUQueue:
             updated = {**config, 'schema': dispatch.HINT_SCHEMA if config.get('producer_hints') is not None else dispatch.HISTORY_SCHEMA if config.get('runtime_history') is not None else dispatch.OVERRIDE_SCHEMA,
                        'job_overrides': {**config.get('job_overrides', {}), job_id: receipt},
                        'action_receipts': {**config.get('action_receipts', {}), request_id: receipt}}
+            if config['schema'] == dispatch.CONTROL_SCHEMA:
+                updated['schema'] = dispatch.CONTROL_SCHEMA
             dispatch.atomic_write(self.queue_dir / 'dispatch-policy.json', dispatch.validate(updated))
             return receipt
 
@@ -1561,6 +1572,13 @@ class GPUQueue:
 
         Returns True if a job was run, False if queue was empty.
         """
+        from .job_controls import recover as recover_operator_jobs
+        try:
+            recover_operator_jobs(self)
+        except (ValueError,KeyError,TypeError,OSError) as error:
+            dispatch.atomic_write(self.queue_dir/'dispatch-error.json',
+                {'phase':'dispatch-policy','error':str(error),'observed_at':time.time()})
+            return False
         if self._worker_shutdown_requested or self.is_paused():
             return False
         if self._external_execution_blocked():
@@ -1587,6 +1605,8 @@ class GPUQueue:
                 effective_claimant = claimant or worker_identity()
                 try:
                     dispatch_policy=dispatch.policy(self.queue_dir)
+                    if dispatch_policy['schema'] == dispatch.CONTROL_SCHEMA and 'operator-job-controls.v1' not in effective_claimant.get('capabilities',[]):
+                        return False
                     if dispatch_policy['mode']=='two-class' and dispatch.CAPABILITY not in effective_claimant.get('capabilities',[]):
                         return False
                     if dispatch_policy['schema'] in (dispatch.OVERRIDE_SCHEMA,dispatch.HISTORY_SCHEMA,dispatch.HINT_SCHEMA) and dispatch.OVERRIDE_CAPABILITY not in effective_claimant.get('capabilities', []):

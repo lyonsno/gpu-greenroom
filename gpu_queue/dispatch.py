@@ -19,6 +19,7 @@ OVERRIDE_CAPABILITY = 'operator-dispatch-override.v1'
 HISTORY_SCHEMA = 'gpu-greenroom.dispatch-policy.v3'
 HISTORY_CAPABILITY = 'runtime-profile.v1'
 HINT_SCHEMA = 'gpu-greenroom.dispatch-policy.v4'
+CONTROL_SCHEMA = 'gpu-greenroom.dispatch-policy.v5'
 
 
 def validate_override(value):
@@ -68,7 +69,7 @@ def atomic_write(path, payload):
 
 
 def validate(value):
-    if not isinstance(value,dict) or value.get('schema') not in (SCHEMA, OVERRIDE_SCHEMA,HISTORY_SCHEMA,HINT_SCHEMA) or not isinstance(value.get('mode'),str) or value['mode'] not in {'fifo','two-class'}:
+    if not isinstance(value,dict) or value.get('schema') not in (SCHEMA, OVERRIDE_SCHEMA,HISTORY_SCHEMA,HINT_SCHEMA,CONTROL_SCHEMA) or not isinstance(value.get('mode'),str) or value['mode'] not in {'fifo','two-class'}:
         raise ValueError('invalid dispatch policy schema or mode')
     for key in ('quick_job_types','quick_routes'):
         rules=value.get(key,{})
@@ -78,7 +79,7 @@ def validate(value):
     overrides, receipts = value.get('job_overrides', {}), value.get('action_receipts', {})
     history = value.get('runtime_history')
     if history is not None:
-        if value['schema'] not in (HISTORY_SCHEMA,HINT_SCHEMA) or not isinstance(history,dict):
+        if value['schema'] not in (HISTORY_SCHEMA,HINT_SCHEMA,CONTROL_SCHEMA) or not isinstance(history,dict):
             raise ValueError('runtime history requires v3 dispatch policy')
         if not isinstance(history.get('index'),str) or not Path(history['index']).is_absolute() or not isinstance(history.get('profiles'),dict):
             raise ValueError('runtime history requires an absolute index and explicit profiles')
@@ -91,11 +92,15 @@ def validate(value):
                 raise ValueError('runtime history rule requires samples, threshold and evidence')
     hints = value.get('producer_hints')
     if hints is not None:
-        if value['schema'] != HINT_SCHEMA:
+        if value['schema'] not in (HINT_SCHEMA,CONTROL_SCHEMA):
             raise ValueError('producer_hints require v4 dispatch policy')
         if (not isinstance(hints,dict) or type(hints.get('max_seconds')) not in (int,float)
                 or not math.isfinite(hints['max_seconds']) or hints['max_seconds'] <= 0):
             raise ValueError('producer_hints require a positive finite max_seconds')
+    from .job_controls import validate_controls
+    validate_controls(value)
+    if any(value.get(k) for k in ('job_holds','job_positions','job_actions','job_restores')) and value['schema'] != CONTROL_SCHEMA:
+        raise ValueError('job controls require v5 policy')
     if value['schema'] == SCHEMA and (overrides or receipts):
         raise ValueError('dispatch overrides require v2 policy and worker capability')
     if not isinstance(overrides, dict) or not isinstance(receipts, dict):
@@ -175,9 +180,10 @@ def pending_order(root, config=None):
             if state.job_id!=path.name or state.status!=JobStatus.PENDING:
                 raise ValueError('pending job identity or containment is unverified')
             rows.append((state.submitted_at,path))
-    rows.sort(key=lambda row:row[0])
+    rows.sort(key=lambda row:(row[0],row[1].name))
+    from .job_controls import order
     if config['mode']=='fifo':
-        return [path for _,path in rows]
+        return order(root, [path for _,path in rows], config)
     normal,quick=deque(),deque()
     for _,path in rows:
         request, digest = read_request(path/'request.json')
@@ -191,4 +197,4 @@ def pending_order(root, config=None):
         path=bucket.popleft()
         result.append(path)
         previous='normal' if bucket is normal else 'quick'
-    return result
+    return order(root, result, config)
