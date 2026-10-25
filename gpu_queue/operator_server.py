@@ -115,6 +115,7 @@ function nativeActions(j){
 }
 function jobControls(j){
   if(!last?.job_control||!j.consistent||document.body.dataset.readOnly==='true')return '';
+  if(j.job_control_error)return `<span class="meta failed">Job controls unavailable: ${esc(j.job_control_error)}</span>`;
   const disabled=busy||!queueAvailable?'disabled':'';
   if(j.restored_as)return `<span class="meta">Restored as ${esc(j.restored_as)}</span>`;
   if(j.requeue_available)return `<button title="Restore cancelled performance job" onclick="askRequeue('${esc(j.job_id)}')" ${disabled}>↻ Requeue</button>`;
@@ -365,6 +366,7 @@ def queue_snapshot(queue: GPUQueue | Path, view: str = "all", *, read_only: bool
             row["consistent"] = consistent
             row["status"] = containment_status if consistent else "inconsistent"
             request_path = job_dir / "request.json"
+            request = {}
             if request_path.is_file():
                 hint_receipt = None
                 digest = None
@@ -461,6 +463,8 @@ def queue_snapshot(queue: GPUQueue | Path, view: str = "all", *, read_only: bool
             try:
                 from .job_controls import projection
                 from .models import JobState
+                if not request:
+                    raise ValueError('Job request missing or unreadable')
                 row.update(projection(queue_dir,job_dir,JobRequest.from_json(json.dumps(request)),
                                       JobState.from_json(status_path.read_text()),config or {}))
             except (OSError, ValueError, TypeError, KeyError) as error:

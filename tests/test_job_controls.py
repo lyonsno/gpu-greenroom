@@ -301,3 +301,13 @@ def test_pause_request_retry_after_definite_failure_preserves_identity(tmp_path,
     assert final['attempts'][0]['status']=='failed'
     assert len(calls)==2
     assert act(q,path,'ask-pause')['status']=='queued'
+
+
+def test_missing_request_is_unverified_not_a_broken_monitor(tmp_path):
+    q=GPUQueue(tmp_path)
+    path=cancelled(q)
+    (path/'request.json').unlink()
+    row=queue_snapshot(q,'cancelled')['jobs'][0]
+    assert row['job_id']==path.name
+    assert row['job_control_error']
+    assert not row.get('requeue_available')
