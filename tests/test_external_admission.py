@@ -97,3 +97,15 @@ def test_identity_reuse_does_not_change_route(tmp_path):
         "--backend", "webgpu", "--device", "fixture-no-gpu", "--profile", "interactive-generation"], capture_output=True, text=True)
     assert result.returncode != 0
     assert queue.lease_status().effective_route == "fixture/browser"
+
+
+def test_queued_cli_does_not_silently_ignore_handoff_flags(tmp_path):
+    queue = GPUQueue(tmp_path / 'queue')
+    result = subprocess.run([sys.executable, '-m', 'gpu_queue.cli', '--queue-dir', str(queue.queue_dir),
+        'lease', 'queued-claim', '--lease-id', 'page-one', '--owner', 'test-page', '--agent-id', 'fixture',
+        '--repo-root', str(tmp_path), '--pid', str(os.getpid()), '--effective-route', 'fixture/browser',
+        '--backend', 'webgpu', '--device', 'fixture-no-gpu', '--profile', 'interactive-generation',
+        '--handoff-bump-id', 'different-protocol'], capture_output=True, text=True)
+    assert result.returncode != 0, 'queued admission must reject a handoff it cannot honor'
+    assert queue.lease_status() is None
+    assert queue.list_jobs() == []

@@ -618,6 +618,8 @@ def cmd_lease_claim(args):
 
 def cmd_lease_queued_claim(args):
     from .external_admission import queued_claim
+    if args.handoff_bump_id:
+        raise ValueError("queued admission cannot claim a handoff bump; use lease claim")
     result = queued_claim(get_queue(args), lease_id=args.lease_id,
         owner=args.owner, agent_id=args.agent_id, repo_root=args.repo_root, pid=args.pid,
         process_group=args.process_group, effective_route=args.effective_route, backend=args.backend,
