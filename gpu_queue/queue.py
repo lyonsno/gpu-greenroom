@@ -1453,6 +1453,9 @@ class GPUQueue:
                          'observed_at':time.time(),'worker':effective_claimant})
                     return False
                 effective_claimant = claimant or worker_identity()
+                # External admission belongs to its polling client, never a worker.
+                if request.job_type == "external-lease-admission":
+                    return False
                 claimant_capabilities = frozenset(
                     effective_claimant.get("capabilities", [])
                 )
