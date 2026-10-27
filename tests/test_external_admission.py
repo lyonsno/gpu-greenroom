@@ -109,3 +109,44 @@ def test_queued_cli_does_not_silently_ignore_handoff_flags(tmp_path):
     assert result.returncode != 0, 'queued admission must reject a handoff it cannot honor'
     assert queue.lease_status() is None
     assert queue.list_jobs() == []
+
+
+def test_live_v4_override_class_is_preserved_on_admission(tmp_path):
+    import hashlib
+    from uuid import uuid4
+    queue = GPUQueue(tmp_path / 'queue')
+    queue.configure_dispatch({'schema':'gpu-greenroom.dispatch-policy.v4', 'mode':'two-class',
+        'quick_routes':{}, 'quick_job_types':{}, 'producer_hints':{'max_seconds':30}}, owner='fixture')
+    pause = queue.pause(owner='fixture')
+    waiting = call(queue.queue_dir)
+    path = queue.queue_dir / 'pending' / waiting['jobId']
+    receipt = queue.override_dispatch(job_id=path.name, service_class='quick',
+        request_digest=hashlib.sha256((path/'request.json').read_bytes()).hexdigest(),
+        request_id=str(uuid4()), requested_by='operator-console')
+    queue.resume(owner='fixture', epoch=pause['epoch'])
+    assert call(queue.queue_dir)['status'] == 'held'
+    state = queue.get_job(path.name)
+    assert state.dispatch['service_class'] == 'quick'
+    assert state.dispatch['operator_override'] == receipt
+    assert json.loads((queue.queue_dir/'dispatch-state.json').read_text())['last_class'] == 'quick'
+
+
+def test_operator_non_bypass_hold_waits_instead_of_crashing_or_claiming(tmp_path):
+    import hashlib
+    from uuid import uuid4
+    queue = GPUQueue(tmp_path / 'queue')
+    batch = JobRequest(job_type='command', input_path='', command_argv=[sys.executable,'-c','pass'],
+        command_cwd=str(tmp_path), repo_root=str(tmp_path), agent_id='fixture', cooperative_checkpoint=True)
+    path = queue.submit(batch)
+    waiting = call(queue.queue_dir)
+    identity = dict(job_id=batch.job_id,
+        request_digest=hashlib.sha256((path/'request.json').read_bytes()).hexdigest(),
+        expected_status='pending', expected_started_at=None, requested_by='operator-console')
+    queue.operator_job_action(**identity, action='pause', allow_bypass=False, request_id=str(uuid4()))
+    held = call(queue.queue_dir)
+    assert held['status'] == 'waiting' and held['queueHeld'] is True and held['position'] is None
+    assert queue.lease_status() is None
+    queue.operator_job_action(**identity, action='resume', request_id=str(uuid4()))
+    assert call(queue.queue_dir)['position'] == 2
+    queue.cancel(batch.job_id)
+    assert call(queue.queue_dir)['status'] == 'held'

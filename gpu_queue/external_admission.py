@@ -34,13 +34,19 @@ def _finish(queue, request, lease):
     directory = queue.queue_dir / "pending" / request.job_id
     if not directory.exists():
         return
-    now = time.time()
+    now = lease.claimed_at
+    config = dispatch.policy(queue.queue_dir)
+    raw_request, request_digest = dispatch.read_request(directory / "request.json")
+    service_class, basis = dispatch.classify(raw_request, config, request_digest=request_digest, queue_dir=queue.queue_dir)
     state = JobState.from_json((directory / "status.json").read_text())
     state.status = JobStatus.DONE
     state.started_at = state.finished_at = now
     state.exit_code = 0
     state.effective_route = lease.effective_route
-    state.dispatch = {"mode": dispatch.policy(queue.queue_dir)["mode"], "service_class": "normal"}
+    state.dispatch = {"mode": config["mode"], "service_class": service_class,
+                      "policy_epoch": config.get("epoch"), "eligibility_basis": basis}
+    if request.job_id in config.get("job_overrides", {}):
+        state.dispatch["operator_override"] = config["job_overrides"][request.job_id]
     dispatch.atomic_write(directory / "status.json", json.loads(state.to_json()))
     dispatch.atomic_write(directory / "receipt.json", {
         "schema": "gpu-greenroom.external-admission.v1", "job_id": request.job_id,
@@ -48,12 +54,11 @@ def _finish(queue, request, lease):
         "lease_id": lease.lease_id, "effective_route": lease.effective_route,
         "queue_dir": str(queue.queue_dir), "admitted_at": now,
         "submitted_at": request.submitted_at, "queue_wait_seconds": now - request.submitted_at,
-        "holder_pid": lease.pid,
+        "holder_pid": lease.pid, "dispatch": state.dispatch,
     })
-    config = dispatch.policy(queue.queue_dir)
     if config["mode"] == "two-class":
         dispatch.atomic_write(queue.queue_dir / "dispatch-state.json", {
-            "schema": "gpu-greenroom.dispatch-state.v1", "last_class": "normal",
+            "schema": "gpu-greenroom.dispatch-state.v1", "last_class": service_class,
             "job_id": request.job_id, "policy_epoch": config.get("epoch"), "claimed_at": now,
         })
     queue._move_job(directory, "done")
@@ -98,6 +103,9 @@ def queued_claim(queue, *, lease_id, **identity):
                 return {"status": state.status.value, "jobId": job_id}
             order = dispatch.pending_order(queue.queue_dir)
             ids = [path.name for path in order]
+            if job_id not in ids:
+                return {"status": "waiting", "jobId": job_id, "position": None, "ahead": [],
+                        "queueHeld": True, "reason": "operator queue hold", "queueDir": str(queue.queue_dir)}
             running = sorted(path.name for path in (queue.queue_dir / "running").iterdir())
             blocked = current and current.lifecycle_state != LeaseStatus.RELEASED
             if lock_fd is None or queue.is_paused() or running or blocked or ids[0] != job_id:
