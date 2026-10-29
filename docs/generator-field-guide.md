@@ -23,6 +23,15 @@ Greenroom completion proves that the effective command finished. It does not
 prove that the source plate was suitable, the prompt isolated the intended
 variable, or the output supports a scientific or production claim.
 
+## Default resolution
+
+Generate at 512 × 512 unless the task names a reason to go larger: a print or
+display size, small legible text, a downstream route that needs more pixels, or
+a comparison that is explicitly about resolution. The text-to-image routes
+(`mflux_flux2_t2i`, `mflux_z_image_turbo_t2i`, `mflux_qwen_image_t2i`) default
+to 512, matching the edit routes. A 1024 × 1024 image has four times the image
+tokens of a 512 × 512 one and costs several times as much to generate.
+
 ## Source plates
 
 Use a source plate at the target aspect ratio and resolution whenever source
