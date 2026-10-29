@@ -204,6 +204,8 @@ def test_linked_smoke_keeps_only_its_authorized_native_actions(tmp_path, mode, s
     script = script[:script.index("document.querySelector('#pause').onclick")]
     fixture = """
 const nodes=new Map();
+const stored=new Map();
+Object.defineProperty(globalThis,'sessionStorage',{configurable:true,value:{getItem:key=>stored.get(key)??null,setItem:(key,value)=>stored.set(key,String(value)),removeItem:key=>stored.delete(key)}});
 function node(key){if(!nodes.has(key))nodes.set(key,{innerHTML:'',style:{},dataset:{},querySelectorAll:()=>[],before:()=>{}});return nodes.get(key)}
 global.document={body:{dataset:{readOnly:MODE==='readonly'?'true':'false'}},activeElement:null,querySelector:node,querySelectorAll:()=>[],createElement:()=>node('created'),getElementById:()=>null};
 global.location={href:'http://127.0.0.1:8766/',search:'',hash:'',origin:'http://127.0.0.1:8766',pathname:'/'};
@@ -221,6 +223,19 @@ console.log(JSON.stringify({automatic:node('#jobs').innerHTML,operator:node('#sm
         assert expected in markup['operator']
     else:
         assert "act('" not in markup['operator']
+
+
+def test_linked_smoke_fixture_does_not_depend_on_node_web_storage(tmp_path, monkeypatch):
+    run = subprocess.run
+
+    def without_browser_storage(argv, **kwargs):
+        if argv[:2] == ['node', '-e']:
+            argv = [*argv[:2], 'delete globalThis.sessionStorage;\n' + argv[2]]
+        return run(argv, **kwargs)
+
+    monkeypatch.setattr(subprocess, 'run', without_browser_storage)
+    test_linked_smoke_keeps_only_its_authorized_native_actions(
+        tmp_path, 'full', 'pending', 'Cancel', True)
 
 
 def test_terminal_notification_is_bound_and_not_duplicated_on_phase_changes(tmp_path, monkeypatch):
