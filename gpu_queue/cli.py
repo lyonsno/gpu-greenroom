@@ -616,6 +616,23 @@ def cmd_lease_claim(args):
     _print_model(lease)
 
 
+def cmd_lease_queued_claim(args):
+    from .external_admission import queued_claim
+    if args.handoff_bump_id:
+        raise ValueError("queued admission cannot claim a handoff bump; use lease claim")
+    result = queued_claim(get_queue(args), lease_id=args.lease_id,
+        owner=args.owner, agent_id=args.agent_id, repo_root=args.repo_root, pid=args.pid,
+        process_group=args.process_group, effective_route=args.effective_route, backend=args.backend,
+        device=args.device, profile=args.profile, supports_checkpoints=args.supports_checkpoints,
+        interruptible=args.interruptible, ttl_seconds=args.ttl_seconds)
+    print(json.dumps(result, indent=2))
+
+
+def cmd_lease_withdraw(args):
+    from .external_admission import withdraw
+    print(json.dumps(withdraw(get_queue(args), lease_id=args.lease_id), indent=2))
+
+
 def cmd_lease_renew(args):
     queue = get_queue(args)
     interruptible = args.interruptible
@@ -1017,6 +1034,13 @@ def main():
     p_lease_claim.add_argument("--ttl-seconds", type=float, default=300.0)
     p_lease_claim.add_argument("--handoff-bump-id")
     p_lease_claim.set_defaults(func=cmd_lease_claim)
+
+    p_lease_queued = lease_sub.add_parser("queued-claim", parents=[p_lease_claim], add_help=False,
+        help="Join the execution queue, then claim an external lease when first")
+    p_lease_queued.set_defaults(func=cmd_lease_queued_claim)
+    p_lease_withdraw = lease_sub.add_parser("withdraw-queued", help="Withdraw a queued lease before external work starts")
+    p_lease_withdraw.add_argument("--lease-id", required=True)
+    p_lease_withdraw.set_defaults(func=cmd_lease_withdraw)
 
     p_lease_renew = lease_sub.add_parser("renew", help="Renew the current external GPU lease")
     p_lease_renew.add_argument("lease_id")

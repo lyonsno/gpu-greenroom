@@ -716,3 +716,12 @@ A started subprocess is not evidence until its receipt proves the route.
 TRELLIS.2 on Apple Silicon is the standing example: the Mac route needs
 `ATTN_BACKEND=sdpa` and `SPARSE_ATTN_BACKEND=sdpa`; a job that launches with
 upstream `flash_attn` identity is a route failure, not a model failure.
+
+
+## Queued external lease admission
+
+Interactive clients can use `gpu-greenroom lease queued-claim` with the same identity flags as `lease claim` and an explicit `--lease-id`. Each call submits or reuses one `external-lease-admission` job in the ordinary execution queue. It returns JSON with `status: waiting`, the canonical `jobId`, its current one-based `position`, `ahead` job IDs, `heldBy`, and `paused`. Polling does not change submission time or queue order. Existing capability-aware workers leave this client-owned ticket at the head; the requesting client exchanges it for a lease under the execution and coordination locks when its turn arrives. The ordinary dispatch policy and pause apply. No worker upgrade is needed to leave the ticket pending; the submitting CLI needs these commands.
+
+A successful claim returns `status: held`, `leaseId`, and `ttlSeconds`. It writes an admission-only done receipt, with `inference_completed: false`; the external lease is the subsequent execution authority. Renew and release that lease through the existing protocol. Repeating an old request can observe its active lease or terminal state, but never enqueue fresh work under the same ID. Expiry or a dead holder still means unknown ownership rather than a free GPU.
+
+`gpu-greenroom lease withdraw-queued --lease-id <id>` removes the pending entry and records cancellation so a delayed claim cannot revive it. It can also release a just-granted reservation **only when the caller confirms its external work has not started**. Once execution starts, use normal lease release after confirming settlement. A disconnected client must withdraw its ticket; a pending ticket is not silently expired. If that client is lost, its pending job remains visible and can be cancelled through the normal queue controls. These operations never kill the external page or its server.
