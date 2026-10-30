@@ -13,14 +13,29 @@ from tests.test_job_controls import job, cancelled
 
 
 def test_pause_estimate_visible_and_honest_on_desktop_and_mobile(tmp_path):
+    chromium = os.environ.get('GREENROOM_TEST_CHROMIUM')
+    if not chromium:
+        pytest.skip('set independent Chromium executable')
+    evidence = Path(os.environ.get('GREENROOM_TEST_EVIDENCE', str(tmp_path/'evidence')))
+    evidence.mkdir(parents=True, exist_ok=True)
+    report = {'status':'failed','phase':'dependencies','executable':chromium,
+              'source':str(Path(__file__).resolve().parents[1]),'evidence_kind':'synthetic CPU display fixture'}
+    try:
+        _exercise_pause_estimate(tmp_path, chromium, evidence, report)
+    except Exception as error:
+        report['error'] = str(error)
+        raise
+    finally:
+        (evidence/'pause-estimate-browser.json').write_text(json.dumps(report,indent=2))
+
+
+def _exercise_pause_estimate(tmp_path, chromium, evidence, report):
     import hashlib
     import time
     from gpu_queue.models import JobState, JobStatus
     from gpu_queue.dispatch import atomic_write
-    chromium = os.environ.get('GREENROOM_TEST_CHROMIUM')
-    if not chromium:
-        pytest.skip('set independent Chromium executable')
     from playwright.sync_api import sync_playwright
+    report['phase'] = 'fixture'
     q = GPUQueue(tmp_path/'queue')
     path = job(q, cooperative_checkpoint=True)
     state = JobState.from_json((path/'status.json').read_text())
@@ -33,14 +48,14 @@ def test_pause_estimate_visible_and_honest_on_desktop_and_mobile(tmp_path):
         started_at=state.started_at, child_pid=123, child_start_identity=state.child_start_identity,
         reported_at=time.time(), seconds=90, checkpoint='End of current tile')
     atomic_write(path/'pause-estimate.json', record)
-    evidence = Path(os.environ.get('GREENROOM_TEST_EVIDENCE', str(tmp_path/'evidence')))
-    evidence.mkdir(parents=True, exist_ok=True)
+    report['queue'] = str(q.queue_dir)
+    report['phase'] = 'server-start'
     server = ThreadingHTTPServer(('127.0.0.1',0), make_handler(q,'fixture-secret',local_operator=True,job_control=True))
-    thread = threading.Thread(target=server.serve_forever,daemon=True)
-    thread.start()
-    report = {'status':'failed','phase':'launch','executable':chromium,'queue':str(q.queue_dir),
-              'source':str(Path(__file__).resolve().parents[1]),'evidence_kind':'synthetic CPU display fixture'}
+    thread = None
     try:
+        thread = threading.Thread(target=server.serve_forever,daemon=True)
+        thread.start()
+        report['phase'] = 'launch'
         with sync_playwright() as p:
             context = p.chromium.launch_persistent_context(str(tmp_path/'profile'),executable_path=chromium,
                 headless=True,args=['--use-mock-keychain','--password-store=basic','--disable-gpu'])
@@ -69,12 +84,28 @@ def test_pause_estimate_visible_and_honest_on_desktop_and_mobile(tmp_path):
                 report.update(status='passed',phase='complete',errors=errors)
             finally:
                 context.close()
-    except Exception as error:
-        report['error'] = str(error)
-        raise
     finally:
-        server.shutdown(); server.server_close(); thread.join()
-        (evidence/'pause-estimate-browser.json').write_text(json.dumps(report,indent=2))
+        if thread is not None and thread.is_alive():
+            server.shutdown()
+            thread.join()
+        server.server_close()
+
+
+def test_pause_estimate_startup_failure_keeps_report(tmp_path, monkeypatch):
+    import sys
+    import types
+    monkeypatch.setenv('GREENROOM_TEST_CHROMIUM', '/fixture/not-launched')
+    monkeypatch.setenv('GREENROOM_TEST_EVIDENCE', str(tmp_path/'evidence'))
+    monkeypatch.setitem(sys.modules, 'playwright.sync_api', types.SimpleNamespace(sync_playwright=None))
+    def denied(*args, **kwargs):
+        raise PermissionError('synthetic socket denial')
+    monkeypatch.setattr(sys.modules[__name__], 'ThreadingHTTPServer', denied)
+    with pytest.raises(PermissionError, match='synthetic socket denial'):
+        test_pause_estimate_visible_and_honest_on_desktop_and_mobile(tmp_path)
+    report = json.loads((tmp_path/'evidence/pause-estimate-browser.json').read_text())
+    assert report['status'] == 'failed'
+    assert report['phase'] == 'server-start'
+    assert report['error'] == 'synthetic socket denial'
 
 
 def test_process_ownership_warning_does_not_claim_lane_unresolved(tmp_path):
