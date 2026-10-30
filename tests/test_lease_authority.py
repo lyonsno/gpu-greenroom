@@ -285,3 +285,30 @@ def test_direct_claim_racing_ticket_publication_fails_ticket_without_overwriting
     assert not (queue.queue_dir / "pending/external-race").exists()
     claim = json.loads((queue.lease_receipts_dir / "race-claim.json").read_text())
     assert claim["owner"] == "direct-holder"
+
+
+@pytest.mark.parametrize("settle_before_retry", [False, True])
+def test_interrupted_queued_claim_recovers_exact_admission_without_claim_receipt(tmp_path, monkeypatch, settle_before_retry):
+    from gpu_queue.external_admission import queued_claim
+    queue = GPUQueue(tmp_path / "queue")
+    write = queue._write_receipt_locked
+    def fail_claim(directory, name, payload):
+        if name == "claim-crash-claim.json":
+            raise OSError("claim receipt unavailable")
+        write(directory, name, payload)
+    monkeypatch.setattr(queue, "_write_receipt_locked", fail_claim)
+    with pytest.raises(OSError):
+        queued_claim(queue, lease_id="claim-crash", **_lease_kwargs())
+    held = queue.lease_status()
+    assert held.lifecycle_state == LeaseStatus.ACTIVE
+    assert queue.get_job("external-claim-crash").status.value == "pending"
+    monkeypatch.setattr(queue, "_write_receipt_locked", write)
+    if settle_before_retry:
+        queue.release_lease(held.lease_id, released_by="holder", reason="settled despite lost response")
+    result = queued_claim(queue, lease_id="claim-crash", **_lease_kwargs())
+    assert result["status"] == ("released" if settle_before_retry else "held")
+    assert queue.get_job("external-claim-crash").status.value == "done"
+    assert queue.lease_status().claimed_at == held.claimed_at
+    receipt = json.loads((queue.lease_receipts_dir / "claim-crash-claim.json").read_text())
+    assert receipt["admission_job_id"] == "external-claim-crash"
+    assert receipt["process_start_identity"] == asdict(held)["process_start_identity"]

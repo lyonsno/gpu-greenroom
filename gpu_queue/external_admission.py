@@ -34,9 +34,16 @@ def _assert_admission_identity_locked(queue, lease_id, job_id):
     current = queue._read_lease_locked()
     receipt = queue.lease_receipts_dir / f"{lease_id}-claim.json"
     if receipt.exists() or (current is not None and current.lease_id == lease_id):
-        claim = json.loads(receipt.read_text()) if receipt.exists() else {}
+        claim = (json.loads(receipt.read_text()) if receipt.exists() else
+                 {"admission_job_id": current.admission_job_id} if current is not None else {})
         if claim.get("admission_job_id") != job_id:
             raise ValueError("lease ids must be unique; queued admission cannot reuse an earlier claim")
+
+
+def _record_claim(queue, lease):
+    queue._write_receipt_locked(queue.lease_receipts_dir, lease.lease_id + "-claim.json", {
+        **json.loads(lease.to_json()), "transition": "queued_claim",
+    })
 
 
 def _finish(queue, request, lease):
@@ -121,10 +128,14 @@ def queued_claim(queue, *, lease_id, **identity):
                 return {"status": "cancelled", "jobId": job_id}
             current = queue._refresh_lease_observation_locked()
             if current and current.lease_id == lease_id:
+                if not (queue.lease_receipts_dir / f"{lease_id}-claim.json").exists():
+                    _record_claim(queue, current)
+                # Admission happened even if the holder subsequently settled or
+                # lost authority before the client's response was recovered.
+                _finish(queue, request, current)
                 if current.lifecycle_state == LeaseStatus.ACTIVE:
                     # Recover a lost response or a crash between lease creation
                     # and the admission receipt. Never start a second lease.
-                    _finish(queue, request, current)
                     return {"status": "held", "jobId": job_id, "leaseId": lease_id, "ttlSeconds": current.ttl_seconds}
                 return {"status": current.lifecycle_state.value, "jobId": job_id, "leaseId": lease_id}
             if state.status != JobStatus.PENDING:
@@ -144,12 +155,9 @@ def queued_claim(queue, *, lease_id, **identity):
             queue._assert_new_lease_id_locked(lease_id)
             start_identity = queue._capture_lease_start_identity(identity.get("pid"), identity.get("process_group"))
             lease = ExternalLease(lease_id=lease_id, **identity, process_start_identity=start_identity,
-                                  claimed_at=now, renewed_at=now)
+                                  admission_job_id=job_id, claimed_at=now, renewed_at=now)
             queue._write_lease_locked(lease)
-            queue._write_receipt_locked(queue.lease_receipts_dir, lease_id + "-claim.json", {
-                "transition": "queued_claim", "lease_id": lease_id, "admission_job_id": job_id,
-                "process_start_identity": start_identity, **identity,
-            })
+            _record_claim(queue, lease)
             queue._emit_event_locked("lease_claim", lease_id, {"owner": lease.owner, "admission_job_id": job_id})
             _finish(queue, request, lease)
             return {"status": "held", "jobId": job_id, "leaseId": lease_id, "ttlSeconds": lease.ttl_seconds}
