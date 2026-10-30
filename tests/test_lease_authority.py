@@ -364,3 +364,22 @@ def test_failure_to_preserve_previous_identity_prevents_replacement(tmp_path, mo
         queue.claim_lease(**_lease_kwargs(lease_id="next"))
     assert queue.lease_status().lease_id == "previous"
     assert not (queue.lease_receipts_dir / "next-claim.json").exists()
+
+
+@pytest.mark.parametrize("retry_kind", ["direct", "queued"])
+def test_legacy_release_receipt_alone_still_reserves_its_used_id(tmp_path, retry_kind):
+    from gpu_queue.external_admission import queued_claim
+    queue = GPUQueue(tmp_path / "queue")
+    queue.claim_lease(**_lease_kwargs(lease_id="legacy"))
+    queue.release_lease("legacy", released_by="holder", reason="settled")
+    queue.claim_lease(**_lease_kwargs(lease_id="current"))
+    queue.release_lease("current", released_by="holder", reason="settled")
+    # Replay the legacy shape: a release receipt, but no claim/history record.
+    (queue.lease_receipts_dir / "legacy-claim.json").unlink()
+    queue._lease_history_path("legacy").unlink()
+    with pytest.raises(ValueError, match="unique|reuse"):
+        if retry_kind == "direct":
+            queue.claim_lease(**_lease_kwargs(lease_id="legacy"))
+        else:
+            queued_claim(queue, lease_id="legacy", **_lease_kwargs())
+    assert queue.lease_status().lease_id == "current"

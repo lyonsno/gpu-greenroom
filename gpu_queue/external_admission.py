@@ -37,7 +37,7 @@ def _assert_admission_identity_locked(queue, lease_id, job_id):
     receipt = queue.lease_receipts_dir / f"{lease_id}-claim.json"
     if historical is not None and historical.admission_job_id != job_id:
         raise ValueError("lease ids must be unique; cannot reuse a historical claim")
-    if receipt.exists() or bound is not None:
+    if queue._lease_id_has_receipt_locked(lease_id) or bound is not None:
         claim = (json.loads(receipt.read_text()) if receipt.exists() else
                  {"admission_job_id": bound.admission_job_id} if bound is not None else {})
         if claim.get("admission_job_id") != job_id:

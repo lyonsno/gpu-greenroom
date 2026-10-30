@@ -582,8 +582,12 @@ class GPUQueue:
         current = self._read_lease_locked()
         if ((current is not None and current.lease_id == lease_id)
                 or self._lease_history_path(lease_id).exists()
-                or (self.lease_receipts_dir / f"{lease_id}-claim.json").exists()):
+                or self._lease_id_has_receipt_locked(lease_id)):
             raise ValueError("lease ids must be unique; cannot reuse an earlier claim")
+
+    def _lease_id_has_receipt_locked(self, lease_id: str) -> bool:
+        return any((self.lease_receipts_dir / f"{lease_id}-{transition}.json").exists()
+                   for transition in ("claim", "release", "recovery", "handoff-claim"))
 
     def _external_execution_blocked(self) -> bool:
         with self._coordination_lock():
