@@ -12,6 +12,71 @@ from gpu_queue.queue import GPUQueue
 from tests.test_job_controls import job, cancelled
 
 
+def test_pause_estimate_visible_and_honest_on_desktop_and_mobile(tmp_path):
+    import hashlib
+    import time
+    from gpu_queue.models import JobState, JobStatus
+    from gpu_queue.dispatch import atomic_write
+    chromium = os.environ.get('GREENROOM_TEST_CHROMIUM')
+    if not chromium:
+        pytest.skip('set independent Chromium executable')
+    from playwright.sync_api import sync_playwright
+    q = GPUQueue(tmp_path/'queue')
+    path = job(q, cooperative_checkpoint=True)
+    state = JobState.from_json((path/'status.json').read_text())
+    state.status, state.started_at = JobStatus.RUNNING, time.time()-60
+    state.child_pid, state.child_start_identity = 123, 'synthetic-browser-attempt'
+    (path/'status.json').write_text(state.to_json())
+    path = path.rename(q.queue_dir/'running'/path.name)
+    record = dict(schema='gpu-greenroom.pause-estimate.v1', job_id=path.name,
+        request_sha256=hashlib.sha256((path/'request.json').read_bytes()).hexdigest(),
+        started_at=state.started_at, child_pid=123, child_start_identity=state.child_start_identity,
+        reported_at=time.time(), seconds=90, checkpoint='End of current tile')
+    atomic_write(path/'pause-estimate.json', record)
+    evidence = Path(os.environ.get('GREENROOM_TEST_EVIDENCE', str(tmp_path/'evidence')))
+    evidence.mkdir(parents=True, exist_ok=True)
+    server = ThreadingHTTPServer(('127.0.0.1',0), make_handler(q,'fixture-secret',local_operator=True,job_control=True))
+    thread = threading.Thread(target=server.serve_forever,daemon=True)
+    thread.start()
+    report = {'status':'failed','phase':'launch','executable':chromium,'queue':str(q.queue_dir),
+              'source':str(Path(__file__).resolve().parents[1]),'evidence_kind':'synthetic CPU display fixture'}
+    try:
+        with sync_playwright() as p:
+            context = p.chromium.launch_persistent_context(str(tmp_path/'profile'),executable_path=chromium,
+                headless=True,args=['--use-mock-keychain','--password-store=basic','--disable-gpu'])
+            try:
+                page = context.new_page()
+                errors = []
+                page.on('pageerror',lambda error: errors.append(str(error)))
+                report['phase'] = 'render'
+                page.goto(f'http://127.0.0.1:{server.server_address[1]}',wait_until='networkidle')
+                label = page.locator('.pause-estimate')
+                assert 'producer estimate' in label.inner_text()
+                assert 'End of current tile' in label.inner_text()
+                for width,height in [(1440,1000),(390,844)]:
+                    page.set_viewport_size({'width':width,'height':height})
+                    page.screenshot(path=str(evidence/f'pause-estimate-{width}.png'),full_page=True)
+                    assert page.evaluate('document.documentElement.scrollWidth<=innerWidth')
+                report['phase'] = 'degradation'
+                atomic_write(path/'pause-estimate.json',{**record,'reported_at':time.time()-10,'seconds':1})
+                page.evaluate('load()')
+                page.wait_for_function("()=>document.querySelector('.pause-estimate').textContent.includes('overdue')")
+                assert 'paused' not in label.inner_text().lower()
+                atomic_write(path/'pause-estimate.json',{**record,'child_start_identity':'old'})
+                page.evaluate('load()')
+                page.wait_for_function("()=>document.querySelector('.pause-estimate').textContent.includes('Unknown')")
+                assert not errors
+                report.update(status='passed',phase='complete',errors=errors)
+            finally:
+                context.close()
+    except Exception as error:
+        report['error'] = str(error)
+        raise
+    finally:
+        server.shutdown(); server.server_close(); thread.join()
+        (evidence/'pause-estimate-browser.json').write_text(json.dumps(report,indent=2))
+
+
 def test_process_ownership_warning_does_not_claim_lane_unresolved(tmp_path):
     chromium=os.environ.get('GREENROOM_TEST_CHROMIUM')
     if not chromium:

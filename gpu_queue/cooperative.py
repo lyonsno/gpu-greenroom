@@ -15,6 +15,29 @@ from .models import JobState
 from .cancellation import read_request as read_cancellation
 
 
+def report_pause_estimate(seconds, *, checkpoint=''):
+    """Report seconds until safe yield, including save/quiesce/exit overhead.
+
+    Call before a finite unit or update when its forecast changes. None withdraws
+    the forecast. This neither requests pause nor acknowledges GPU release.
+    Unmanaged invocations are a no-op, like the other cooperative hooks.
+    """
+    from .pause_estimates import SCHEMA, valid_seconds
+    if (seconds is not None and not valid_seconds(seconds)) or not isinstance(checkpoint, str):
+        raise ValueError('pause estimate needs finite nonnegative seconds or None and a checkpoint label')
+    context = _context()
+    if context is None:
+        return False
+    _, job, request, state = context
+    dispatch.atomic_write(job/'pause-estimate.json', {
+        'schema': SCHEMA, 'job_id': request.job_id,
+        'request_sha256': hashlib.sha256((job/'request.json').read_bytes()).hexdigest(),
+        'started_at': state['started_at'], 'child_pid': state['child_pid'],
+        'child_start_identity': state['child_start_identity'],
+        'reported_at': time.time(), 'seconds': seconds, 'checkpoint': checkpoint})
+    return True
+
+
 def run_units(units, *, perform, quiesce, continuation, on_submitted):
     """Resume a finite JSON-described case list at completed-unit boundaries.
 

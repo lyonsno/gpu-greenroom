@@ -36,3 +36,28 @@ before activation; older source-pinned submitters cannot read v5. The browser
 does not constitute evidence that an old running producer can honor a pause.
 Staged retry publication is replayable from the policy's job_restores map.
 Paused continuation checkpoints retain the existing explicit retention pins.
+
+## Time until safe pause
+
+Running checkpoint-capable jobs show an advisory countdown beside their details,
+both before and after a pause request. Producers can publish it from their managed
+process, including from a `run_units` perform callback:
+
+```python
+from gpu_queue.cooperative import report_pause_estimate
+
+report_pause_estimate(30, checkpoint="end of current case")
+# Do the case, then use the existing save/quiesce/continuation hook.
+```
+
+The estimate includes the remaining work until the next checkpoint plus saving,
+GPU quiescence and process-exit overhead. It is not whole-job runtime. Update it
+when the forecast changes or call `report_pause_estimate(None)` to withdraw it.
+Without a report the monitor says Unknown; elapsed estimates become overdue,
+never "paused" or "GPU free". Producer estimates are not deadlines, preemption,
+or scheduling authority. The existing worker still verifies exit and releases
+the mutex. Reports are bound to the managed request and execution incarnation;
+stale, malformed, future-dated and other-attempt records degrade to Unknown.
+The countdown refreshes with normal queue snapshots. Old producers continue to
+work but cannot report a number until they adopt this optional hook and library.
+No historical whole-job duration is silently substituted for checkpoint time.

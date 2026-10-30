@@ -113,6 +113,12 @@ function nativeActions(j){
   if(j.status==='running')return `<button class="danger text" title="Stop running job" onclick="act('terminate','${esc(j.job_id)}')"><span>■</span> Stop</button> <button class="danger icon" title="Force stop running job" onclick="act('kill','${esc(j.job_id)}')">!</button>`;
   return '';
 }
+function pauseEstimate(j){
+  if(j.status!=='running'||!j.pause_control?.supported)return '';
+  const e=j.pause_control.estimate;
+  const label=e?.status==='estimated'?`~${duration(Math.ceil(e.remaining_seconds))} (producer estimate)`:e?.status==='overdue'?'Estimate overdue; waiting for checkpoint':'Unknown';
+  return `<div class="meta pause-estimate" title="${esc(e?.reason||'Includes checkpoint save and quiescence; not a guarantee or GPU release')}">Time until safe pause: ${esc(label)}${e?.checkpoint?' · '+esc(e.checkpoint):''}</div>`;
+}
 function jobControls(j){
   if(!last?.job_control||!j.consistent||document.body.dataset.readOnly==='true')return '';
   if(j.job_control_error)return `<span class="meta failed">Job controls unavailable: ${esc(j.job_control_error)}</span>`;
@@ -173,7 +179,7 @@ function render(s){
   const jobMarkup=items=>items.map(j=>{
     const a=jobControls(j)+nativeActions(j);
     const route=j.requested_route||j.effective_route||j.job_type;
-    const conflict=performanceWindow(j)+runtimeHint(j)+(j.consistent?'':`<div class="meta">containment: ${esc(j.containment_status)} · declared: ${esc(j.declared_status)}</div>`);
+    const conflict=performanceWindow(j)+runtimeHint(j)+pauseEstimate(j)+(j.consistent?'':`<div class="meta">containment: ${esc(j.containment_status)} · declared: ${esc(j.declared_status)}</div>`);
     const manual=j.dispatch_override||j.dispatch?.operator_override;
     const choice=canMove(j)?`<label class="queue-choice">Queue <select class="dispatchClass" aria-label="Queue for ${esc(j.job_id)}" data-job-id="${esc(j.job_id)}"><option value="normal" ${j.dispatch_class==='normal'?'selected':''}>Automatic</option><option value="quick" ${j.dispatch_class==='quick'?'selected':''}>Quick</option></select></label>`:'';
     return `<article class="job-item" data-job-id="${esc(j.job_id)}" draggable="${canMove(j)}"><div class="job-heading"><strong>${esc(j.job_id)}</strong><span class="pill ${esc(j.status)}">${esc(j.status)}</span>${j.dispatch_class==='quick'?`<span class="pill quick" title="${esc(j.dispatch_basis)}">${manual?'Manual Quick':'Quick'}</span>`:manual?'<span class="meta">Manual Automatic</span>':''}${j.queue_position?`<span class="meta">Queue ${esc(j.queue_position)}</span>`:''}</div>${conflict}<div class="route">${esc(route)}</div><div class="meta">${esc(document.body.dataset.identityLabel||'Agent')}: ${esc(j.agent_id||'not recorded')} · ${esc(j.job_type)}</div><div class="meta">${esc(j.repo_root||j.output_dir||j.record_error||'')}</div>${j.dispatch_error?'<div class="meta failed">Dispatch classification: '+esc(j.dispatch_error)+'</div>':''}<div class="job-timing"><div>Submitted: ${j.submitted_at?esc(new Date(j.submitted_at*1000).toLocaleString()):'not recorded'}</div><div>Queue wait: ${duration(j.queue_wait_seconds)}</div><div>Execution wall time: ${duration(j.execution_wall_seconds)}</div><div>GPU hold time: not recorded</div></div>${choice}<div class="job-actions actions">${a}</div></article>`;

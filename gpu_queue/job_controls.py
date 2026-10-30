@@ -78,13 +78,15 @@ def eligible_retry(path, request, state):
 
 
 def projection(root, path, request, state, config):
+    from .pause_estimates import project
     hold = config.get('job_holds', {}).get(path.name)
     predecessor_running = bool(hold and hold.get('parent_job_id')
                                and (root/'running'/hold['parent_job_id']).exists())
     result = {'supported': request.cooperative_checkpoint is True,
               'phase': 'pause-requested' if hold and (state.status == JobStatus.RUNNING or predecessor_running) else
                        'paused' if hold and state.status == JobStatus.PENDING else None,
-              'allow_bypass': hold['allow_bypass'] if hold else True}
+              'allow_bypass': hold['allow_bypass'] if hold else True,
+              'estimate': project(path, request, state)}
     try:
         retry = eligible_retry(path, request, state)
         error = None
