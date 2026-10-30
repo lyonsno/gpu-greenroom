@@ -213,3 +213,75 @@ def test_expired_queued_withdrawal_does_not_clear_uncertain_ownership(tmp_path):
     with pytest.raises(RuntimeError, match="recovery"):
         withdraw(queue, lease_id=held["leaseId"])
     assert queue._external_execution_blocked()
+
+
+def test_queued_admission_cannot_recycle_a_direct_lease_after_an_intervening_holder(tmp_path):
+    from gpu_queue.external_admission import queued_claim
+    queue = GPUQueue(tmp_path / "queue")
+    original = queue.claim_lease(**_lease_kwargs(lease_id="once"))
+    queue.release_lease("once", released_by="original", reason="settled")
+    claim_receipt = (queue.lease_receipts_dir / "once-claim.json").read_bytes()
+    queue.claim_lease(**_lease_kwargs(lease_id="intervening"))
+    queue.release_lease("intervening", released_by="other", reason="settled")
+    with pytest.raises(ValueError, match="unique|reuse"):
+        queued_claim(queue, lease_id="once", **_lease_kwargs(owner="replacement"))
+    assert (queue.lease_receipts_dir / "once-claim.json").read_bytes() == claim_receipt
+    assert queue.lease_status().lease_id == "intervening"
+    assert not (queue.queue_dir / "pending/external-once").exists()
+    with pytest.raises(KeyError):
+        queue.release_lease(original.lease_id, released_by="original", reason="stale retry")
+
+
+def test_two_pending_checkpoints_keep_first_grant_through_release_retry_and_recovery(tmp_path, monkeypatch):
+    queue = GPUQueue(tmp_path / "queue")
+    proc = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
+                            stdin=subprocess.PIPE, start_new_session=True)
+    try:
+        lease = queue.claim_lease(**_lease_kwargs(pid=proc.pid, process_group=proc.pid))
+        first = queue.request_bump(bump_id="a", **_bump_kwargs())
+        second = queue.request_bump(bump_id="b", **_bump_kwargs())
+        for bump in (first, second):
+            queue.grant_bump(bump.bump_id, granted_by="holder", checkpoint="next", quiescence_confirmed=False)
+        write = queue._write_receipt_locked
+        def fail_release(directory, name, payload):
+            if name.endswith("-release.json"):
+                raise OSError("release receipt unavailable")
+            write(directory, name, payload)
+        monkeypatch.setattr(queue, "_write_receipt_locked", fail_release)
+        with pytest.raises(OSError):
+            queue.release_lease(lease.lease_id, released_by="holder", reason="checkpoint")
+        assert queue.get_bump(first.bump_id).status.value == "granted"
+        monkeypatch.setattr(queue, "_write_receipt_locked", write)
+        held = queue.release_lease(lease.lease_id, released_by="holder", reason="retry")
+        assert held.handoff_bump_id == first.bump_id
+        assert queue.get_bump(second.bump_id).status.value == "grant_pending_checkpoint"
+        expire(queue, held)
+        proc.communicate()
+        recovered = queue.recover_lease(lease.lease_id,
+            expected_start_identity=asdict(lease)["process_start_identity"],
+            recovered_by="operator", reason="recorded tree exited")
+        assert recovered.handoff_bump_id == first.bump_id
+        assert recovered.lifecycle_state == LeaseStatus.HANDOFF
+        assert queue._external_execution_blocked()
+    finally:
+        if proc.poll() is None:
+            proc.communicate()
+
+
+def test_direct_claim_racing_ticket_publication_fails_ticket_without_overwriting_holder(tmp_path, monkeypatch):
+    from gpu_queue.external_admission import queued_claim
+    queue = GPUQueue(tmp_path / "queue")
+    submit = queue.submit
+    def direct_claim_after_submission(request):
+        path = submit(request)
+        queue.claim_lease(**_lease_kwargs(lease_id="race", owner="direct-holder"))
+        queue.release_lease("race", released_by="direct-holder", reason="settled")
+        return path
+    monkeypatch.setattr(queue, "submit", direct_claim_after_submission)
+    with pytest.raises(ValueError, match="unique|reuse"):
+        queued_claim(queue, lease_id="race", **_lease_kwargs(owner="queued-holder"))
+    assert queue.lease_status().owner == "direct-holder"
+    assert queue.get_job("external-race").failure_phase == "external_admission_identity"
+    assert not (queue.queue_dir / "pending/external-race").exists()
+    claim = json.loads((queue.lease_receipts_dir / "race-claim.json").read_text())
+    assert claim["owner"] == "direct-holder"

@@ -558,6 +558,12 @@ class GPUQueue:
         if type(ttl_seconds) not in (int, float) or not math.isfinite(ttl_seconds) or ttl_seconds <= 0:
             raise ValueError("lease TTL must be positive and finite")
 
+    def _assert_new_lease_id_locked(self, lease_id: str) -> None:
+        current = self._read_lease_locked()
+        if ((current is not None and current.lease_id == lease_id)
+                or (self.lease_receipts_dir / f"{lease_id}-claim.json").exists()):
+            raise ValueError("lease ids must be unique; cannot reuse an earlier claim")
+
     def _external_execution_blocked(self) -> bool:
         with self._coordination_lock():
             return self._external_execution_blocked_locked()
@@ -768,11 +774,8 @@ class GPUQueue:
 
                 start_identity = self._capture_lease_start_identity(pid, process_group)
                 self._validate_lease_ttl(ttl_seconds)
-                if lease_id is not None and (
-                    (current is not None and current.lease_id == lease_id)
-                    or (self.lease_receipts_dir / f"{lease_id}-claim.json").exists()
-                ):
-                    raise ValueError("lease ids must be unique; cannot reuse an earlier claim")
+                if lease_id is not None:
+                    self._assert_new_lease_id_locked(lease_id)
                 now = time.time()
                 lease = ExternalLease(
                     lease_id=lease_id or uuid.uuid4().hex[:12],
@@ -892,7 +895,8 @@ class GPUQueue:
             waiting_bump = None
             sticky_handoff_bump = self._granted_lease_handoff_locked(lease)
             for bump in self.list_bumps_locked():
-                if bump.holder_lease_id == lease_id and bump.status == BumpStatus.GRANT_PENDING_CHECKPOINT:
+                if (sticky_handoff_bump is None and bump.holder_lease_id == lease_id
+                        and bump.status == BumpStatus.GRANT_PENDING_CHECKPOINT):
                     waiting_bump = bump
                     break
 

@@ -30,6 +30,15 @@ def _cancellation(queue, lease_id):
     return queue.queue_dir / "external-admission-cancellations" / (lease_id + ".json")
 
 
+def _assert_admission_identity_locked(queue, lease_id, job_id):
+    current = queue._read_lease_locked()
+    receipt = queue.lease_receipts_dir / f"{lease_id}-claim.json"
+    if receipt.exists() or (current is not None and current.lease_id == lease_id):
+        claim = json.loads(receipt.read_text()) if receipt.exists() else {}
+        if claim.get("admission_job_id") != job_id:
+            raise ValueError("lease ids must be unique; queued admission cannot reuse an earlier claim")
+
+
 def _finish(queue, request, lease):
     directory = queue.queue_dir / "pending" / request.job_id
     if not directory.exists():
@@ -73,6 +82,8 @@ def queued_claim(queue, *, lease_id, **identity):
     ttl = identity.get("ttl_seconds", 300.0)
     if type(ttl) not in (int, float) or not math.isfinite(ttl) or ttl <= 0:
         raise ValueError("lease TTL must be positive and finite")
+    with queue._coordination_lock():
+        _assert_admission_identity_locked(queue, lease_id, job_id)
     request = JobRequest(job_type=JOB_TYPE, input_path="", job_id=job_id,
         agent_id=identity["agent_id"], repo_root=identity["repo_root"], route_identity=identity["effective_route"],
         params={"external_lease": {"lease_id": lease_id, **identity}}, service_class="normal",
@@ -83,6 +94,23 @@ def queued_claim(queue, *, lease_id, **identity):
     try:
         with queue._coordination_lock():
             state = queue.get_job(job_id)
+            try:
+                _assert_admission_identity_locked(queue, lease_id, job_id)
+            except ValueError as error:
+                directory = queue.queue_dir / "pending" / job_id
+                if directory.exists():
+                    state.status = JobStatus.FAILED
+                    state.finished_at = time.time()
+                    state.failure_phase = "external_admission_identity"
+                    state.error_message = str(error)
+                    dispatch.atomic_write(directory / "status.json", json.loads(state.to_json()))
+                    dispatch.atomic_write(directory / "receipt.json", {
+                        "status": "failed", "scope": "external-lease-admission-only",
+                        "failure_phase": state.failure_phase, "error": str(error),
+                        "lease_id": lease_id, "job_id": job_id, "inference_completed": False,
+                    })
+                    queue._move_job(directory, "failed")
+                raise
             if _cancellation(queue, lease_id).exists() or state.status == JobStatus.CANCELLED:
                 directory = queue.queue_dir / "pending" / job_id
                 if directory.exists():
@@ -113,6 +141,7 @@ def queued_claim(queue, *, lease_id, **identity):
                     "ahead": ids[:ids.index(job_id)], "heldBy": ([current.owner] if blocked else running),
                     "paused": queue.is_paused(), "queueDir": str(queue.queue_dir)}
             now = time.time()
+            queue._assert_new_lease_id_locked(lease_id)
             start_identity = queue._capture_lease_start_identity(identity.get("pid"), identity.get("process_group"))
             lease = ExternalLease(lease_id=lease_id, **identity, process_start_identity=start_identity,
                                   claimed_at=now, renewed_at=now)
