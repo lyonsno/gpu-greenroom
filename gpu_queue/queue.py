@@ -8,6 +8,7 @@ import ctypes
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import select
@@ -223,6 +224,17 @@ class GPUQueue:
 
     def _write_lease_locked(self, lease: ExternalLease) -> None:
         self._write_text_atomic(self.current_lease_path, lease.to_json())
+        self._sync_file_and_parent(self.current_lease_path)
+
+    @staticmethod
+    def _sync_file_and_parent(path: Path) -> None:
+        with path.open("rb") as stream:
+            os.fsync(stream.fileno())
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
 
     def _read_lease_locked(self) -> ExternalLease | None:
         if not self.current_lease_path.exists():
@@ -257,6 +269,8 @@ class GPUQueue:
             "receipt_written_at": time.time(),
         }
         self._write_json_atomic(directory / name, payload)
+        if directory in (self.lease_receipts_dir, self.bump_receipts_dir):
+            self._sync_file_and_parent(directory / name)
 
     def _pid_alive(self, pid: int | None) -> bool | None:
         if pid is None:
@@ -511,9 +525,38 @@ class GPUQueue:
             return lease
         if lease.ttl_seconds is not None and time.time() - lease.renewed_at > lease.ttl_seconds:
             return self._mark_lease_unknown_locked(lease, "ttl_expired")
-        if lease.lifecycle_state == LeaseStatus.ACTIVE and self._pid_alive(lease.pid) is False:
-            return self._mark_lease_unknown_locked(lease, "holder_pid_dead_without_release")
+        if not lease.process_start_identity or not lease.pid or lease.pid < 1:
+            return self._mark_lease_unknown_locked(lease, "holder_identity_unbound")
+        if lease.lifecycle_state == LeaseStatus.ACTIVE:
+            if self._pid_alive(lease.pid) is False:
+                return self._mark_lease_unknown_locked(lease, "holder_pid_dead_without_release")
+            try:
+                observed = self._capture_lease_start_identity(lease.pid, lease.process_group)
+            except ValueError:
+                observed = None
+            if observed != lease.process_start_identity:
+                return self._mark_lease_unknown_locked(lease, "holder_identity_changed_or_unverifiable")
         return lease
+
+    def _capture_lease_start_identity(self, pid: int | None, process_group: int | None) -> str:
+        if type(pid) is not int or pid < 1:
+            raise ValueError("lease identity requires a positive holder PID")
+        if process_group is not None and (type(process_group) is not int or process_group < 1):
+            raise ValueError("lease identity requires a positive process group")
+        before = self._process_start_identity(pid)
+        try:
+            observed_group = os.getpgid(pid)
+        except OSError as exc:
+            raise ValueError("lease process identity is not observable") from exc
+        if (not before or self._process_start_identity(pid) != before
+                or (process_group is not None and process_group != observed_group)):
+            raise ValueError("lease process identity changed or group does not match")
+        return before
+
+    @staticmethod
+    def _validate_lease_ttl(ttl_seconds: float) -> None:
+        if type(ttl_seconds) not in (int, float) or not math.isfinite(ttl_seconds) or ttl_seconds <= 0:
+            raise ValueError("lease TTL must be positive and finite")
 
     def _external_execution_blocked(self) -> bool:
         with self._coordination_lock():
@@ -723,6 +766,13 @@ class GPUQueue:
                             raise RuntimeError("external lease already blocks Greenroom execution")
                         return None
 
+                start_identity = self._capture_lease_start_identity(pid, process_group)
+                self._validate_lease_ttl(ttl_seconds)
+                if lease_id is not None and (
+                    (current is not None and current.lease_id == lease_id)
+                    or (self.lease_receipts_dir / f"{lease_id}-claim.json").exists()
+                ):
+                    raise ValueError("lease ids must be unique; cannot reuse an earlier claim")
                 now = time.time()
                 lease = ExternalLease(
                     lease_id=lease_id or uuid.uuid4().hex[:12],
@@ -731,6 +781,7 @@ class GPUQueue:
                     repo_root=repo_root,
                     pid=pid,
                     process_group=process_group,
+                    process_start_identity=start_identity,
                     effective_route=effective_route,
                     backend=backend,
                     device=device,
@@ -754,6 +805,7 @@ class GPUQueue:
                         "repo_root": repo_root,
                         "pid": pid,
                         "process_group": process_group,
+                        "process_start_identity": start_identity,
                         "effective_route": effective_route,
                         "backend": backend,
                         "device": device,
@@ -796,13 +848,21 @@ class GPUQueue:
                 raise KeyError(f"lease {lease_id} not found")
             if lease.lifecycle_state == LeaseStatus.RELEASED:
                 raise RuntimeError(f"lease {lease_id} is released")
+            if lease.lifecycle_state == LeaseStatus.OWNERSHIP_UNKNOWN:
+                raise RuntimeError(f"lease {lease_id} requires explicit recovery")
+            if lifecycle_state is not None:
+                requested = LeaseStatus(lifecycle_state)
+                if requested == LeaseStatus.OWNERSHIP_UNKNOWN:
+                    return self._mark_lease_unknown_locked(lease, "holder_reported_unknown")
+                if requested != lease.lifecycle_state:
+                    raise ValueError("renew cannot change lease lifecycle; use release or bump grant")
+            if ttl_seconds is not None:
+                self._validate_lease_ttl(ttl_seconds)
             lease.renewed_at = time.time()
             if interruptible is not None:
                 lease.interruptible = interruptible
             if ttl_seconds is not None:
                 lease.ttl_seconds = ttl_seconds
-            if lifecycle_state is not None:
-                lease.lifecycle_state = LeaseStatus(lifecycle_state)
             self._write_lease_locked(lease)
             self._write_receipt_locked(
                 self.lease_receipts_dir,
@@ -824,13 +884,13 @@ class GPUQueue:
             lease = self._refresh_lease_observation_locked()
             if lease is None or lease.lease_id != lease_id:
                 raise KeyError(f"lease {lease_id} not found")
+            if lease.lifecycle_state == LeaseStatus.OWNERSHIP_UNKNOWN:
+                raise RuntimeError(f"lease {lease_id} requires explicit recovery")
+            if lease.released_at is not None:
+                return lease
 
             waiting_bump = None
-            sticky_handoff_bump = None
-            if lease.lifecycle_state == LeaseStatus.HANDOFF and lease.handoff_bump_id:
-                bump = self._read_bump_locked(lease.handoff_bump_id)
-                if bump is not None and bump.status == BumpStatus.GRANTED:
-                    sticky_handoff_bump = bump
+            sticky_handoff_bump = self._granted_lease_handoff_locked(lease)
             for bump in self.list_bumps_locked():
                 if bump.holder_lease_id == lease_id and bump.status == BumpStatus.GRANT_PENDING_CHECKPOINT:
                     waiting_bump = bump
@@ -865,7 +925,6 @@ class GPUQueue:
                 lease.handoff_bump_id = sticky_handoff_bump.bump_id
             else:
                 lease.lifecycle_state = LeaseStatus.RELEASED
-            self._write_lease_locked(lease)
             self._write_receipt_locked(
                 self.lease_receipts_dir,
                 f"{lease.lease_id}-release.json",
@@ -876,10 +935,78 @@ class GPUQueue:
                     "reason": reason,
                     "lifecycle_state": lease.lifecycle_state.value,
                     "handoff_bump_id": lease.handoff_bump_id,
+                    "process_start_identity": lease.process_start_identity,
+                    "quiescence_authority": "healthy_holder_confirms_settlement",
                 },
             )
+            self._write_lease_locked(lease)
             self._emit_event_locked("lease_release", lease.lease_id, {"lifecycle_state": lease.lifecycle_state.value})
             return lease
+
+    def _granted_lease_handoff_locked(self, lease: ExternalLease) -> BumpRequest | None:
+        # The bump may have committed just before a failed lease-state write.
+        granted = [bump for bump in self.list_bumps_locked()
+                   if bump.holder_lease_id == lease.lease_id and bump.status == BumpStatus.GRANTED]
+        if len(granted) > 1:
+            raise RuntimeError("conflicting granted handoffs require recovery")
+        return granted[0] if granted else None
+
+    def recover_lease(
+        self, lease_id: str, *, expected_start_identity: str,
+        recovered_by: str, reason: str,
+    ) -> ExternalLease:
+        """Recover lost authority only after the recorded process tree has exited.
+
+        Missing legacy bindings and still-live holders remain blocked. This is
+        not a force-release command or a signal to any external process.
+        """
+        lock_fd = self._try_execution_lock()
+        if lock_fd is None:
+            raise RuntimeError("gpu.lock is held; cannot recover external lease")
+        try:
+            with self._coordination_lock():
+                lease = self._refresh_lease_observation_locked()
+                if lease is None or lease.lease_id != lease_id:
+                    raise KeyError(f"lease {lease_id} not found")
+                if not expected_start_identity or lease.process_start_identity != expected_start_identity:
+                    raise RuntimeError("lease recovery identity does not match the recorded holder")
+                receipt_path = self.lease_receipts_dir / f"{lease_id}-recovery.json"
+                if lease.lifecycle_state in (LeaseStatus.RELEASED, LeaseStatus.HANDOFF) and receipt_path.exists():
+                    return lease
+                if lease.lifecycle_state != LeaseStatus.OWNERSHIP_UNKNOWN:
+                    raise RuntimeError("only ownership_unknown leases need recovery")
+                if (not lease.pid or lease.pid < 1 or not lease.process_group or lease.process_group < 1
+                        or self._pid_alive(lease.pid) is not False
+                        or self._process_group_alive(lease.process_group) is not False):
+                    raise RuntimeError("recorded process tree is live or quiescence cannot be verified")
+                if not recovered_by.strip() or not reason.strip():
+                    raise ValueError("lease recovery needs attribution and a reason")
+                previous_state = lease.lifecycle_state.value
+                handoff = self._granted_lease_handoff_locked(lease)
+                lease.lifecycle_state = LeaseStatus.HANDOFF if handoff else LeaseStatus.RELEASED
+                if handoff:
+                    lease.handoff_bump_id = handoff.bump_id
+                    lease.renewed_at = time.time()
+                lease.released_at = time.time()
+                lease.released_by = recovered_by
+                lease.release_reason = reason
+                self._write_receipt_locked(self.lease_receipts_dir, receipt_path.name, {
+                    "transition": "recovery", "lease_id": lease_id,
+                    "previous_state": previous_state, "unknown_reason": lease.unknown_reason,
+                    "lifecycle_state": lease.lifecycle_state.value,
+                    "handoff_bump_id": lease.handoff_bump_id,
+                    "recovered_by": recovered_by, "reason": reason,
+                    "pid": lease.pid, "process_group": lease.process_group,
+                    "process_start_identity": lease.process_start_identity,
+                    "effective_route": lease.effective_route,
+                    "quiescence_authority": "recorded_process_tree_exited",
+                })
+                self._write_lease_locked(lease)
+                self._emit_event_locked("lease_recovery", lease_id, {"recovered_by": recovered_by})
+                return lease
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
 
     def request_bump(
         self,

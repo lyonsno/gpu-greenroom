@@ -113,10 +113,13 @@ def queued_claim(queue, *, lease_id, **identity):
                     "ahead": ids[:ids.index(job_id)], "heldBy": ([current.owner] if blocked else running),
                     "paused": queue.is_paused(), "queueDir": str(queue.queue_dir)}
             now = time.time()
-            lease = ExternalLease(lease_id=lease_id, **identity, claimed_at=now, renewed_at=now)
+            start_identity = queue._capture_lease_start_identity(identity.get("pid"), identity.get("process_group"))
+            lease = ExternalLease(lease_id=lease_id, **identity, process_start_identity=start_identity,
+                                  claimed_at=now, renewed_at=now)
             queue._write_lease_locked(lease)
             queue._write_receipt_locked(queue.lease_receipts_dir, lease_id + "-claim.json", {
-                "transition": "queued_claim", "lease_id": lease_id, "admission_job_id": job_id, **identity,
+                "transition": "queued_claim", "lease_id": lease_id, "admission_job_id": job_id,
+                "process_start_identity": start_identity, **identity,
             })
             queue._emit_event_locked("lease_claim", lease_id, {"owner": lease.owner, "admission_job_id": job_id})
             _finish(queue, request, lease)

@@ -84,8 +84,10 @@ def test_existing_holder_and_unknown_ownership_block_admission(tmp_path):
     queue.renew_lease(lease.lease_id, lifecycle_state="ownership_unknown")
     assert call(queue.queue_dir, identity="page-two")["status"] == "waiting"
     assert call(queue.queue_dir)["status"] == "ownership_unknown"
-    queue.release_lease(first["leaseId"], released_by="fixture", reason="fixture quiescent")
-    assert call(queue.queue_dir, identity="page-two")["status"] == "held"
+    import pytest
+    with pytest.raises(RuntimeError, match="recovery"):
+        queue.release_lease(first["leaseId"], released_by="fixture", reason="fixture quiescent")
+    assert call(queue.queue_dir, identity="page-two")["status"] == "waiting"
 
 
 def test_identity_reuse_does_not_change_route(tmp_path):

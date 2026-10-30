@@ -123,6 +123,7 @@ class ExternalLease:
     lifecycle_state: LeaseStatus = LeaseStatus.ACTIVE
     pid: int | None = None
     process_group: int | None = None
+    process_start_identity: str | None = None
     claimed_at: float = field(default_factory=time.time)
     renewed_at: float = field(default_factory=time.time)
     ttl_seconds: float = 300.0

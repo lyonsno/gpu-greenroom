@@ -662,6 +662,14 @@ def cmd_lease_release(args):
     _print_model(lease)
 
 
+def cmd_lease_recover(args):
+    lease = get_queue(args).recover_lease(
+        args.lease_id, expected_start_identity=args.expected_start_identity,
+        recovered_by=args.recovered_by, reason=args.reason,
+    )
+    _print_model(lease)
+
+
 def cmd_bump_request(args):
     queue = get_queue(args)
     bump = queue.request_bump(
@@ -1023,7 +1031,7 @@ def main():
     p_lease_claim.add_argument("--owner", required=True)
     p_lease_claim.add_argument("--agent-id", required=True)
     p_lease_claim.add_argument("--repo-root", required=True)
-    p_lease_claim.add_argument("--pid", type=int)
+    p_lease_claim.add_argument("--pid", type=int, required=True)
     p_lease_claim.add_argument("--process-group", type=int)
     p_lease_claim.add_argument("--effective-route", required=True)
     p_lease_claim.add_argument("--backend", required=True)
@@ -1058,6 +1066,13 @@ def main():
     p_lease_release.add_argument("--released-by", required=True)
     p_lease_release.add_argument("--reason", required=True)
     p_lease_release.set_defaults(func=cmd_lease_release)
+
+    p_lease_recover = lease_sub.add_parser("recover", help="Recover an unknown lease after its recorded process tree exits")
+    p_lease_recover.add_argument("lease_id")
+    p_lease_recover.add_argument("--expected-start-identity", required=True)
+    p_lease_recover.add_argument("--recovered-by", required=True)
+    p_lease_recover.add_argument("--reason", required=True)
+    p_lease_recover.set_defaults(func=cmd_lease_recover)
 
     # bump
     p_bump = sub.add_parser("bump", help="Manage inbound cooperative GPU bump requests")

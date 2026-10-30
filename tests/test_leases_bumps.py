@@ -160,7 +160,12 @@ def test_dead_pid_becomes_ownership_unknown_but_live_pid_stays_active(tmp_path):
     assert queue.lease_status().lifecycle_state == LeaseStatus.ACTIVE
     queue.release_lease(live.lease_id, released_by="holder", reason="test reset")
 
-    dead = queue.claim_lease(**_lease_kwargs(pid=99999999, ttl_seconds=120))
+    proc = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
+                            stdin=subprocess.PIPE, start_new_session=True)
+    try:
+        dead = queue.claim_lease(**_lease_kwargs(pid=proc.pid, process_group=proc.pid, ttl_seconds=120))
+    finally:
+        proc.communicate()
     observed = queue.lease_status()
 
     assert observed.lease_id == dead.lease_id
@@ -295,7 +300,7 @@ def test_requester_claims_handoff_only_for_matching_granted_bump(tmp_path):
             owner="resident-loader",
             agent_id="resident-loader",
             repo_root="/repo/kaminos",
-            pid=None,
+            pid=os.getpid(),
             effective_route="sam31 cold-load --mps",
             profile="cold-model-load",
             interruptible=True,

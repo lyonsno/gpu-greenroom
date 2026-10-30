@@ -183,6 +183,9 @@ gpu-greenroom lease claim \
 gpu-greenroom lease renew <lease-id> [--interruptible|--not-interruptible] [--ttl-seconds N]
 gpu-greenroom lease status
 gpu-greenroom lease release <lease-id> --released-by render-holder --reason "capture checkpoint complete"
+gpu-greenroom lease recover <lease-id> \
+  --expected-start-identity '<process_start_identity from lease status>' \
+  --recovered-by operator --reason "recorded process tree exited"
 
 # Bump requests (asking a lease holder for a handoff window)
 gpu-greenroom bump request \
@@ -372,7 +375,25 @@ Lease `lifecycle_state`:
 | `active` | An external process owns the GPU. Worker dispatch is blocked. |
 | `handoff` | A bump was granted; the requester may claim a new lease bound to that bump. Worker dispatch stays blocked. |
 | `released` | The holder released. Worker dispatch resumes. |
-| `ownership_unknown` | TTL expired or the holder PID died without a release receipt. Worker dispatch stays blocked until someone recovers authority explicitly. |
+| `ownership_unknown` | TTL expired, the PID died, or its recorded start/group identity is missing or changed. Ordinary release and renewal cannot clear it. Worker dispatch stays blocked until explicit recovery. |
+
+New direct and queued claims require a live `--pid`; Greenroom records its
+observed process-start identity, and checks `--process-group` against the host
+when supplied. Lease IDs must not be recycled. A healthy holder may release
+after positively settling its GPU work while its application remains alive.
+This is cooperative settlement, not a GPU-memory measurement. Renewal preserves
+lifecycle state; it cannot manufacture `released` or `handoff`. A holder may
+report `ownership_unknown`, but cannot renew it back to active.
+
+`lease recover` takes the existing execution flock and the exact recorded start
+identity. It succeeds only when both the recorded PID and recorded process
+group are gone, writes a separate recovery receipt before permitting dispatch,
+and preserves an already-granted handoff. It never signals or kills a process.
+Legacy leases without a start identity, leases without a recorded process group,
+and still-live unknown holders stay blocked: they require an explicit
+operator-led reconciliation, not ordinary release or an invented replacement
+identity. Previously released records remain historical releases; this update
+does not infer that their old workloads are currently running.
 
 Bump `status`:
 
