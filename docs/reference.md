@@ -223,6 +223,7 @@ or `~/.local/state/gpu-greenroom`.
   outputs/              # durable output dirs for jobs submitted without an explicit output_dir
   leases/
     current.json        # the current external lease (active, handoff, released, or ownership_unknown)
+    history/            # prior lease identities, keyed by SHA-256 of lease ID
     receipts/           # claim, renew, release, handoff, and ownership-unknown receipts
   bumps/
     <bump-id>.json      # inbound bump request state

@@ -223,8 +223,28 @@ class GPUQueue:
         self._write_text_atomic(path, json.dumps(payload, indent=2))
 
     def _write_lease_locked(self, lease: ExternalLease) -> None:
+        previous = self._read_lease_locked()
+        if previous is not None and previous.lease_id != lease.lease_id:
+            history_path = self._lease_history_path(previous.lease_id)
+            self._write_text_atomic(history_path, previous.to_json())
+            self._sync_file_and_parent(history_path)
+            # Persist the new history-directory entry before replacing current.
+            self._sync_file_and_parent(self.current_lease_path)
         self._write_text_atomic(self.current_lease_path, lease.to_json())
         self._sync_file_and_parent(self.current_lease_path)
+
+    def _lease_history_path(self, lease_id: str) -> Path:
+        digest = hashlib.sha256(lease_id.encode()).hexdigest()
+        return self.queue_dir / "leases" / "history" / f"{digest}.json"
+
+    def _read_lease_history_locked(self, lease_id: str) -> ExternalLease | None:
+        path = self._lease_history_path(lease_id)
+        if not path.exists():
+            return None
+        lease = ExternalLease.from_json(path.read_text())
+        if lease.lease_id != lease_id:
+            raise ValueError("historical lease identity does not match its key")
+        return lease
 
     @staticmethod
     def _sync_file_and_parent(path: Path) -> None:
@@ -561,6 +581,7 @@ class GPUQueue:
     def _assert_new_lease_id_locked(self, lease_id: str) -> None:
         current = self._read_lease_locked()
         if ((current is not None and current.lease_id == lease_id)
+                or self._lease_history_path(lease_id).exists()
                 or (self.lease_receipts_dir / f"{lease_id}-claim.json").exists()):
             raise ValueError("lease ids must be unique; cannot reuse an earlier claim")
 

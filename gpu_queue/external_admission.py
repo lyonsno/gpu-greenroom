@@ -32,10 +32,14 @@ def _cancellation(queue, lease_id):
 
 def _assert_admission_identity_locked(queue, lease_id, job_id):
     current = queue._read_lease_locked()
+    historical = queue._read_lease_history_locked(lease_id)
+    bound = current if current is not None and current.lease_id == lease_id else historical
     receipt = queue.lease_receipts_dir / f"{lease_id}-claim.json"
-    if receipt.exists() or (current is not None and current.lease_id == lease_id):
+    if historical is not None and historical.admission_job_id != job_id:
+        raise ValueError("lease ids must be unique; cannot reuse a historical claim")
+    if receipt.exists() or bound is not None:
         claim = (json.loads(receipt.read_text()) if receipt.exists() else
-                 {"admission_job_id": current.admission_job_id} if current is not None else {})
+                 {"admission_job_id": bound.admission_job_id} if bound is not None else {})
         if claim.get("admission_job_id") != job_id:
             raise ValueError("lease ids must be unique; queued admission cannot reuse an earlier claim")
 
@@ -127,6 +131,14 @@ def queued_claim(queue, *, lease_id, **identity):
                     queue._move_job(directory, "cancelled")
                 return {"status": "cancelled", "jobId": job_id}
             current = queue._refresh_lease_observation_locked()
+            historical = queue._read_lease_history_locked(lease_id)
+            if historical is not None and (current is None or current.lease_id != lease_id):
+                if historical.lifecycle_state not in (LeaseStatus.RELEASED, LeaseStatus.HANDOFF):
+                    raise RuntimeError("historical admission is not settled; recovery required")
+                if not (queue.lease_receipts_dir / f"{lease_id}-claim.json").exists():
+                    _record_claim(queue, historical)
+                _finish(queue, request, historical)
+                return {"status": historical.lifecycle_state.value, "jobId": job_id, "leaseId": lease_id}
             if current and current.lease_id == lease_id:
                 if not (queue.lease_receipts_dir / f"{lease_id}-claim.json").exists():
                     _record_claim(queue, current)

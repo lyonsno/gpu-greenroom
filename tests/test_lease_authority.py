@@ -312,3 +312,55 @@ def test_interrupted_queued_claim_recovers_exact_admission_without_claim_receipt
     receipt = json.loads((queue.lease_receipts_dir / "claim-crash-claim.json").read_text())
     assert receipt["admission_job_id"] == "external-claim-crash"
     assert receipt["process_start_identity"] == asdict(held)["process_start_identity"]
+
+
+@pytest.mark.parametrize("original_kind", ["direct", "queued"])
+@pytest.mark.parametrize("retry_kind", ["direct", "queued"])
+def test_missing_claim_receipt_cannot_forget_incarnation_after_replacement(tmp_path, monkeypatch, original_kind, retry_kind):
+    from gpu_queue.external_admission import queued_claim
+    queue = GPUQueue(tmp_path / "queue")
+    write = queue._write_receipt_locked
+    def fail_claim(directory, name, payload):
+        if name == "once-claim.json":
+            raise OSError("claim receipt unavailable")
+        write(directory, name, payload)
+    monkeypatch.setattr(queue, "_write_receipt_locked", fail_claim)
+    with pytest.raises(OSError):
+        if original_kind == "direct":
+            queue.claim_lease(**_lease_kwargs(lease_id="once"))
+        else:
+            queued_claim(queue, lease_id="once", **_lease_kwargs())
+    original = queue.lease_status()
+    monkeypatch.setattr(queue, "_write_receipt_locked", write)
+    queue.release_lease("once", released_by="original", reason="settled")
+    queue.claim_lease(**_lease_kwargs(lease_id="intervening"))
+    queue.release_lease("intervening", released_by="intervening", reason="settled")
+    if original_kind == retry_kind == "queued":
+        result = queued_claim(queue, lease_id="once", **_lease_kwargs())
+        assert result["status"] == "released", "retry must recover the old admission, not reacquire"
+        assert queue.get_job("external-once").status.value == "done"
+    else:
+        with pytest.raises(ValueError, match="unique|reuse"):
+            if retry_kind == "direct":
+                queue.claim_lease(**_lease_kwargs(lease_id="once"))
+            else:
+                queued_claim(queue, lease_id="once", **_lease_kwargs())
+    assert queue.lease_status().lease_id == "intervening"
+    with pytest.raises(KeyError):
+        queue.release_lease(original.lease_id, released_by="original", reason="stale release")
+
+
+def test_failure_to_preserve_previous_identity_prevents_replacement(tmp_path, monkeypatch):
+    queue = GPUQueue(tmp_path / "queue")
+    queue.claim_lease(**_lease_kwargs(lease_id="previous"))
+    queue.release_lease("previous", released_by="holder", reason="settled")
+    write = queue._write_text_atomic
+    def fail_history(path, text):
+        if path.parent.name == "history":
+            raise OSError("history unavailable")
+        write(path, text)
+    monkeypatch.setattr(queue, "_write_text_atomic", fail_history)
+    with pytest.raises(OSError, match="history"):
+        queue.claim_lease(**_lease_kwargs(lease_id="next"))
+    assert queue.lease_status().lease_id == "previous"
+    assert not (queue.lease_receipts_dir / "next-claim.json").exists()
