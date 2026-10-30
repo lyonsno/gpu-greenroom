@@ -343,7 +343,8 @@ def test_operator_snapshot_serializes_external_lease(tmp_path):
     snapshot = queue_snapshot(queue)
 
     assert snapshot["lease"]["owner"] == "chrome"
-    assert snapshot["lease"]["lifecycle_state"] == "active"
+    assert snapshot["lease"]["lifecycle_state"] == "ownership_unknown"
+    assert snapshot["lease"]["unknown_reason"] == "holder_identity_unbound"
     json.dumps(snapshot)
 
 
