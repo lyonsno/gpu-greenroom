@@ -109,7 +109,7 @@ function updateFreshness(){
     document.querySelectorAll('.job-item').forEach(n=>n.draggable=false);
   }
   if(!readFresh('smoke')){smokeRefreshUnavailable=true;document.querySelectorAll('#smokeRequestList button').forEach(n=>n.disabled=true)}
-  if(freshness.smoke.error&&smokeHasLoaded)document.querySelector('#smokeStatus').textContent='Refresh unavailable; showing last loaded requests';
+  if(freshness.smoke.error&&smokeHasLoaded)document.querySelector('#smokeStatus').textContent='Refresh failed; showing last loaded requests';
 }
 function canMove(j){return queueAvailable&&!busy&&j?.consistent&&j.status==='pending'&&j.request_digest&&!j.dispatch_error&&!last?.dispatch?.error&&last?.dispatch?.policy?.mode==='two-class'&&document.body.dataset.readOnly!=='true'&&(!last?.read_only||last?.admission_control)}
 function finishDrag(){draggedJob=null;document.querySelectorAll('.drop-target').forEach(n=>n.classList.remove('drop-target'));if(last)render(last)}
@@ -240,7 +240,7 @@ async function load(){
     if(generation!==queueLoadGeneration)return;
     if(s.schema!=='gpu-greenroom.operator-snapshot.v1'||s.view!==view||!Array.isArray(s.jobs))throw new Error('Invalid queue snapshot');
     readStamp('queue',s.observed_at);queueAvailable=readFresh('queue');render(s);
-  }catch(e){if(generation===queueLoadGeneration){freshness.queue.error=e.message;err(e.message)}}
+  }catch(e){if(generation===queueLoadGeneration){if(last)filter=last.view;freshness.queue.error=e.message;err(e.message)}}
   finally{if(generation===queueLoadGeneration){queueLoading=false;updateFreshness()}}
 }
 function smokeDestination(item){
@@ -261,7 +261,6 @@ function validateSmokePayload(payload){
 function renderSmoke(payload){
   validateSmokePayload(payload);
   lastSmoke=payload;
-  if(payload.errors.length)freshness.smoke.error='Partial smoke snapshot: '+payload.errors.length+' unreadable record(s)';
   if(last)render(last);
   if(!smokeArrivalHandled&&location.hash.startsWith('#smoke-'))smokeFilter='all';
   const host=document.querySelector('#smokeRequestList'),items=payload.items.filter(item=>smokeFilter==='all'||(item.display?.section||'active')===smokeFilter),focused=document.activeElement,

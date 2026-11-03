@@ -94,6 +94,27 @@ def test_failed_filter_keeps_retained_view_identity(monitor):
     page.wait_for_function('()=>!!freshness.queue.error')
     assert page.locator('#filters .active').inner_text() == 'active'
     assert page.evaluate('last.view') == 'active'
+    assert page.evaluate('filter') == 'active'
+    assert page.evaluate('liveQueueView()') is True
+    page.wait_for_function('()=>!freshness.queue.error&&readFresh("queue")')
+
+
+def test_partial_smoke_snapshot_keeps_valid_request_actionable(monitor, tmp_path):
+    from gpu_queue.smoke_requests import SmokeRequests
+    from tests.test_smoke_admission import command, smoke
+    page, queue, url = monitor
+    store = SmokeRequests(queue.queue_dir/'smoke-requests')
+    store.submit(smoke(tmp_path, command(tmp_path)))
+    store.path('9c0a03f6-b2d8-43f4-b7b7-5e848e733662').write_text('[]')
+    page.goto(url, wait_until='networkidle')
+    assert page.locator('.smoke-card').count() == 1
+    assert page.locator('#smokeStatus').inner_text() == '1 unreadable record(s)'
+    assert page.evaluate("readFresh('smoke')") is True
+    assert not page.locator('button.smokeStart').is_disabled()
+    page.locator('[data-smoke-filter="history"]').click()
+    page.locator('[data-smoke-filter="active"]').click()
+    assert page.locator('#smokeStatus').inner_text() == '1 unreadable record(s)'
+    assert not page.locator('button.smokeStart').is_disabled()
 
 
 def test_linked_smoke_controls_recover_with_queue_without_smoke_read(monitor, tmp_path):
