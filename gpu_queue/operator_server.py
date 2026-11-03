@@ -73,6 +73,35 @@ function smokeReply(item){
 }
 function auth(){return {'Authorization':'Bearer '+token,'Content-Type':'application/json'}}async function request(path,options={}){const r=await fetch(path,options);if(r.status===401&&globalThis.__GREENROOM_LOCAL_OPERATOR__){if(!sessionStorage.getItem('greenroom-auth-reload')){sessionStorage.setItem('greenroom-auth-reload','1');location.reload();return new Promise(()=>{})}}else if(r.ok){sessionStorage.removeItem('greenroom-auth-reload')}return r}function err(e){const n=document.querySelector('#error');n.textContent=e;n.style.display='block';setTimeout(()=>n.style.display='none',6000)}function elapsed(j){const end=j.finished_at||Date.now()/1000,start=j.started_at||j.submitted_at;if(!start)return '—';const s=Math.max(0,end-start);if(s<60)return Math.round(s)+'s';if(s<3600)return Math.floor(s/60)+'m '+Math.round(s%60)+'s';return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'}function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 let busy=false,draggedJob=null,queueAvailable=false;
+// Freshness belongs to the successful read, never to a redraw of cached data.
+const pollMs=5000,staleMs=3*pollMs,freshness={queue:{},smoke:{}};
+let queueLoadGeneration=0,queueLoading=false,smokeLoading=false;
+const freshnessBar=document.createElement('div');freshnessBar.className='meta';
+freshnessBar.innerHTML='<div id="queueFreshness" role="status"></div><div id="smokeFreshness" role="status"></div>';
+document.querySelector('main').prepend(freshnessBar);
+function readStamp(kind,value){
+  const observed=kind==='queue'?(typeof value==='number'?value*1000:NaN):(typeof value==='string'?Date.parse(value):NaN);
+  if(!Number.isFinite(observed)||observed<=0)throw new Error('Observation time missing or invalid');
+  freshness[kind]={observed,received:Date.now(),error:null};
+}
+function readAge(kind){const f=freshness[kind];return f.received?Math.max(0,Date.now()-f.received,Date.now()-f.observed):Infinity}
+function readFresh(kind){return !!freshness[kind].received&&!freshness[kind].error&&readAge(kind)<staleMs}
+function updateFreshness(){
+  const wasAvailable=queueAvailable;queueAvailable=readFresh('queue');
+  for(const kind of ['queue','smoke']){
+    const f=freshness[kind],age=readAge(kind),n=document.querySelector('#'+kind+'Freshness');
+    n.textContent=(kind==='queue'?'Queue':'Operator smokes')+': '+(f.error?'Refresh unavailable':!f.received?'Waiting for first observation':readFresh(kind)?'Updated '+duration(age/1000)+' ago':'Stale; last observation '+duration(age/1000)+' ago');
+    n.className=readFresh(kind)?'meta':'meta failed';n.title=f.error||'';
+  }
+  if(wasAvailable!==queueAvailable&&last)render(last);
+  if(!queueAvailable){
+    document.querySelector('#queueState').textContent=freshness.queue.error?'State unavailable':last?'Queue state stale':'Waiting for queue state';
+    document.querySelector('#dot').className='dot paused';
+    document.querySelectorAll('#pause,#resume,.job-actions button,.job-actions input,.dispatchClass,#confirmCancel,#requeueConfirm').forEach(n=>n.disabled=true);
+    document.querySelectorAll('.job-item').forEach(n=>n.draggable=false);
+  }
+  if(!readFresh('smoke')){smokeRefreshUnavailable=true;document.querySelectorAll('#smokeRequestList button').forEach(n=>n.disabled=true)}
+}
 function canMove(j){return queueAvailable&&!busy&&j?.consistent&&j.status==='pending'&&j.request_digest&&!j.dispatch_error&&!last?.dispatch?.error&&last?.dispatch?.policy?.mode==='two-class'&&document.body.dataset.readOnly!=='true'&&(!last?.read_only||last?.admission_control)}
 function finishDrag(){draggedJob=null;document.querySelectorAll('.drop-target').forEach(n=>n.classList.remove('drop-target'));if(last)render(last)}
 async function moveJob(job,serviceClass){
@@ -154,11 +183,11 @@ function render(s){
   last=s;
   if(draggedJob)return;
   const state=s.admission_state==='paused_running'?'Paused; work still running':s.paused?'Paused; no queued job running':'Queue starts enabled';
-  document.querySelector('#queueState').textContent=state;
+  document.querySelector('#queueState').textContent=queueAvailable?state:freshness.queue.error?'State unavailable':'Queue state stale';
   if(s.dispatch?.error)document.querySelector('#queueState').textContent+=' · Dispatch blocked: '+s.dispatch.error;
-  document.querySelector('#dot').className='dot'+(s.paused?' paused':'');
-  document.querySelector('#pause').disabled=busy||s.paused;
-  document.querySelector('#resume').disabled=busy||!s.paused||(s.admission_control&&!s.pause_state?.epoch);
+  document.querySelector('#dot').className='dot'+(s.paused||!queueAvailable?' paused':'');
+  document.querySelector('#pause').disabled=busy||!queueAvailable||s.paused;
+  document.querySelector('#resume').disabled=busy||!queueAvailable||!s.paused||(s.admission_control&&!s.pause_state?.epoch);
   const pm=document.querySelector('#pauseMeta'),p=s.pause_state;
   pm.hidden=false;pm.textContent=`Observed: ${new Date(s.observed_at*1000).toLocaleString()}`+(p?` · Pause owner: ${p.owner||'not recorded'} · epoch ${p.epoch||'not recorded'}`:'');
   if(s.paused&&!p?.epoch)pm.textContent+=' · Legacy pause: epoch not recorded.'+(s.admission_control?' Verify pause ownership and recover through the native queue CLI; browser resume cannot bind this marker.':'');
@@ -192,7 +221,17 @@ function render(s){
   });
   document.querySelectorAll('.dispatchClass').forEach(select=>select.onchange=()=>moveJob(s.jobs.find(j=>j.job_id===select.dataset.jobId),select.value));
 }
-async function load(){try{const r=await request('/api/state?view='+encodeURIComponent(filter),{headers:auth()});if(!r.ok)throw new Error(await r.text());const s=await r.json();queueAvailable=true;render(s)}catch(e){queueAvailable=false;document.querySelectorAll('.job-item').forEach(n=>n.draggable=false);document.querySelectorAll('.dispatchClass').forEach(n=>n.disabled=true);document.querySelector('#queueState').textContent='State unavailable';document.querySelector('#pause').disabled=true;document.querySelector('#resume').disabled=true;err(e.message)}}
+async function load(){
+  const generation=++queueLoadGeneration,view=filter;queueLoading=true;
+  try{
+    const r=await request('/api/state?view='+encodeURIComponent(view),{headers:auth(),cache:'no-store'});
+    if(!r.ok)throw new Error(await r.text());const s=await r.json();
+    if(generation!==queueLoadGeneration)return;
+    if(s.schema!=='gpu-greenroom.operator-snapshot.v1'||s.view!==view||!Array.isArray(s.jobs))throw new Error('Invalid queue snapshot');
+    readStamp('queue',s.observed_at);queueAvailable=readFresh('queue');render(s);
+  }catch(e){if(generation===queueLoadGeneration){freshness.queue.error=e.message;err(e.message)}}
+  finally{if(generation===queueLoadGeneration){queueLoading=false;updateFreshness()}}
+}
 function smokeDestination(item){
   const q=item.request||{},target=item.destination||{kind:'context',url:q.url},display=item.display||{},readOnly=document.body.dataset.readOnly==='true';
   if(display.run_available)return '';
@@ -225,7 +264,7 @@ function renderSmoke(payload){
     host.innerHTML='<div class="empty">Smoke requests could not be read.</div>';
     return;
   }
-  smokeRefreshUnavailable=false;smokeHasLoaded=true;
+  smokeRefreshUnavailable=!readFresh('smoke');smokeHasLoaded=true;
   payload.items.forEach(reconcileSmokeRun);
   document.querySelector('#smokeStatus').textContent=payload.errors?.length?`${payload.errors.length} unreadable record(s)`:items.length?`${items.length} request(s)`:'No requests';
   let views=document.querySelector('#smokeViews');if(!views){views=document.createElement('div');views.id='smokeViews';views.className='toolbar';host.before(views)}
@@ -268,28 +307,32 @@ function renderSmoke(payload){
     }
   });
   if(!smokeArrivalHandled&&location.hash.startsWith('#smoke-')){const target=document.getElementById(location.hash.slice(1));if(target){if(!focusControl){target.style.scrollMarginTop=(document.querySelector('header').getBoundingClientRect().height+12)+'px';target.scrollIntoView({block:'start'});target.tabIndex=-1;target.focus({preventScroll:true})}smokeArrivalHandled=true}else{document.querySelector('#smokeStatus').textContent='Smoke request in link is not available'}}
+  updateFreshness();
   if(arrivalId&&arrivalDigest&&!arrivalOpened){arrivalOpened=true;const item=payload.items.find(value=>value.request.id===arrivalId);if(item?.destination?.identity_digest===arrivalDigest&&!item.display?.run_available&&item.display?.job_state==='running'&&(item.display.terminal_verified||item.display.application_navigation_available)){const button=host.querySelector(`button.smokeFocus[data-id="${CSS.escape(arrivalId)}"]`);if(button&&!button.disabled)focusSmoke(button)}else err(item?.display?.navigation_error||'The linked session has ended, changed, or has no existing-window control; showing its request instead.')}
 }
 function keepLastSmokeView(message){
+  freshness.smoke.error=message;
   smokeRefreshUnavailable=true;
   document.querySelector('#smokeStatus').textContent=message;
     document.querySelectorAll('#smokeRequestList button').forEach(button=>button.disabled=true);
 }
 async function loadSmoke(){
-  const generation=++smokeLoadGeneration;
+  const generation=++smokeLoadGeneration;smokeLoading=true;
   try{
-    const r=await request('/api/smoke-requests',{headers:auth()});
+    const r=await request('/api/smoke-requests',{headers:auth(),cache:'no-store'});
     if(!r.ok)throw new Error(await r.text());
     const payload=await r.json();
     if(generation!==smokeLoadGeneration)return;
-    renderSmoke(payload);
+    if(payload.schema!=='gpu-greenroom.smoke-request-list.v1'||!Array.isArray(payload.items)||!Array.isArray(payload.errors))throw new Error('Invalid smoke request list response');
+    readStamp('smoke',payload.observed_at);renderSmoke(payload);
   }catch(e){
     if(generation!==smokeLoadGeneration)return;
+    freshness.smoke.error=e.message;
     if(smokeHasLoaded){keepLastSmokeView('Refresh failed; showing last loaded requests');err(e.message);return}
     document.querySelector('#smokeStatus').textContent='State unavailable';
     document.querySelector('#smokeRequestList').innerHTML='<div class="empty">Smoke requests unavailable.</div>';
     err(e.message);
-  }
+  }finally{if(generation===smokeLoadGeneration){smokeLoading=false;updateFreshness()}}
 }
 async function startSmoke(button){const id=button.dataset.id;if(smokeSubmitting.has(id))return;smokeSubmitting.add(id);button.disabled=true;try{const r=await request(`/api/smoke-requests/${encodeURIComponent(id)}/start`,{method:'POST',headers:auth(),body:JSON.stringify({request_digest:button.dataset.digest,request_id:crypto.randomUUID()})});if(!r.ok)throw new Error(await r.text());await loadSmoke();await load()}catch(e){err(e.message)}finally{smokeSubmitting.delete(id);const current=document.querySelector(`button.smokeStart[data-id="${CSS.escape(id)}"]`);if(current)current.disabled=smokeRefreshUnavailable}}
 async function focusSmoke(button){button.disabled=true;try{const r=await request(`/api/smoke-requests/${encodeURIComponent(button.dataset.id)}/focus`,{method:'POST',headers:auth(),body:JSON.stringify({request_digest:button.dataset.digest,destination_digest:button.dataset.destination})});if(!r.ok)throw new Error(await r.text())}catch(e){err(e.message)}finally{await loadSmoke()}}
@@ -313,7 +356,7 @@ function askCancel(id,force=false){
 }
 async function confirmCancel(){const selection=cancelSelection;if(!selection)return;document.querySelector('#cancelDialog').close();try{await post('/api/job-cancel',selection)}catch(e){err(e.message)}}
 async function act(kind,id){askCancel(id,kind==='kill')}
-document.querySelector('#pause').onclick=()=>post('/api/pause',{requested_by:'operator-console'}).catch(e=>err(e.message));document.querySelector('#resume').onclick=()=>post('/api/resume',{requested_by:'operator-console',epoch:last?.pause_state?.epoch}).catch(e=>err(e.message));document.querySelector('#refresh').onclick=load;document.querySelector('#refreshSmoke').onclick=loadSmoke;bindDropTargets();load();loadSmoke();setInterval(()=>{if(filter==='active')load();loadSmoke()},5000);
+document.querySelector('#pause').onclick=()=>post('/api/pause',{requested_by:'operator-console'}).catch(e=>err(e.message));document.querySelector('#resume').onclick=()=>post('/api/resume',{requested_by:'operator-console',epoch:last?.pause_state?.epoch}).catch(e=>err(e.message));document.querySelector('#refresh').onclick=load;document.querySelector('#refreshSmoke').onclick=loadSmoke;bindDropTargets();updateFreshness();load();loadSmoke();setInterval(()=>{if(!queueLoading)load();if(!smokeLoading)loadSmoke()},pollMs);setInterval(updateFreshness,1000);document.addEventListener('visibilitychange',()=>{updateFreshness();if(!document.hidden){load();loadSmoke()}});
 </script></body></html>"""
 
 
