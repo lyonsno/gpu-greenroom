@@ -13,6 +13,107 @@ from gpu_queue.queue import GPUQueue
 from tests.test_job_controls import job
 
 
+@pytest.fixture
+def monitor(tmp_path):
+    chromium = os.environ.get('GREENROOM_TEST_CHROMIUM')
+    if not chromium:
+        pytest.skip('set independent Chromium executable')
+    assert 'Google Chrome.app' not in Path(chromium).resolve().parts, 'Use an independent automation browser'
+    from playwright.sync_api import sync_playwright
+    queue = GPUQueue(tmp_path/'queue')
+    server = ThreadingHTTPServer(('127.0.0.1', 0), make_handler(queue, 'fixture', local_operator=True, job_control=True))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with sync_playwright() as p:
+            context = p.chromium.launch_persistent_context(str(tmp_path/'profile'), executable_path=chromium,
+                headless=True, args=['--use-mock-keychain','--password-store=basic','--disable-gpu'])
+            try:
+                yield context.new_page(), queue, f'http://127.0.0.1:{server.server_address[1]}'
+            finally:
+                context.close()
+    finally:
+        server.shutdown()
+        thread.join()
+        server.server_close()
+
+
+@pytest.mark.parametrize('kind', ['cancel', 'requeue'])
+def test_modal_recovers_after_failed_refresh(monitor, kind):
+    page, queue, url = monitor
+    path = job(queue, performance_window='fixture')
+    if kind == 'requeue':
+        queue.cancel(path.name)
+    page.goto(url, wait_until='networkidle')
+    if kind == 'requeue':
+        page.get_by_role('button', name='Restore cancelled', exact=True).click()
+        page.wait_for_function("()=>last.view==='recoverable'")
+        page.get_by_title('Restore cancelled performance job').click()
+    else:
+        page.get_by_title('Cancel job', exact=True).click()
+    button = page.locator('#requeueConfirm' if kind == 'requeue' else '#confirmCancel')
+    assert not button.is_disabled()
+    page.route('**/api/state?*', lambda route: route.abort())
+    page.evaluate('load()')
+    assert button.is_disabled()
+    page.unroute('**/api/state?*')
+    page.evaluate('load()')
+    assert not button.is_disabled()
+
+
+@pytest.mark.parametrize('initial', [True, False])
+def test_unreadable_smokes_never_look_fresh_or_replace_retained_cards(monitor, tmp_path, initial):
+    from gpu_queue.smoke_requests import SmokeRequests
+    from tests.test_smoke_admission import command, smoke
+    page, queue, url = monitor
+    store = SmokeRequests(queue.queue_dir/'smoke-requests')
+    record, _ = store.submit(smoke(tmp_path, command(tmp_path)))
+    bad = {**store.snapshot(), 'items': [], 'errors': ['record unreadable']}
+    if not initial:
+        page.goto(url, wait_until='networkidle')
+        assert page.locator('.smoke-card').count() == 1
+    page.route('**/api/smoke-requests', lambda route: route.fulfill(json=bad))
+    if initial:
+        page.goto(url, wait_until='networkidle')
+    else:
+        page.evaluate('loadSmoke()')
+        assert page.evaluate('lastSmoke.items[0].request.id') == record['request']['id']
+        page.locator('[data-smoke-filter="history"]').click()
+        page.locator('[data-smoke-filter="active"]').click()
+        assert page.locator('.smoke-card').count() == 1
+    assert 'unavailable' in page.locator('#smokeFreshness').inner_text().lower()
+    assert page.evaluate("readFresh('smoke')") is False
+
+
+def test_failed_filter_keeps_retained_view_identity(monitor):
+    page, queue, url = monitor
+    job(queue)
+    page.goto(url, wait_until='networkidle')
+    page.route('**/api/state?view=done', lambda route: route.abort())
+    page.get_by_role('button', name='done', exact=True).click()
+    page.wait_for_function('()=>!!freshness.queue.error')
+    assert page.locator('#filters .active').inner_text() == 'active'
+    assert page.evaluate('last.view') == 'active'
+
+
+def test_linked_smoke_controls_recover_with_queue_without_smoke_read(monitor, tmp_path):
+    from gpu_queue.smoke_requests import SmokeRequests
+    from tests.test_smoke_admission import command, smoke
+    page, queue, url = monitor
+    store = SmokeRequests(queue.queue_dir/'smoke-requests')
+    record, _ = store.submit(smoke(tmp_path, command(tmp_path)))
+    store.start(record['request']['id'], record['request_digest'])
+    page.goto(url, wait_until='networkidle')
+    button = page.locator('#smokeRequestList .job-actions button')
+    assert not button.is_disabled()
+    page.route('**/api/state?*', lambda route: route.abort())
+    page.evaluate('load()')
+    assert button.is_disabled()
+    page.unroute('**/api/state?*')
+    page.evaluate('load()')
+    assert not button.is_disabled()
+
+
 def test_monitor_does_not_present_old_queue_as_live(tmp_path):
     chromium = os.environ.get('GREENROOM_TEST_CHROMIUM')
     if not chromium:
@@ -23,13 +124,16 @@ def test_monitor_does_not_present_old_queue_as_live(tmp_path):
                   executable=chromium, evidence_kind='native API with synthetic CPU jobs and transport faults')
     server = thread = None
     try:
+        assert 'Google Chrome.app' not in Path(chromium).resolve().parts, 'Use an independent automation browser'
         from playwright.sync_api import sync_playwright
         queue = GPUQueue(tmp_path/'queue')
         path = job(queue)
+        report['phase'] = 'server-start'
         server = ThreadingHTTPServer(('127.0.0.1', 0), make_handler(queue, 'fixture-token', local_operator=True, job_control=True))
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         with sync_playwright() as p:
+            report['phase'] = 'browser-launch'
             context = p.chromium.launch_persistent_context(str(tmp_path/'profile'), executable_path=chromium,
                 headless=True, args=['--use-mock-keychain', '--password-store=basic', '--disable-gpu'])
             try:
@@ -37,6 +141,7 @@ def test_monitor_does_not_present_old_queue_as_live(tmp_path):
                 page.clock.install()
                 errors = []
                 page.on('pageerror', lambda error: errors.append(str(error)))
+                report['phase'] = 'initial-page'
                 page.goto(f'http://127.0.0.1:{server.server_address[1]}', wait_until='networkidle')
                 report['phase'] = 'failed-queue-with-successful-smoke-refresh'
                 page.route('**/api/state?*', lambda route: route.abort())

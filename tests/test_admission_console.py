@@ -22,17 +22,18 @@ def test_shared_page_preserves_actions_and_explains_legacy_pause():
     harness = '''const vm=require('node:vm'); const nodes={};
 const context={URLSearchParams, location:{hash:'',pathname:'/'},history:{replaceState(){}},
 sessionStorage:{getItem(){return ''}},fetch(){return new Promise(()=>{})},setInterval(){},setTimeout(){},
-document:{body:{dataset:{}},querySelector(s){return nodes[s]??=( {style:{},dataset:{}} )},querySelectorAll(){return []}}};
+document:{body:{dataset:{}},createElement(){return {}},addEventListener(){},querySelector(s){return nodes[s]??=( {style:{},dataset:{},prepend(){}} )},querySelectorAll(){return []}}};
 vm.createContext(context);
 '''
     harness += 'vm.runInContext('+json.dumps(script)+',context);\n'
-    harness += 'vm.runInContext('+json.dumps('render('+json.dumps(fixture)+')')+',context);\n'
+    harness += 'vm.runInContext('+json.dumps("readStamp('queue',Date.now()/1000);render("+json.dumps(fixture)+')')+',context);\n'
     harness += "console.log(JSON.stringify(nodes));"
     result = subprocess.run(['node', '-e', harness], capture_output=True, text=True, check=True)
     nodes = json.loads(result.stdout)
     assert 'pending' in nodes['#jobs']['innerHTML'] and 'running' in nodes['#jobs']['innerHTML']
     assert "act('" not in nodes['#jobs']['innerHTML']
     assert 'native queue CLI' in nodes['#pauseMeta']['textContent']
+    assert nodes['#queueState']['textContent'] == 'Paused; no queued job running'
     assert nodes['#resume']['disabled'] is True
 
 

@@ -377,7 +377,8 @@ def test_operator_snapshot_preserves_containment_over_stale_declared_status(tmp_
 
 
 def test_operator_history_views_do_not_poll_automatically():
-    assert "if(filter==='active')load()" in PAGE
+    assert "function liveQueueView(view=filter){return ['active','pending','running'].includes(view)}" in PAGE
+    assert "if(liveQueueView()&&!queueLoading)load()" in PAGE
 
 
 def test_read_only_snapshot_does_not_refresh_lease_authority(tmp_path, monkeypatch):

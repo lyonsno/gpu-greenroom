@@ -76,9 +76,12 @@ let busy=false,draggedJob=null,queueAvailable=false;
 // Freshness belongs to the successful read, never to a redraw of cached data.
 const pollMs=5000,staleMs=3*pollMs,freshness={queue:{},smoke:{}};
 let queueLoadGeneration=0,queueLoading=false,smokeLoading=false;
-const freshnessBar=document.createElement('div');freshnessBar.className='meta';
-freshnessBar.innerHTML='<div id="queueFreshness" role="status"></div><div id="smokeFreshness" role="status"></div>';
-document.querySelector('main').prepend(freshnessBar);
+function initFreshness(){
+  const bar=document.createElement('div');bar.className='meta';
+  bar.innerHTML='<div id="queueFreshness" role="status"></div><div id="smokeFreshness" role="status"></div>';
+  document.querySelector('main').prepend(bar);
+}
+function liveQueueView(view=filter){return ['active','pending','running'].includes(view)}
 function readStamp(kind,value){
   const observed=kind==='queue'?(typeof value==='number'?value*1000:NaN):(typeof value==='string'?Date.parse(value):NaN);
   if(!Number.isFinite(observed)||observed<=0)throw new Error('Observation time missing or invalid');
@@ -90,10 +93,15 @@ function updateFreshness(){
   const wasAvailable=queueAvailable;queueAvailable=readFresh('queue');
   for(const kind of ['queue','smoke']){
     const f=freshness[kind],age=readAge(kind),n=document.querySelector('#'+kind+'Freshness');
-    n.textContent=(kind==='queue'?'Queue':'Operator smokes')+': '+(f.error?'Refresh unavailable':!f.received?'Waiting for first observation':readFresh(kind)?'Updated '+duration(age/1000)+' ago':'Stale; last observation '+duration(age/1000)+' ago');
+    n.textContent=(kind==='queue'?(liveQueueView(last?.view||filter)?'Queue':'Queue snapshot'):'Operator smokes')+': '+(f.error?'Refresh unavailable':!f.received?'Waiting for first observation':readFresh(kind)?'Updated '+duration(age/1000)+' ago':'Stale; last observation '+duration(age/1000)+' ago');
     n.className=readFresh(kind)?'meta':'meta failed';n.title=f.error||'';
   }
   if(wasAvailable!==queueAvailable&&last)render(last);
+  document.querySelectorAll('#confirmCancel,#requeueConfirm').forEach(n=>n.disabled=busy||!queueAvailable);
+  document.querySelectorAll('#smokeRequestList .smoke-card').forEach(card=>{
+    const item=lastSmoke?.items.find(i=>'smoke-'+i.request.id===card.id),host=card.querySelector('.job-actions');
+    if(host){const job=last?.jobs.find(j=>j.job_id===item?.display?.job_id&&j.status===item?.display?.job_state),markup=nativeActions(job);if(host.innerHTML!==markup)host.innerHTML=markup}
+  });
   if(!queueAvailable){
     document.querySelector('#queueState').textContent=freshness.queue.error?'State unavailable':last?'Queue state stale':'Waiting for queue state';
     document.querySelector('#dot').className='dot paused';
@@ -101,6 +109,7 @@ function updateFreshness(){
     document.querySelectorAll('.job-item').forEach(n=>n.draggable=false);
   }
   if(!readFresh('smoke')){smokeRefreshUnavailable=true;document.querySelectorAll('#smokeRequestList button').forEach(n=>n.disabled=true)}
+  if(freshness.smoke.error&&smokeHasLoaded)document.querySelector('#smokeStatus').textContent='Refresh unavailable; showing last loaded requests';
 }
 function canMove(j){return queueAvailable&&!busy&&j?.consistent&&j.status==='pending'&&j.request_digest&&!j.dispatch_error&&!last?.dispatch?.error&&last?.dispatch?.policy?.mode==='two-class'&&document.body.dataset.readOnly!=='true'&&(!last?.read_only||last?.admission_control)}
 function finishDrag(){draggedJob=null;document.querySelectorAll('.drop-target').forEach(n=>n.classList.remove('drop-target'));if(last)render(last)}
@@ -129,17 +138,18 @@ function runtimeHint(j){
 }
 function nativeActions(j){
   if(!j?.consistent||document.body.dataset.readOnly==='true')return '';
+  const disabled=busy||!queueAvailable?'disabled':'';
   if(last?.job_control){
     if(!['pending','deferred','running'].includes(j.status)||!j.request_digest)return '';
     if(j.warnings?.some(w=>w.startsWith('ownership_unknown:')))return '<span class="meta failed" title="Execution process ownership is unresolved, not the submitting lane identity. Recovery is required before cancellation.">Process ownership unresolved; cancellation unavailable</span>';
     if(j.cancellation_error)return '<span class="meta failed">Cancellation unverified</span>';
     if(j.status==='running'&&!j.worker_capabilities?.includes('job-cancellation.v1'))return '<span class="meta">Cancellation requires worker update</span>';
-    if(j.cancellation)return `<span class="meta">${j.cancellation.force?'Force stop requested':'Cancelling; waiting for process exit'}</span>${j.status==='running'&&!j.cancellation.force?` <button class="danger icon" title="Force stop job" onclick="askCancel('${esc(j.job_id)}',true)">■</button>`:''}`;
+    if(j.cancellation)return `<span class="meta">${j.cancellation.force?'Force stop requested':'Cancelling; waiting for process exit'}</span>${j.status==='running'&&!j.cancellation.force?` <button class="danger icon" title="Force stop job" onclick="askCancel('${esc(j.job_id)}',true)" ${disabled}>■</button>`:''}`;
     return `<button class="danger text" title="Cancel job" onclick="askCancel('${esc(j.job_id)}')" ${busy||!queueAvailable?'disabled':''}><span>×</span> Cancel</button>`;
   }
   if(last?.read_only||last?.admission_control)return '';
-  if(['pending','deferred'].includes(j.status))return `<button class="danger text" title="Cancel queued job" onclick="act('cancel','${esc(j.job_id)}')"><span>×</span> Cancel</button>`;
-  if(j.status==='running')return `<button class="danger text" title="Stop running job" onclick="act('terminate','${esc(j.job_id)}')"><span>■</span> Stop</button> <button class="danger icon" title="Force stop running job" onclick="act('kill','${esc(j.job_id)}')">!</button>`;
+  if(['pending','deferred'].includes(j.status))return `<button class="danger text" title="Cancel queued job" onclick="act('cancel','${esc(j.job_id)}')" ${disabled}><span>×</span> Cancel</button>`;
+  if(j.status==='running')return `<button class="danger text" title="Stop running job" onclick="act('terminate','${esc(j.job_id)}')" ${disabled}><span>■</span> Stop</button> <button class="danger icon" title="Force stop running job" onclick="act('kill','${esc(j.job_id)}')" ${disabled}>!</button>`;
   return '';
 }
 function pauseEstimate(j){
@@ -166,7 +176,7 @@ async function jobAction(id,action,extra={}){
   try{await post('/api/job-action',{job_id:id,request_digest:job.request_digest,expected_status:job.status,expected_started_at:job.started_at??null,action,...extra})}catch(e){err(e.message)}
 }
 function askRequeue(id){
-  const job=last?.jobs.find(j=>j.job_id===id);if(!job)return;
+  const job=last?.jobs.find(j=>j.job_id===id);if(!job||!queueAvailable||busy)return;
   let d=document.querySelector('#requeueDialog');
   if(!d){d=document.createElement('dialog');d.id='requeueDialog';d.innerHTML='<form method="dialog"><h2>Restore this performance job?</h2><p id="requeueIdentity"></p><p>Creates a new attempt. Fresh performance confirmation is required.</p><label>Queue placement <select id="requeuePlacement"><option value="previous">Previous position among waiting jobs</option><option value="second">Second in the waiting queue</option><option value="end">End of the waiting queue</option></select></label><div class="dialog-actions"><button value="back">Keep cancelled</button><button id="requeueConfirm" type="button">Requeue</button></div></form>';document.body.append(d)}
   d.querySelector('#requeueIdentity').textContent=`${job.job_id} · ${job.agent_id||'Agent not recorded'}\n${job.requested_route||job.job_type}`;
@@ -193,7 +203,7 @@ function render(s){
   if(s.paused&&!p?.epoch)pm.textContent+=' · Legacy pause: epoch not recorded.'+(s.admission_control?' Verify pause ownership and recover through the native queue CLI; browser resume cannot bind this marker.':'');
   const lease=document.querySelector('#lease');lease.hidden=!s.lease;
   lease.textContent=s.lease?`Recorded external owner: ${s.lease.owner} · ${s.lease.effective_route} · ${s.lease.lifecycle_state}`:'';
-  document.querySelector('#filters').innerHTML=statuses.map(x=>`<button class="filter ${filter===x?'active':''}" data-filter="${x}">${x==='recoverable'?'Restore cancelled':x}</button>`).join('');
+  document.querySelector('#filters').innerHTML=statuses.map(x=>`<button class="filter ${s.view===x?'active':''}" data-filter="${x}">${x==='recoverable'?'Restore cancelled':x}</button>`).join('');
   document.querySelectorAll('[data-filter]').forEach(b=>b.onclick=()=>{filter=b.dataset.filter;load()});
   const smokeJobs=new Set((lastSmoke?.items||[]).map(item=>item.display?.job_id).filter(Boolean));
   const rank=j=>j.status==='running'?0:j.status==='pending'?1:2;
@@ -220,6 +230,7 @@ function render(s){
     item.ondragend=finishDrag;
   });
   document.querySelectorAll('.dispatchClass').forEach(select=>select.onchange=()=>moveJob(s.jobs.find(j=>j.job_id===select.dataset.jobId),select.value));
+  updateFreshness();
 }
 async function load(){
   const generation=++queueLoadGeneration,view=filter;queueLoading=true;
@@ -242,9 +253,15 @@ function smokeDestination(item){
   if(url.origin===location.origin&&url.pathname===location.pathname)return '';
   return `<a href="${esc(target.url)}" target="_blank" rel="noopener noreferrer">${target.kind==='browser'?'Open application':'View linked page'}</a>`;
 }
-function renderSmoke(payload){
+function validateSmokePayload(payload){
   if(!payload||payload.schema!=='gpu-greenroom.smoke-request-list.v1'||!Array.isArray(payload.items)||!Array.isArray(payload.errors))throw new Error('Invalid smoke request list response');
+  if(payload.errors.length&&!payload.items.length)throw new Error('Smoke records unreadable');
+  if([...document.querySelectorAll('#smokeRequestList form.smokeReply')].some(form=>!payload.items.some(item=>item.request?.id===form.dataset.id)))throw new Error('Request missing from refresh');
+}
+function renderSmoke(payload){
+  validateSmokePayload(payload);
   lastSmoke=payload;
+  if(payload.errors.length)freshness.smoke.error='Partial smoke snapshot: '+payload.errors.length+' unreadable record(s)';
   if(last)render(last);
   if(!smokeArrivalHandled&&location.hash.startsWith('#smoke-'))smokeFilter='all';
   const host=document.querySelector('#smokeRequestList'),items=payload.items.filter(item=>smokeFilter==='all'||(item.display?.section||'active')===smokeFilter),focused=document.activeElement,
@@ -254,16 +271,6 @@ function renderSmoke(payload){
     selectionEnd=focusControl==='textarea'?focused.selectionEnd:null,
     selectionDirection=focusControl==='textarea'?focused.selectionDirection:null;
   host.querySelectorAll('form.smokeReply').forEach(form=>smokeDrafts.set(form.dataset.id,form.querySelector('textarea').value));
-  const missingReply=[...host.querySelectorAll('form.smokeReply')].find(form=>!payload.items.some(item=>item.request?.id===form.dataset.id));
-  if(missingReply){keepLastSmokeView('Request missing from refresh; showing last loaded requests');return}
-  if(payload.errors.length&&!payload.items.length){
-    err(payload.errors.join('\n'));
-    if(smokeHasLoaded){keepLastSmokeView('Requests unreadable; showing last loaded requests');return}
-    smokeRefreshUnavailable=true;
-    document.querySelector('#smokeStatus').textContent=`${payload.errors.length} unreadable record(s)`;
-    host.innerHTML='<div class="empty">Smoke requests could not be read.</div>';
-    return;
-  }
   smokeRefreshUnavailable=!readFresh('smoke');smokeHasLoaded=true;
   payload.items.forEach(reconcileSmokeRun);
   document.querySelector('#smokeStatus').textContent=payload.errors?.length?`${payload.errors.length} unreadable record(s)`:items.length?`${items.length} request(s)`:'No requests';
@@ -323,7 +330,7 @@ async function loadSmoke(){
     if(!r.ok)throw new Error(await r.text());
     const payload=await r.json();
     if(generation!==smokeLoadGeneration)return;
-    if(payload.schema!=='gpu-greenroom.smoke-request-list.v1'||!Array.isArray(payload.items)||!Array.isArray(payload.errors))throw new Error('Invalid smoke request list response');
+    validateSmokePayload(payload);
     readStamp('smoke',payload.observed_at);renderSmoke(payload);
   }catch(e){
     if(generation!==smokeLoadGeneration)return;
@@ -356,7 +363,7 @@ function askCancel(id,force=false){
 }
 async function confirmCancel(){const selection=cancelSelection;if(!selection)return;document.querySelector('#cancelDialog').close();try{await post('/api/job-cancel',selection)}catch(e){err(e.message)}}
 async function act(kind,id){askCancel(id,kind==='kill')}
-document.querySelector('#pause').onclick=()=>post('/api/pause',{requested_by:'operator-console'}).catch(e=>err(e.message));document.querySelector('#resume').onclick=()=>post('/api/resume',{requested_by:'operator-console',epoch:last?.pause_state?.epoch}).catch(e=>err(e.message));document.querySelector('#refresh').onclick=load;document.querySelector('#refreshSmoke').onclick=loadSmoke;bindDropTargets();updateFreshness();load();loadSmoke();setInterval(()=>{if(!queueLoading)load();if(!smokeLoading)loadSmoke()},pollMs);setInterval(updateFreshness,1000);document.addEventListener('visibilitychange',()=>{updateFreshness();if(!document.hidden){load();loadSmoke()}});
+document.querySelector('#pause').onclick=()=>post('/api/pause',{requested_by:'operator-console'}).catch(e=>err(e.message));document.querySelector('#resume').onclick=()=>post('/api/resume',{requested_by:'operator-console',epoch:last?.pause_state?.epoch}).catch(e=>err(e.message));document.querySelector('#refresh').onclick=load;document.querySelector('#refreshSmoke').onclick=loadSmoke;bindDropTargets();initFreshness();updateFreshness();load();loadSmoke();setInterval(()=>{if(liveQueueView()&&!queueLoading)load();if(!smokeLoading)loadSmoke()},pollMs);setInterval(updateFreshness,1000);document.addEventListener('visibilitychange',()=>{updateFreshness();if(!document.hidden){load();loadSmoke()}});
 </script></body></html>"""
 
 
