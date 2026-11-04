@@ -143,6 +143,7 @@ gpu-greenroom submit-command --manifest /path/to/gpu-greenroom.command.json
 # Worker
 gpu-greenroom worker [--poll SECONDS]  # runs jobs sequentially, reloads job_types.json every poll
 gpu-greenroom pause --owner NAME --epoch ID     # finishes the current job, then waits
+gpu-greenroom panic [--owner NAME] [--reason TEXT] [--kill-unmanaged-webgpu] # pause immediately + SIGKILL running child group
 gpu-greenroom resume --owner NAME --epoch ID    # epoch must match the observed pause
 gpu-greenroom recover                  # move running jobs whose worker PID is gone to failed/
 gpu-greenroom doctor --json            # executable discovery, imports, queue writes, dispatch availability
@@ -356,12 +357,13 @@ display results without reading the queue.
 | `runtime_identity` | The identity probe failed or exited non-zero |
 | `launch` | Subprocess failed to start |
 | `execution` | Subprocess exited non-zero |
+| `metal_gpu_timeout` | Subprocess failed with a Metal command-buffer timeout (`kIOGPUCommandBufferCallbackErrorTimeout`); the worker automatically pauses the queue (`owner: "gpu-greenroom:watchdog"`, `contention_class: "metal_gpu_timeout"`) so no subsequent job is dispatched onto a wedged GPU driver |
 | `timeout` | Subprocess exceeded the configured timeout and its process group was quiesced |
 | `worker_shutdown` | The worker was asked to stop; the owned process group was quiesced |
 | `source_postflight` | Input or its commit changed during execution |
 | `metadata` | Could not write `metadata.json` |
 | `artifact_manifest` | A manifest pattern matched nothing or a non-file |
-| `stale_recovery` | Worker died without cleanup; moved to `failed/` by `recover` |
+| `stale_recovery` | Worker died without cleanup; moved to `failed/` by `recover` (preserving `last_observed_alive_at` from `heartbeat.json` and `correlated_windowserver_restart` when macOS `WindowServer` restarted between job launch and recovery) |
 | `completion_quiescence_unresolved` | Leader exited but the process group could not be confirmed dead; job stays in `running/`, receipt status `ownership_unknown` |
 | `timeout_quiescence_unresolved` | Timed out and the process group could not be quiesced; same handling |
 | `worker_shutdown_quiescence_unresolved` | Worker stopped and the process group could not be quiesced; same handling |

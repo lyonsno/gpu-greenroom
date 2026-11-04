@@ -32,6 +32,17 @@ DEFAULT_WORKER_CAPABILITIES = frozenset({STRUCTURED_COMMAND_CAPABILITY})
 PAUSE_STATE_SCHEMA = "gpu-greenroom.pause-state.v1"
 PAUSE_ACK_SCHEMA = "gpu-greenroom.pause-acknowledgement.v1"
 TERMINATION_RECEIPT_SCHEMA = "gpu-greenroom.running-job-termination.v1"
+PANIC_RECEIPT_SCHEMA = "gpu-greenroom.panic-receipt.v1"
+HEARTBEAT_SCHEMA = "gpu-greenroom.job-heartbeat.v1"
+NOW_PLAYING_SCHEMA = "gpu-greenroom.now-playing.v1"
+DEFAULT_MIN_FREE_BYTES = 1024 * 1024 * 1024  # 1 GiB minimum free disk floor
+METAL_GPU_TIMEOUT_PATTERNS = (
+    "kIOGPUCommandBufferCallbackErrorTimeout",
+    "Caused GPU Timeout Error",
+    "[METAL] Command buffer execution failed",
+    "MTLCommandBufferErrorTimeout",
+    "IMP: GPU timeout",
+)
 
 
 class _DarwinProcBsdInfo(ctypes.Structure):
@@ -150,11 +161,16 @@ class GPUQueue:
 
     VOLATILE_PREFIXES = ("/tmp", "/private/tmp", "/var/tmp")
 
-    def __init__(self, queue_dir: str | Path):
+    def __init__(self, queue_dir: str | Path, *, min_free_bytes: int | None = None):
         self.queue_dir = Path(queue_dir)
         self._worker_shutdown_requested = False
         self._owned_child: subprocess.Popen | None = None
         self._owned_process_group: int | None = None
+        self._heartbeat_interval_seconds: float = 2.0
+        self._cached_windowserver_pid: int | None = None
+        self.min_free_bytes: int = (
+            DEFAULT_MIN_FREE_BYTES if min_free_bytes is None else int(min_free_bytes)
+        )
         for sub in ("pending", "deferred", "running", "done", "failed", "cancelled", "outputs"):
             (self.queue_dir / sub).mkdir(parents=True, exist_ok=True)
         for sub in (
@@ -202,6 +218,10 @@ class GPUQueue:
     @property
     def control_receipts_dir(self) -> Path:
         return self.queue_dir / "control-receipts"
+
+    @property
+    def now_playing_path(self) -> Path:
+        return self.queue_dir / "now-playing.json"
 
     @contextmanager
     def _coordination_lock(self):
@@ -341,6 +361,109 @@ class GPUQueue:
             return True
         except ProcessLookupError:
             return False
+
+    def _windowserver_start_identity(self) -> str | None:
+        if sys.platform != "darwin":
+            return None
+        if self._cached_windowserver_pid is not None:
+            ident = self._process_start_identity(self._cached_windowserver_pid)
+            if ident:
+                return ident
+            self._cached_windowserver_pid = None
+        try:
+            res = subprocess.run(
+                ["pgrep", "-x", "WindowServer"],
+                capture_output=True,
+                text=True,
+                timeout=1.0,
+                check=False,
+            )
+            lines = [line.strip() for line in res.stdout.splitlines() if line.strip()]
+            if not lines:
+                return None
+            ws_pid = int(lines[0])
+            ident = self._process_start_identity(ws_pid)
+            if ident:
+                self._cached_windowserver_pid = ws_pid
+                return ident
+            return None
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return None
+
+    def _write_job_heartbeat(
+        self,
+        job_dir: Path,
+        state: JobState,
+        *,
+        ws_at_launch: str | None = None,
+    ) -> None:
+        now = time.time()
+        state.last_observed_alive_at = now
+        payload = {
+            "schema": HEARTBEAT_SCHEMA,
+            "job_id": state.job_id,
+            "started_at": state.started_at,
+            "last_observed_alive_at": now,
+            "windowserver_start_identity_at_launch": ws_at_launch,
+            "windowserver_start_identity_last": ws_at_launch,
+        }
+        try:
+            self._write_json_atomic(job_dir / "heartbeat.json", payload)
+        except OSError:
+            pass
+
+    def _update_job_heartbeat(self, job_dir: Path, state: JobState) -> None:
+        hb_path = job_dir / "heartbeat.json"
+        now = time.time()
+        state.last_observed_alive_at = now
+        try:
+            existing = json.loads(hb_path.read_text()) if hb_path.exists() else {}
+        except (OSError, ValueError):
+            existing = {}
+        ws_launch = existing.get("windowserver_start_identity_at_launch")
+        payload = {
+            "schema": HEARTBEAT_SCHEMA,
+            "job_id": state.job_id,
+            "started_at": state.started_at,
+            "last_observed_alive_at": now,
+            "windowserver_start_identity_at_launch": ws_launch,
+            "windowserver_start_identity_last": existing.get(
+                "windowserver_start_identity_last", ws_launch
+            ),
+        }
+        try:
+            self._write_json_atomic(hb_path, payload)
+        except OSError:
+            pass
+
+    def _write_now_playing(self, payload: dict) -> None:
+        try:
+            self._write_json_atomic(
+                self.now_playing_path,
+                {"schema": NOW_PLAYING_SCHEMA, **payload, "updated_at": time.time()},
+            )
+        except OSError:
+            pass
+
+    @staticmethod
+    def _detect_metal_gpu_timeout(stderr_path: Path) -> str | None:
+        try:
+            if not stderr_path.is_file():
+                return None
+            with stderr_path.open("rb") as stream:
+                stream.seek(0, os.SEEK_END)
+                size = stream.tell()
+                stream.seek(max(0, size - 65536), os.SEEK_SET)
+                tail = stream.read().decode("utf-8", errors="replace")
+        except OSError:
+            return None
+        for line in reversed(tail.splitlines()):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if any(pat in stripped for pat in METAL_GPU_TIMEOUT_PATTERNS):
+                return stripped[:240]
+        return None
 
     @classmethod
     def _quiesce_owned_child(
@@ -508,6 +631,94 @@ class GPUQueue:
             self._write_json_atomic(receipt_path, receipt)
             return receipt
 
+    def panic(
+        self,
+        *,
+        owner: str = "operator-panic",
+        reason: str = "Emergency GPU panic stop",
+        kill_unmanaged_webgpu: bool = False,
+    ) -> dict:
+        """One-command emergency stop: atomically pause the queue and SIGKILL any running child group."""
+        if not owner.strip() or not reason.strip():
+            raise ValueError("owner and reason are required for panic")
+        pause_ack = self.pause(owner=owner, contention_class="panic")
+        terminated_jobs: list[dict] = []
+        skipped_jobs: list[dict] = []
+        running_dir = self.queue_dir / "running"
+        if running_dir.is_dir():
+            for job_dir in sorted(running_dir.iterdir()):
+                if not job_dir.is_dir():
+                    continue
+                try:
+                    term_receipt = self.terminate_running(
+                        job_dir.name,
+                        requested_by=owner,
+                        reason=reason,
+                        signal_number=signal.SIGKILL,
+                    )
+                    terminated_jobs.append(term_receipt)
+                except Exception as exc:
+                    skipped_jobs.append({"job_id": job_dir.name, "reason": str(exc)})
+
+        killed_unmanaged_webgpu: list[dict] = []
+        if kill_unmanaged_webgpu:
+            try:
+                res = subprocess.run(
+                    ["ps", "-ax", "-o", "pid=,pgid=,command="],
+                    capture_output=True,
+                    text=True,
+                    timeout=2.0,
+                    check=False,
+                )
+                seen_pgids: set[int] = set()
+                for line in res.stdout.splitlines():
+                    parts = line.strip().split(None, 2)
+                    if len(parts) < 3:
+                        continue
+                    pid_s, pgid_s, cmd_s = parts
+                    if (
+                        "--enable-unsafe-webgpu" in cmd_s
+                        and ("--headless" in cmd_s or "chrome-headless-shell" in cmd_s)
+                    ):
+                        try:
+                            pgid = int(pgid_s)
+                            pid = int(pid_s)
+                        except ValueError:
+                            continue
+                        if pgid <= 1 or pgid == os.getpgid(0) or pgid in seen_pgids:
+                            continue
+                        seen_pgids.add(pgid)
+                        try:
+                            os.killpg(pgid, signal.SIGKILL)
+                            killed_unmanaged_webgpu.append(
+                                {"pid": pid, "process_group": pgid, "status": "sigkill_sent"}
+                            )
+                        except OSError as exc:
+                            killed_unmanaged_webgpu.append(
+                                {"pid": pid, "process_group": pgid, "status": "failed", "error": str(exc)}
+                            )
+            except (OSError, subprocess.SubprocessError):
+                pass
+
+        receipt_path = self.control_receipts_dir / f"{time.time_ns()}-panic.json"
+        report = {
+            "schema": PANIC_RECEIPT_SCHEMA,
+            "action": "panic",
+            "owner": owner,
+            "reason": reason,
+            "paused": True,
+            "pause_epoch": pause_ack.get("epoch"),
+            "pause_acknowledgement": pause_ack,
+            "terminated_jobs": terminated_jobs,
+            "skipped_jobs": skipped_jobs,
+            "killed_unmanaged_webgpu": killed_unmanaged_webgpu,
+            "effective_queue_dir": str(self.queue_dir.resolve()),
+            "receipt_path": str(receipt_path),
+            "triggered_at": time.time(),
+        }
+        self._write_json_atomic(receipt_path, report)
+        return report
+
     def request_cancel(self, **kwargs) -> dict:
         from .cancellation import request
         return request(self, **kwargs)
@@ -622,6 +833,61 @@ class GPUQueue:
         with self._coordination_lock():
             return self._read_pause_state_locked()
 
+    def _pause_locked(
+        self,
+        *,
+        owner: str = "local",
+        epoch: str | None = None,
+        contention_class: str | None = None,
+        requested_at: float | None = None,
+    ) -> dict:
+        explicit_epoch = epoch is not None
+        requested_at = time.time() if requested_at is None else requested_at
+        existing = self._read_pause_state_locked()
+        if existing is not None:
+            observed_epoch = existing.get("epoch")
+            if explicit_epoch and observed_epoch != epoch:
+                raise PauseStateError(
+                    f"queue is already paused under epoch {observed_epoch!r}",
+                    expected_epoch=epoch,
+                    observed_epoch=observed_epoch,
+                )
+            return {
+                "schema": PAUSE_ACK_SCHEMA,
+                "action": "pause",
+                "owner": existing.get("owner"),
+                "epoch": observed_epoch,
+                "queue_dir": str(self.queue_dir.resolve()),
+                "acknowledged_at": time.time(),
+                "effective_paused": True,
+                "idempotent": True,
+                "pause_state": existing,
+            }
+
+        effective_at = time.time()
+        state = {
+            "schema": PAUSE_STATE_SCHEMA,
+            "status": "effective",
+            "owner": owner,
+            "epoch": epoch or uuid.uuid4().hex,
+            "contention_class": contention_class,
+            "queue_dir": str(self.queue_dir.resolve()),
+            "requested_at": requested_at,
+            "effective_at": effective_at,
+        }
+        self._write_json_atomic(self.pause_path, state)
+        return {
+            "schema": PAUSE_ACK_SCHEMA,
+            "action": "pause",
+            "owner": state["owner"],
+            "epoch": state["epoch"],
+            "queue_dir": state["queue_dir"],
+            "acknowledged_at": effective_at,
+            "effective_paused": True,
+            "idempotent": False,
+            "pause_state": state,
+        }
+
     def pause(
         self,
         *,
@@ -631,53 +897,13 @@ class GPUQueue:
         requested_at: float | None = None,
     ) -> dict:
         """Linearize queued-to-running pause and return the native acknowledgement."""
-        explicit_epoch = epoch is not None
-        requested_at = time.time() if requested_at is None else requested_at
         with self._coordination_lock():
-            existing = self._read_pause_state_locked()
-            if existing is not None:
-                observed_epoch = existing.get("epoch")
-                if explicit_epoch and observed_epoch != epoch:
-                    raise PauseStateError(
-                        f"queue is already paused under epoch {observed_epoch!r}",
-                        expected_epoch=epoch,
-                        observed_epoch=observed_epoch,
-                    )
-                return {
-                    "schema": PAUSE_ACK_SCHEMA,
-                    "action": "pause",
-                    "owner": existing.get("owner"),
-                    "epoch": observed_epoch,
-                    "queue_dir": str(self.queue_dir.resolve()),
-                    "acknowledged_at": time.time(),
-                    "effective_paused": True,
-                    "idempotent": True,
-                    "pause_state": existing,
-                }
-
-            effective_at = time.time()
-            state = {
-                "schema": PAUSE_STATE_SCHEMA,
-                "status": "effective",
-                "owner": owner,
-                "epoch": epoch or uuid.uuid4().hex,
-                "contention_class": contention_class,
-                "queue_dir": str(self.queue_dir.resolve()),
-                "requested_at": requested_at,
-                "effective_at": effective_at,
-            }
-            self._write_json_atomic(self.pause_path, state)
-            return {
-                "schema": PAUSE_ACK_SCHEMA,
-                "action": "pause",
-                "owner": state["owner"],
-                "epoch": state["epoch"],
-                "queue_dir": state["queue_dir"],
-                "acknowledged_at": effective_at,
-                "effective_paused": True,
-                "idempotent": False,
-                "pause_state": state,
-            }
+            return self._pause_locked(
+                owner=owner,
+                epoch=epoch,
+                contention_class=contention_class,
+                requested_at=requested_at,
+            )
 
     def resume(
         self,
@@ -1780,6 +2006,36 @@ class GPUQueue:
                 if job_dir is None:
                     return False
 
+                try:
+                    min_free = int(
+                        os.environ.get("GPU_GREENROOM_MIN_FREE_BYTES", str(self.min_free_bytes))
+                    )
+                except ValueError:
+                    min_free = self.min_free_bytes
+                if min_free > 0:
+                    try:
+                        free_bytes = shutil.disk_usage(self.queue_dir).free
+                    except OSError:
+                        free_bytes = None
+                    if free_bytes is not None and free_bytes < min_free:
+                        pause_ack = self._pause_locked(
+                            owner="gpu-greenroom:watchdog",
+                            contention_class="disk_headroom_low",
+                        )
+                        dispatch.atomic_write(
+                            self.queue_dir / "dispatch-error.json",
+                            {
+                                "schema": "gpu-greenroom.dispatch-error.v1",
+                                "phase": "disk_headroom_low",
+                                "free_bytes": free_bytes,
+                                "min_free_bytes": min_free,
+                                "pause_epoch": pause_ack.get("epoch"),
+                                "observed_at": time.time(),
+                                "worker": effective_claimant,
+                            },
+                        )
+                        return False
+
                 raw_request, request_digest = dispatch.read_request(job_dir / 'request.json')
                 request = JobRequest.from_json(json.dumps(raw_request))
                 try:
@@ -1941,6 +2197,9 @@ class GPUQueue:
             run_env.pop('GPU_GREENROOM_READY_FD',None)
             run_env.pop('GPU_GREENROOM_RESUME_CHECKPOINT',None)
             run_env['GPU_GREENROOM_CANCEL_REQUEST'] = str((job_dir/'cancel-request.json').resolve())
+            run_env['GREENROOM_JOB_ID'] = request.job_id
+            run_env['GPU_GREENROOM_JOB_ID'] = request.job_id
+            run_env['GPU_GREENROOM_QUEUE_DIR'] = str(self.queue_dir.resolve())
             if request.cooperative_checkpoint and (job_env or {}).get('GPU_GREENROOM_RESUME_CHECKPOINT'):
                 if not request.params.get('continuation_of') or not request.params.get('checkpoint_sha256'):
                     state.status=JobStatus.FAILED
@@ -2035,6 +2294,8 @@ class GPUQueue:
             ready_read=ready_write=None
             launch_cmd = cmd
             performance_report = None
+            metal_timeout_line = None
+            watchdog_auto_pause_epoch = None
 
             if state.status == JobStatus.RUNNING:
                 try:
@@ -2061,6 +2322,23 @@ class GPUQueue:
                             child_options['pass_fds']=(ready_read,)
                         if request.performance_window is not None:
                             launch_cmd = performance_window.runner_command(job_dir, request, cmd, job_timeout)
+                        self._write_now_playing(
+                            {
+                                "active": True,
+                                "job_id": state.job_id,
+                                "job_type": state.job_type,
+                                "agent_id": request.agent_id,
+                                "repo_root": request.repo_root,
+                                "requested_route": request.route_identity,
+                                "effective_route": state.effective_route,
+                                "service_class": (state.dispatch or {}).get("service_class"),
+                                "started_at": state.started_at,
+                                "worker_pid": state.worker_pid,
+                                "child_pid": None,
+                                "child_process_group": None,
+                                "child_start_identity": None,
+                            }
+                        )
                         proc = subprocess.Popen(
                             launch_cmd,
                             stdout=out_f,
@@ -2083,7 +2361,27 @@ class GPUQueue:
                         state.child_start_identity = self._process_start_identity(proc.pid)
                         if not state.child_start_identity:
                             raise RuntimeError("could not record child process start identity")
+                        state.last_observed_alive_at = time.time()
                         self._write_text_atomic(job_dir / "status.json", state.to_json())
+                        ws_at_launch = self._windowserver_start_identity()
+                        self._write_job_heartbeat(job_dir, state, ws_at_launch=ws_at_launch)
+                        self._write_now_playing(
+                            {
+                                "active": True,
+                                "job_id": state.job_id,
+                                "job_type": state.job_type,
+                                "agent_id": request.agent_id,
+                                "repo_root": request.repo_root,
+                                "requested_route": request.route_identity,
+                                "effective_route": state.effective_route,
+                                "service_class": (state.dispatch or {}).get("service_class"),
+                                "started_at": state.started_at,
+                                "worker_pid": state.worker_pid,
+                                "child_pid": state.child_pid,
+                                "child_process_group": state.child_process_group,
+                                "child_start_identity": state.child_start_identity,
+                            }
+                        )
                         if ready_write is not None:
                             try:
                                 os.write(ready_write,b'1')
@@ -2109,9 +2407,24 @@ class GPUQueue:
                         state.status = JobStatus.DONE
                         dest_status = "done"
                     else:
+                        metal_timeout_line = self._detect_metal_gpu_timeout(stderr_path)
                         state.status = JobStatus.FAILED
-                        state.failure_phase = "execution"
-                        state.error_message = f"Process exited with code {state.exit_code}"
+                        if metal_timeout_line:
+                            state.failure_phase = "metal_gpu_timeout"
+                            state.error_message = (
+                                f"Metal GPU command buffer timeout (exit code {state.exit_code}): "
+                                f"{metal_timeout_line}"
+                            )
+                            if "metal_gpu_timeout" not in state.warnings:
+                                state.warnings.append("metal_gpu_timeout")
+                            pause_ack = self.pause(
+                                owner="gpu-greenroom:watchdog",
+                                contention_class="metal_gpu_timeout",
+                            )
+                            watchdog_auto_pause_epoch = pause_ack.get("epoch")
+                        else:
+                            state.failure_phase = "execution"
+                            state.error_message = f"Process exited with code {state.exit_code}"
                         dest_status = "failed"
                 except subprocess.TimeoutExpired:
                     if self._quiesce_owned_child(proc, state.child_process_group):
@@ -2307,6 +2620,9 @@ class GPUQueue:
                 "exit_code": state.exit_code,
                 "failure_phase": state.failure_phase,
                 "error_message": state.error_message,
+                "metal_gpu_timeout": True if metal_timeout_line else None,
+                "metal_gpu_timeout_signature": metal_timeout_line,
+                "watchdog_auto_pause_epoch": watchdog_auto_pause_epoch,
                 "warnings": state.warnings if state.warnings else None,
                 "request_path": str(final_job_dir / "request.json"),
                 "stdout_path": str(final_job_dir / "stdout.log"),
@@ -2364,6 +2680,18 @@ class GPUQueue:
                 self._write_json_atomic(job_dir / "receipt.json", receipt)
                 if not ownership_unresolved:
                     self._move_job(job_dir, dest_status)
+                self._write_now_playing(
+                    {
+                        "active": False,
+                        "ownership_unresolved": ownership_unresolved,
+                        "last_job_id": state.job_id,
+                        "last_status": (
+                            "ownership_unknown" if ownership_unresolved else state.status.value
+                        ),
+                        "last_failure_phase": state.failure_phase,
+                        "finished_at": state.finished_at,
+                    }
+                )
             if dispatch_policy.get('runtime_history'):
                 from .runtime_history import record_completion
                 try:
@@ -2508,12 +2836,36 @@ class GPUQueue:
                 except (OSError, ValueError, TypeError, KeyError):
                     pass
 
+                heartbeat_path = job_dir / "heartbeat.json"
+                heartbeat = {}
+                if heartbeat_path.is_file():
+                    try:
+                        heartbeat = json.loads(heartbeat_path.read_text())
+                    except (OSError, ValueError):
+                        heartbeat = {}
+                ws_at_launch = heartbeat.get("windowserver_start_identity_at_launch")
+                ws_at_recovery = self._windowserver_start_identity()
+                correlated_ws = bool(
+                    ws_at_launch and ws_at_recovery and ws_at_launch != ws_at_recovery
+                )
+
                 state.status = JobStatus.FAILED
                 state.finished_at = time.time()
+                state.last_observed_alive_at = (
+                    heartbeat.get("last_observed_alive_at") or state.started_at
+                )
+                state.correlated_windowserver_restart = correlated_ws
+                if correlated_ws and "correlated_windowserver_restart" not in state.warnings:
+                    state.warnings.append("correlated_windowserver_restart")
                 state.failure_phase = "stale_recovery"
                 state.error_message = (
                     f"Exact child {state.child_pid} and process group "
                     f"{state.child_process_group} are no longer alive"
+                    + (
+                        " (WindowServer restart detected between job launch and recovery)"
+                        if correlated_ws
+                        else ""
+                    )
                 )
                 state.exit_code = -1
                 self._write_text_atomic(status_file, state.to_json())
@@ -2528,7 +2880,13 @@ class GPUQueue:
                     "child_process_group": state.child_process_group,
                     "child_start_identity": state.child_start_identity,
                     "started_at": state.started_at,
+                    "last_observed_alive_at": state.last_observed_alive_at,
+                    "recovered_at": state.finished_at,
                     "finished_at": state.finished_at,
+                    "windowserver_start_identity_at_launch": ws_at_launch,
+                    "windowserver_start_identity_at_recovery": ws_at_recovery,
+                    "correlated_windowserver_restart": correlated_ws,
+                    "warnings": state.warnings if state.warnings else None,
                 }
                 self._write_json_atomic(job_dir / "receipt.json", receipt)
 

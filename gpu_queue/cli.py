@@ -461,6 +461,16 @@ def cmd_pause(args):
     print(json.dumps(acknowledgement, indent=2))
 
 
+def cmd_panic(args):
+    queue = get_queue(args)
+    report = queue.panic(
+        owner=args.owner,
+        reason=args.reason,
+        kill_unmanaged_webgpu=bool(getattr(args, "kill_unmanaged_webgpu", False)),
+    )
+    print(json.dumps(report, indent=2))
+
+
 def cmd_resume(args):
     queue = get_queue(args)
     try:
@@ -976,6 +986,20 @@ def main():
     p_pause.add_argument("--owner", default="local-cli")
     p_pause.add_argument("--epoch")
     p_pause.set_defaults(func=cmd_pause)
+
+    # panic
+    p_panic = sub.add_parser(
+        "panic",
+        help="One-command emergency stop: pause queue and SIGKILL any running child process group",
+    )
+    p_panic.add_argument("--owner", default="local-cli-panic")
+    p_panic.add_argument("--reason", default="Emergency GPU panic stop")
+    p_panic.add_argument(
+        "--kill-unmanaged-webgpu",
+        action="store_true",
+        help="Also SIGKILL any headless Chromium --enable-unsafe-webgpu process groups",
+    )
+    p_panic.set_defaults(func=cmd_panic)
 
     # resume
     p_resume = sub.add_parser("resume", help="Resume a paused queue")

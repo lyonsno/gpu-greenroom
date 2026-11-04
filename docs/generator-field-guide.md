@@ -157,6 +157,54 @@ prepare, run, or interpret a job. Name the effective route and version when the
 behavior may be implementation-specific. When later evidence disagrees, narrow
 or supersede the rule; do not silently preserve the stronger wording.
 
+## Apple Silicon Metal & WebGPU Pacing Guardrails (WindowServer Protection)
+
+On Apple Silicon unified memory, macOS `WindowServer` shares the single GPU hardware
+command queue and unified memory pool with every MLX, PyTorch MPS, and Dawn/WebGPU
+workload. A single unchunked Metal command buffer that exceeds the macOS IOGPU hardware
+watchdog (~5–10 seconds) triggers `kIOGPUCommandBufferCallbackErrorTimeout`, wedges
+the `AGXG16X` driver at 100% perf state, and causes the userspace watchdog to terminate
+`WindowServer`.
+
+Apply these mandatory guardrails across all MLX, MPS, and WebGPU routes:
+
+1. **No lazy-graph fuses across weight loading (`mx.eval()` per shard):**
+   Never attach lazy `mx.transpose(...)`, `.astype(...)`, or delta reconstruction graphs
+   across hundreds of layers in `__init__` and defer evaluation to Token 1 / Step 1.
+   Call `mx.eval(...)` and `mx.clear_cache()` after each shard or transformer block during
+   model initialization so Token 1 executes only the forward pass.
+2. **O(1) CPU header hashes for checkpoint provenance:**
+   Never dequantize model weights on the GPU merely to compute provenance hashes or verify
+   shapes in `__init__`. Hash the safetensors header / file bytes on CPU in O(1) memory.
+3. **Step-1 timing gate (`mx.eval()` / `torch.mps.synchronize()`):**
+   Synchronize explicitly after Step 1 / Token 1 and log `step1_elapsed_ms` before
+   entering a multi-step loop or benchmark.
+4. **Chunk custom Metal compute kernels:**
+   Cap custom `mx.fast.metal_kernel` dispatches to `<= 256k–512k` queries per `mx.eval()`
+   with a `15 ms` sleep between chunks so `WindowServer` can interleave compositor frames.
+5. **WebGPU WindowServer Breathing Rule (`onSubmittedWorkDone()` + `16 ms` yield):**
+   Never run a synchronous `for (let i = 0; i < N; i++) step()` loop or uncapped headless
+   `requestAnimationFrame` in Chromium/Playwright. Every multi-step WebGPU advance loop
+   must `await device.queue.onSubmittedWorkDone()` and `await new Promise(r => setTimeout(r, 16))`
+   every `1–4` steps, and enforce a Step-1 frame budget (`maxStepMs = 25 ms`).
+   Avoid WGSL `select(a, b, cond)` when `a` or `b` is an expensive function call (`select`
+   evaluates both branches eagerly in WGSL; use `if / else`).
+6. **Pre-allocate WebGPU bind groups and dispose multi-variant scenes:**
+   Never call `device.createBindGroup` or `device.createBuffer` inside per-step inner loops.
+   In multi-variant Playwright captures, explicitly `.dispose()` geometries/textures/render
+   targets, `await device.queue.onSubmittedWorkDone()`, and sleep `50 ms` before loading
+   the next variant.
+7. **Mandatory Greenroom admission for all Metal/WebGPU fixtures:**
+   Pure CPU unit tests (`OMP_NUM_THREADS=1`, zero Metal/MPS/MLX/WebGPU) may run inline.
+   Any script or test that initializes `mlx`, `torch.mps`, or headless Chromium
+   `--enable-unsafe-webgpu`—even a 2-second `256x256` smoke—must run through
+   `gpu-greenroom` (`--service-class quick` for `<= 15s` smokes, `normal` for full runs).
+   Weight loaders for full models (`> 64 MiB`) should verify `os.environ.get("GREENROOM_JOB_ID")`
+   (injected automatically by the Greenroom worker).
+8. **Emergency stop (`gpu-greenroom panic`):**
+   If a job causes desktop stutter or runaway GPU occupancy, run `gpu-greenroom panic` to
+   atomically pause the queue and `SIGKILL` the active running child process group.
+
 Keep implementation details in the owning generator README:
 
 - [mlx-ideogram4](https://github.com/lyonsno/mlx-ideogram4) for FLUX/MFLUX;

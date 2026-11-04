@@ -179,8 +179,15 @@ def wait(queue, job, state, proc, timeout):
     """Only the worker signals its owned child; acceptance is not quiescence."""
     import subprocess
     started = time.monotonic()
+    last_heartbeat = started
+    heartbeat_interval = float(getattr(queue, '_heartbeat_interval_seconds', 2.0))
     delivered = None
     while proc.poll() is None:
+        now_mono = time.monotonic()
+        if now_mono - last_heartbeat >= heartbeat_interval:
+            if hasattr(queue, '_update_job_heartbeat'):
+                queue._update_job_heartbeat(job, state)
+            last_heartbeat = now_mono
         record = read_request(job, state)
         desired = signal.SIGKILL if record and record['force'] else signal.SIGTERM
         if record and desired != delivered:
@@ -199,8 +206,9 @@ def wait(queue, job, state, proc, timeout):
         remaining = None if timeout is None else timeout-(time.monotonic()-started)
         if remaining is not None and remaining <= 0:
             raise subprocess.TimeoutExpired(proc.args, timeout)
+        wait_slice = min(0.2, max(0.01, heartbeat_interval))
         try:
-            return proc.wait(timeout=.2 if remaining is None else min(.2, remaining))
+            return proc.wait(timeout=wait_slice if remaining is None else min(wait_slice, remaining))
         except subprocess.TimeoutExpired:
             continue
     return proc.returncode

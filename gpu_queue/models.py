@@ -89,6 +89,8 @@ class JobState:
     child_pid: int | None = None
     child_process_group: int | None = None
     child_start_identity: str | None = None
+    last_observed_alive_at: float | None = None
+    correlated_windowserver_restart: bool | None = None
     warnings: list[str] = field(default_factory=list)
     dispatch: dict | None = None
     performance_deferral: dict | None = None
