@@ -946,7 +946,7 @@ def main():
     # telemetry
     p_telemetry = sub.add_parser(
         "telemetry",
-        help="Summarize quick-route wait times, queue-jump savings, unlabeled quick routes, and pause efficiency",
+        help="Summarize observed wait times, bypass evidence, short normal jobs, and pause records",
     )
     p_telemetry.add_argument("--since-hours", type=float, default=None, help="Restrict analysis to the last N hours")
     p_telemetry.add_argument("--quick-threshold-seconds", type=float, default=30.0, help="Threshold in seconds for fast normal candidate detection (default: 30)")
