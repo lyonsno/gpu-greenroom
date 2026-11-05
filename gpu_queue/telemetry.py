@@ -9,7 +9,7 @@ from pathlib import Path
 
 from . import dispatch
 
-TELEMETRY_SCHEMA = "gpu-greenroom.telemetry.v1"
+TELEMETRY_SCHEMA = "gpu-greenroom.telemetry.v2"
 
 
 def _pct(sorted_vals: list[float], p: float) -> float:
@@ -236,18 +236,20 @@ def summarize_telemetry(
 
     queue_jumping_quick_jobs = 0
     total_bypassed_normal_jobs = 0
-    estimated_wait_saved_seconds = 0.0
+    bypassed_jobs_execution_seconds = 0.0
+    recorded_bypass_quick_jobs = 0
+    reconstructed_bypass_quick_jobs = 0
 
     wait_attribution = {
         "immediate_le_5s": 0,
-        "blocked_by_in_flight_job": 0,
-        "waited_behind_other_dispatches": 0,
-        "paused_or_external_lease_block": 0,
+        "overlapped_in_flight_job": 0,
+        "other_dispatches_during_wait": 0,
+        "unattributed": 0,
     }
 
     non_cooperative_blocker_count = 0
     cooperative_blocker_count = 0
-    potential_wait_reducible_seconds = 0.0
+    non_cooperative_overlap_seconds = 0.0
     blocker_route_stats: dict[str, dict] = defaultdict(
         lambda: {
             "route": "",
@@ -282,8 +284,11 @@ def summarize_telemetry(
         if bypassed_count > 0:
             queue_jumping_quick_jobs += 1
             total_bypassed_normal_jobs += bypassed_count
-            saved_for_q = sum((n["exec_s"] or 0.0) for n in bypassed_jobs)
-            estimated_wait_saved_seconds += saved_for_q
+            if isinstance(recorded_bypassed_ids, list):
+                recorded_bypass_quick_jobs += 1
+            else:
+                reconstructed_bypass_quick_jobs += 1
+            bypassed_jobs_execution_seconds += sum((n["exec_s"] or 0.0) for n in bypassed_jobs)
 
         # Attribute wait time using full started-job history so boundary jobs are never misattributed
         in_flight = [
@@ -302,11 +307,11 @@ def summarize_telemetry(
         if q_wait <= 5.0:
             wait_attribution["immediate_le_5s"] += 1
         elif started_before_q:
-            wait_attribution["waited_behind_other_dispatches"] += 1
+            wait_attribution["other_dispatches_during_wait"] += 1
         elif in_flight:
-            wait_attribution["blocked_by_in_flight_job"] += 1
+            wait_attribution["overlapped_in_flight_job"] += 1
         else:
-            wait_attribution["paused_or_external_lease_block"] += 1
+            wait_attribution["unattributed"] += 1
 
         if q_wait > 5.0 and in_flight:
             blocker = max(
@@ -330,7 +335,7 @@ def summarize_telemetry(
                 cooperative_blocker_count += 1
             else:
                 non_cooperative_blocker_count += 1
-                potential_wait_reducible_seconds += overlap_s
+                non_cooperative_overlap_seconds += overlap_s
 
     # Runtime hint accuracy on completed quick jobs (failed/cancelled tracked separately)
     hinted_quick_all = [
@@ -368,17 +373,9 @@ def summarize_telemetry(
         if quick_count
         else 0.0,
         "total_bypassed_normal_jobs": total_bypassed_normal_jobs,
-        "estimated_wait_saved_seconds": round(estimated_wait_saved_seconds, 2),
-        "mean_wait_saved_per_quick_job_seconds": round(
-            estimated_wait_saved_seconds / quick_count, 2
-        )
-        if quick_count
-        else 0.0,
-        "mean_wait_saved_when_jumping_seconds": round(
-            estimated_wait_saved_seconds / queue_jumping_quick_jobs, 2
-        )
-        if queue_jumping_quick_jobs
-        else 0.0,
+        "recorded_bypass_quick_jobs": recorded_bypass_quick_jobs,
+        "reconstructed_bypass_quick_jobs": reconstructed_bypass_quick_jobs,
+        "bypassed_jobs_observed_execution_seconds": round(bypassed_jobs_execution_seconds, 2),
         "wait_attribution": wait_attribution,
         "runtime_hint_accuracy": {
             "evaluated_quick_jobs": len(hinted_quick_done),
@@ -405,9 +402,8 @@ def summarize_telemetry(
     ]
     fast_waited_gt_60 = [r["wait_s"] for r in fast_waited_gt_60_jobs]
 
-    # Separate wait reducible by Quick classification (queued behind older slow normal jobs)
-    # from wait behind an already-running in-flight blocker or same-route batch bursts.
-    reducible_by_quick_bypass_seconds = 0.0
+    # These intervals suggest candidates; they do not simulate alternate scheduling.
+    other_route_slow_normal_overlap_seconds = 0.0
     for fn_job in fast_waited_gt_60_jobs:
         fn_sub = fn_job["submitted_at"]
         fn_start = fn_job["started_at"]
@@ -425,7 +421,7 @@ def summarize_telemetry(
             max(0.0, min(fn_start, o["finished_at"] or fn_start) - o["started_at"])
             for o in intervening_slow_normals
         )
-        reducible_by_quick_bypass_seconds += min(fn_job["wait_s"], bypassable_s)
+        other_route_slow_normal_overlap_seconds += min(fn_job["wait_s"], bypassable_s)
 
     normal_by_route: dict[str, list[dict]] = defaultdict(list)
     for r in normal_done:
@@ -467,14 +463,14 @@ def summarize_telemetry(
         "waited_gt_60s_count": len(fast_waited_gt_60),
         "waited_gt_60s_p50_seconds": _pct(sorted(fast_waited_gt_60), 50),
         "waited_gt_60s_p90_seconds": _pct(sorted(fast_waited_gt_60), 90),
-        "total_avoidable_wait_seconds": total_wait_gt_60_s,
-        "reducible_by_quick_bypass_seconds": round(
-            reducible_by_quick_bypass_seconds, 2
+        "observed_wait_gt_60s_seconds": total_wait_gt_60_s,
+        "observed_wait_overlap_with_other_route_slow_normals_seconds": round(
+            other_route_slow_normal_overlap_seconds, 2
         ),
-        "in_flight_or_same_route_batch_wait_seconds": round(
-            max(0.0, total_wait_gt_60_s - reducible_by_quick_bypass_seconds), 2
+        "wait_not_accounted_for_by_those_intervals_seconds": round(
+            max(0.0, total_wait_gt_60_s - other_route_slow_normal_overlap_seconds), 2
         ),
-        "candidate_routes": candidate_routes[:20],
+        "candidate_routes": candidate_routes,
     }
 
     # Pause & checkpoint events from events/, operator-actions/, and dispatch-policy.json
@@ -633,10 +629,10 @@ def summarize_telemetry(
             + cooperative_blocker_count,
             "non_cooperative_blocker_count": non_cooperative_blocker_count,
             "cooperative_blocker_count": cooperative_blocker_count,
-            "potential_wait_reducible_by_cooperative_pause_seconds": round(
-                potential_wait_reducible_seconds, 2
+            "observed_wait_overlap_with_non_cooperative_jobs_seconds": round(
+                non_cooperative_overlap_seconds, 2
             ),
-            "top_blocking_routes": top_blocking_routes[:10],
+            "top_blocking_routes": top_blocking_routes,
         },
     }
 
@@ -645,6 +641,12 @@ def summarize_telemetry(
         "queue_dir": str(root),
         "generated_at": now,
         "since_hours": since_hours,
+        "evidence_limits": {
+            "wait_intervals": "observed job-record timestamps; overlap is not proof of cause",
+            "bypass": "claim snapshot when present, otherwise interval reconstruction",
+            "savings": "not measured; no alternate-schedule replay",
+            "checkpoint_support": "producer declaration, not proof of effective GPU release",
+        },
         "total_evaluated_jobs": len(active_records),
         "external_lease_admissions_excluded": external_lease_admissions_count,
         "by_service_class": by_service_class,
@@ -681,34 +683,35 @@ def render_telemetry_text(report: dict) -> str:
 
     qe = report["quick_efficiency"]
     wa = qe["wait_attribution"]
-    lines.append("\n2. Quick Route Efficiency & Wait Attribution:")
+    lines.append("\n2. Quick Bypass Evidence & Wait Observations:")
     lines.append(
         f"  - Queue jumps: {qe['queue_jumping_quick_jobs']}/{qe['total_quick_jobs']} quick jobs "
         f"bypassed {qe['total_bypassed_normal_jobs']} queued normal jobs, "
-        f"saving ~{qe['estimated_wait_saved_seconds']:.1f}s "
-        f"({qe['mean_wait_saved_when_jumping_seconds']:.1f}s per jumping job)"
+        f"(claim-recorded={qe['recorded_bypass_quick_jobs']}, "
+        f"reconstructed={qe['reconstructed_bypass_quick_jobs']}); "
+        f"their observed execution={qe['bypassed_jobs_observed_execution_seconds']:.1f}s, not measured savings"
     )
     lines.append(
-        f"  - Why quick jobs waited: immediate(<=5s)={wa['immediate_le_5s']}, "
-        f"blocked_by_in_flight_job={wa['blocked_by_in_flight_job']}, "
-        f"waited_behind_other_dispatches={wa['waited_behind_other_dispatches']}, "
-        f"paused_or_lease={wa['paused_or_external_lease_block']}"
+        f"  - Wait observations (not causal attribution): immediate(<=5s)={wa['immediate_le_5s']}, "
+        f"overlapped_in_flight_job={wa['overlapped_in_flight_job']}, "
+        f"other_dispatches_during_wait={wa['other_dispatches_during_wait']}, "
+        f"unattributed={wa['unattributed']}"
     )
 
     fn = report["unlabeled_quick_candidates"]
     lines.append(
-        f"\n3. Unlabeled Quick Work ('False Normals' finishing <={fn['quick_threshold_seconds']:.0f}s as normal):"
+        f"\n3. Short Completed Normal Work (finished <={fn['quick_threshold_seconds']:.0f}s):"
     )
     lines.append(
         f"  - {fn['fast_normal_done_count']}/{fn['total_normal_done_count']} "
         f"({fn['fast_normal_fraction'] * 100:.1f}%) completed normal jobs finished <={fn['quick_threshold_seconds']:.0f}s; "
         f"{fn['waited_gt_60s_count']} waited >60s (wait p50={fn['waited_gt_60s_p50_seconds']:.1f}s, "
-        f"p90={fn['waited_gt_60s_p90_seconds']:.1f}s, total >60s wait={fn['total_avoidable_wait_seconds']:.1f}s; "
-        f"reducible by quick bypass={fn['reducible_by_quick_bypass_seconds']:.1f}s, "
-        f"in-flight/batch wait={fn['in_flight_or_same_route_batch_wait_seconds']:.1f}s)"
+        f"p90={fn['waited_gt_60s_p90_seconds']:.1f}s, observed >60s wait={fn['observed_wait_gt_60s_seconds']:.1f}s; "
+        f"overlap with other-route slow normals={fn['observed_wait_overlap_with_other_route_slow_normals_seconds']:.1f}s, "
+        f"remaining wait unaccounted for={fn['wait_not_accounted_for_by_those_intervals_seconds']:.1f}s)"
     )
     if fn["candidate_routes"]:
-        lines.append("  - Top candidate routes for quick_routes / --expected-seconds:")
+        lines.append(f"  - Top candidate routes ({min(8, len(fn['candidate_routes']))}/{len(fn['candidate_routes'])}; all in JSON), not eligibility proof:")
         for r in fn["candidate_routes"][:8]:
             lines.append(
                 f"      * {r['route']} (n={r['count']}, exec p50={r['exec_p50_seconds']:.1f}s max={r['exec_max_seconds']:.1f}s, "
@@ -719,7 +722,7 @@ def render_telemetry_text(report: dict) -> str:
     blk = pc["in_flight_blockers_of_quick_jobs"]
     lines.append("\n4. Pause & Cooperative Checkpoint Efficiency:")
     lines.append(
-        f"  - Per-job cooperative checkpointing (yields GPU): {pc['cooperative_checkpoint_jobs_count']} jobs "
+        f"  - Producer-declared cooperative checkpointing: {pc['cooperative_checkpoint_jobs_count']} jobs "
         f"({pc['cooperative_checkpoint_fraction'] * 100:.2f}%), "
         f"job pause actions={pc['job_pause_events_count']}, resumes={pc['job_resume_events_count']}, "
         f"committed handoffs={pc['committed_handoffs_count']}, "
@@ -731,8 +734,8 @@ def render_telemetry_text(report: dict) -> str:
         f"(recorded paused time={pc['total_recorded_paused_seconds']:.1f}s)"
     )
     lines.append(
-        f"  - In-flight blockers of quick jobs: {blk['non_cooperative_blocker_count']} non-cooperative, "
+        f"  - In-flight overlaps with quick waits: {blk['non_cooperative_blocker_count']} non-cooperative, "
         f"{blk['cooperative_blocker_count']} cooperative "
-        f"(reducible wait if cooperative={blk['potential_wait_reducible_by_cooperative_pause_seconds']:.1f}s)"
+        f"(observed non-cooperative overlap={blk['observed_wait_overlap_with_non_cooperative_jobs_seconds']:.1f}s, not predicted savings)"
     )
     return "\n".join(lines)

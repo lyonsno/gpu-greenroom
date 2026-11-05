@@ -306,7 +306,7 @@ def test_telemetry_summarizes_quick_wait_attribution_queue_jumps_false_normals_a
         finished_at=510.0,
         cooperative_checkpoint=False,
     )
-    # 3. Quick job submitted at t=120 while norm_blocker is running; jumps norm_queued and runs t=200..210 (wait=80s, saves 300s!)
+    # The later normal execution is observed; its counterfactual delay is not.
     _write_synthetic_completed_job(
         "quick_jumper",
         service_class="quick",
@@ -335,34 +335,36 @@ def test_telemetry_summarizes_quick_wait_attribution_queue_jumps_false_normals_a
     )
 
     report = summarize_telemetry(queue.queue_dir)
-    assert report["schema"] == "gpu-greenroom.telemetry.v1"
+    assert report["schema"] == "gpu-greenroom.telemetry.v2"
     assert report["by_service_class"]["quick"]["count"] == 1
     assert report["by_service_class"]["normal"]["count"] == 4
 
     qe = report["quick_efficiency"]
     assert qe["queue_jumping_quick_jobs"] == 1
     assert qe["total_bypassed_normal_jobs"] == 1
-    assert qe["estimated_wait_saved_seconds"] == 300.0
-    assert qe["wait_attribution"]["blocked_by_in_flight_job"] == 1
+    assert qe["bypassed_jobs_observed_execution_seconds"] == 300.0
+    assert qe["reconstructed_bypass_quick_jobs"] == 1
+    assert qe["recorded_bypass_quick_jobs"] == 0
+    assert qe["wait_attribution"]["overlapped_in_flight_job"] == 1
 
     fn = report["unlabeled_quick_candidates"]
     assert fn["fast_normal_done_count"] == 2
     assert fn["waited_gt_60s_count"] == 2
     # Both fast_norm_1 (submitted at 130) and fast_norm_2 (submitted at 140) waited while
     # norm_queued (started at 210, finished at 510, 300s) ran between their submission and start.
-    assert fn["reducible_by_quick_bypass_seconds"] == 600.0
+    assert fn["observed_wait_overlap_with_other_route_slow_normals_seconds"] == 600.0
     candidate_routes = [r["route"] for r in fn["candidate_routes"]]
     assert "route/fast-unlabeled" in candidate_routes
 
     pc = report["pause_and_checkpoint_efficiency"]
     assert pc["in_flight_blockers_of_quick_jobs"]["non_cooperative_blocker_count"] == 1
-    assert pc["in_flight_blockers_of_quick_jobs"]["potential_wait_reducible_by_cooperative_pause_seconds"] == 80.0
+    assert pc["in_flight_blockers_of_quick_jobs"]["observed_wait_overlap_with_non_cooperative_jobs_seconds"] == 80.0
 
     # Verify CLI telemetry command works in both text and --json modes
     cli_json = _run_cli(queue.queue_dir, "telemetry", "--json")
     assert cli_json.returncode == 0, cli_json.stderr
     parsed = json.loads(cli_json.stdout)
-    assert parsed["quick_efficiency"]["estimated_wait_saved_seconds"] == 300.0
+    assert parsed["quick_efficiency"]["bypassed_jobs_observed_execution_seconds"] == 300.0
 
     cli_text = _run_cli(queue.queue_dir, "telemetry")
     assert cli_text.returncode == 0, cli_text.stderr

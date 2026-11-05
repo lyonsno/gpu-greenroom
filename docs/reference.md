@@ -147,6 +147,7 @@ gpu-greenroom panic [--owner NAME] [--reason TEXT] [--kill-unmanaged-webgpu] # p
 gpu-greenroom resume --owner NAME --epoch ID    # epoch must match the observed pause
 gpu-greenroom recover                  # move running jobs whose worker PID is gone to failed/
 gpu-greenroom doctor --json            # executable discovery, imports, queue writes, dispatch availability
+gpu-greenroom telemetry [--since-hours HOURS] [--json] # retained queue observations, not measured scheduling savings
 
 # Lineage
 gpu-greenroom lineage <job-id | sha256 | path> [--json]
@@ -209,6 +210,16 @@ gpu-greenroom bump wait <bump-id> [--timeout SECONDS]
 # After a grant, the requester claims its own lease bound to the bump:
 gpu-greenroom lease claim ... --handoff-bump-id resident-cold-load
 ```
+
+The telemetry JSON schema is `gpu-greenroom.telemetry.v2`. Wait and execution
+distributions come from retained job timestamps. Bypass evidence distinguishes
+claim-time snapshots from historical interval reconstruction. Execution time of
+bypassed jobs is not measured time saved, and unexplained wait remains
+`unattributed`; it is not assigned to a pause or lease without supporting
+evidence. Short completed normal jobs are candidates for investigation, not
+proof of Quick eligibility. JSON retains all candidate routes; the text view
+labels its top-route display explicitly. Cooperative capability is a producer
+declaration, separate from a committed checkpoint handoff or observed GPU release.
 
 Every command accepts `--queue-dir DIR`; the default is `GPU_GREENROOM_DIR`
 or `~/.local/state/gpu-greenroom`.

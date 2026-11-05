@@ -508,23 +508,26 @@ class GPUQueue:
         paths = [stderr_path]
         if stdout_path is not None:
             paths.append(stdout_path)
+        needles = tuple(pattern.encode('utf-8') for pattern in METAL_GPU_TIMEOUT_PATTERNS)
+        overlap = max(map(len, needles)) - 1
         for path in paths:
             try:
                 if not path.is_file():
                     continue
                 with path.open("rb") as stream:
-                    stream.seek(0, os.SEEK_END)
-                    size = stream.tell()
-                    stream.seek(max(0, size - 65536), os.SEEK_SET)
-                    tail = stream.read().decode("utf-8", errors="replace")
+                    carry = b''
+                    while chunk := stream.read(65536):
+                        window = carry + chunk
+                        for needle in needles:
+                            position = window.find(needle)
+                            if position >= 0:
+                                # Bound only the diagnostic excerpt, never the scan horizon.
+                                return window[max(0, position - 80):position + len(needle) + 80].decode(
+                                    'utf-8', errors='replace'
+                                ).strip()
+                        carry = window[-overlap:]
             except OSError:
                 continue
-            for line in reversed(tail.splitlines()):
-                stripped = line.strip()
-                if not stripped:
-                    continue
-                if any(pat in stripped for pat in METAL_GPU_TIMEOUT_PATTERNS):
-                    return stripped[:240]
         return None
 
     @classmethod
@@ -2733,6 +2736,18 @@ class GPUQueue:
                             None if request.performance_window is not None else job_timeout)
                         if self._worker_shutdown_requested:
                             raise KeyboardInterrupt
+                    metal_timeout_line = self._detect_metal_gpu_timeout(stderr_path, stdout_path)
+                    if metal_timeout_line:
+                        if "metal_gpu_timeout" not in state.warnings:
+                            state.warnings.append("metal_gpu_timeout")
+                        try:
+                            pause_ack = self.pause(
+                                owner="gpu-greenroom:watchdog",
+                                contention_class="metal_gpu_timeout",
+                            )
+                            watchdog_auto_pause_epoch = pause_ack.get("epoch")
+                        except Exception as pause_exc:
+                            state.warnings.append(f"watchdog_pause_failed:{pause_exc}")
                     if not self._quiesce_owned_child(proc, state.child_process_group):
                         ownership_unresolved = True
                         state.status = JobStatus.RUNNING
@@ -2742,32 +2757,21 @@ class GPUQueue:
                         )
                         state.warnings.append("ownership_unknown:process_group_live")
                         dest_status = None
+                    elif metal_timeout_line:
+                        state.status = JobStatus.FAILED
+                        state.failure_phase = "metal_gpu_timeout"
+                        state.error_message = (
+                            f"Metal GPU command buffer timeout (exit code {state.exit_code}): "
+                            f"{metal_timeout_line}"
+                        )
+                        dest_status = "failed"
                     elif state.exit_code == 0:
                         state.status = JobStatus.DONE
                         dest_status = "done"
                     else:
                         control_termination = self._read_control_termination(job_dir)
-                        metal_timeout_line = self._detect_metal_gpu_timeout(
-                            stderr_path, stdout_path
-                        )
                         state.status = JobStatus.FAILED
-                        if metal_timeout_line:
-                            state.failure_phase = "metal_gpu_timeout"
-                            state.error_message = (
-                                f"Metal GPU command buffer timeout (exit code {state.exit_code}): "
-                                f"{metal_timeout_line}"
-                            )
-                            if "metal_gpu_timeout" not in state.warnings:
-                                state.warnings.append("metal_gpu_timeout")
-                            try:
-                                pause_ack = self.pause(
-                                    owner="gpu-greenroom:watchdog",
-                                    contention_class="metal_gpu_timeout",
-                                )
-                                watchdog_auto_pause_epoch = pause_ack.get("epoch")
-                            except Exception as pause_exc:
-                                state.warnings.append(f"watchdog_pause_failed:{pause_exc}")
-                        elif (
+                        if (
                             control_termination
                             and control_termination.get("action") == "panic"
                         ):
