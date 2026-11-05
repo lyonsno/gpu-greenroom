@@ -85,8 +85,44 @@ def transition(queue: GPUQueue, *, action: str, request_id: str, owner: str, epo
             queue.pause_path.unlink()
             sync_directory(queue.queue_dir)
         try:
-            result['acknowledged_at'] = time.time()
+            ack_at = time.time()
+            result['acknowledged_at'] = ack_at
+            if action == 'resume':
+                if before is not None:
+                    started_pause_at = before.get('effective_at') or before.get('requested_at')
+                    result['paused_seconds'] = (
+                        round(max(0.0, ack_at - float(started_pause_at)), 4)
+                        if isinstance(started_pause_at, (int, float))
+                        else None
+                    )
+                else:
+                    result['paused_seconds'] = 0.0
             write_durable(receipt_path, {**receipt, 'phase': 'completed'})
         except OSError as error:
             raise OSError(f'action may have applied; receipt incomplete at {receipt_path}: {error}') from error
+        if action == 'pause' and before is None:
+            queue._emit_event_locked(
+                'queue_paused',
+                effective_epoch,
+                {
+                    'owner': owner,
+                    'epoch': effective_epoch,
+                    'contention_class': 'operator-console',
+                    'request_id': request_id,
+                    'escalated': False,
+                },
+            )
+        elif action == 'resume' and before is not None:
+            queue._emit_event_locked(
+                'queue_resumed',
+                effective_epoch or 'legacy',
+                {
+                    'owner': owner,
+                    'epoch': effective_epoch,
+                    'paused_seconds': result.get('paused_seconds'),
+                    'request_id': request_id,
+                    'previous_owner': before.get('owner'),
+                    'previous_contention_class': before.get('contention_class'),
+                },
+            )
         return result

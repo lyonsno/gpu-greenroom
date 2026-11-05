@@ -83,10 +83,19 @@ def summarize_telemetry(
             st = _load_json_safe(job_dir / "status.json")
             req = _load_json_safe(job_dir / "request.json")
             rc = _load_json_safe(job_dir / "receipt.json")
-            # Ignore foreign supervisor files that lack valid Greenroom job status
-            if st is None or not isinstance(st.get("status"), str) or not isinstance(st.get("job_id"), str):
+            # Ignore foreign supervisor files that lack valid Greenroom job identity
+            if (
+                st is None
+                or not isinstance(st.get("status"), str)
+                or st.get("job_id") != job_dir.name
+            ):
                 continue
-            score = int(req is not None) + int(st is not None) + int(rc is not None)
+            score = (
+                int(req is not None)
+                + int(st is not None)
+                + int(rc is not None)
+                + int(st.get("status") == state_name)
+            )
             prev = candidates_by_id.get(st["job_id"])
             if prev is None or score > prev[0]:
                 candidates_by_id[st["job_id"]] = (
@@ -98,9 +107,7 @@ def summarize_telemetry(
                     rc or {},
                 )
 
-    records: list[dict] = []
-    committed_handoffs_count = 0
-    performance_window_deferrals_count = 0
+    all_records: list[dict] = []
     external_lease_admissions_count = 0
 
     for job_id, (_score, state_name, job_dir, req, st, rc) in candidates_by_id.items():
@@ -111,9 +118,6 @@ def summarize_telemetry(
         sub_at = st.get("submitted_at") or req.get("submitted_at")
         start_at = st.get("started_at") or rc.get("started_at")
         fin_at = st.get("finished_at") or rc.get("finished_at")
-        anchor_ts = sub_at or start_at or fin_at
-        if cutoff is not None and anchor_ts is not None and anchor_ts < cutoff:
-            continue
 
         disp = rc.get("dispatch") or st.get("dispatch") or {}
         mode = disp.get("mode") or ("two-class" if disp.get("service_class") else "fifo")
@@ -139,13 +143,15 @@ def summarize_telemetry(
         )
 
         handoff = _load_json_safe(job_dir / "checkpoint-handoff.json")
-        if handoff and handoff.get("status") == "committed":
-            committed_handoffs_count += 1
+        committed_handoff = bool(handoff and handoff.get("status") == "committed")
         deferrals_dir = job_dir / "performance-deferrals"
-        if deferrals_dir.is_dir():
-            performance_window_deferrals_count += sum(1 for _ in deferrals_dir.glob("*.json"))
+        deferrals_count = (
+            sum(1 for _ in deferrals_dir.glob("*.json"))
+            if deferrals_dir.is_dir()
+            else 0
+        )
 
-        records.append(
+        all_records.append(
             {
                 "job_id": job_id,
                 "state": state_name,
@@ -166,12 +172,38 @@ def summarize_telemetry(
                 "runtime_hint": req.get("runtime_hint") or rc.get("runtime_hint"),
                 "runtime_hint_comparison": rc.get("runtime_hint_comparison"),
                 "dispatch": disp,
+                "committed_handoff": committed_handoff,
+                "performance_deferrals_count": deferrals_count,
             }
         )
 
     # Filter to two-class records when two-class jobs exist; otherwise include all
-    two_class_records = [r for r in records if r["mode"] == "two-class"]
-    active_records = two_class_records if two_class_records else records
+    two_class_all = [r for r in all_records if r["mode"] == "two-class"]
+    population_all = two_class_all if two_class_all else all_records
+
+    # Keep unfiltered lookup maps so cross-boundary in-flight blockers and bypassed
+    # normal jobs are never lost when --since-hours is used.
+    all_records_by_id = {r["job_id"]: r for r in population_all}
+    all_started_unfiltered = [
+        r
+        for r in population_all
+        if r["submitted_at"] is not None and r["started_at"] is not None
+    ]
+    normal_started_unfiltered = [
+        r for r in all_started_unfiltered if r["service_class"] == "normal"
+    ]
+
+    if cutoff is not None:
+        active_records = [
+            r
+            for r in population_all
+            if any(
+                ts is not None and ts >= cutoff
+                for ts in (r["submitted_at"], r["started_at"], r["finished_at"])
+            )
+        ]
+    else:
+        active_records = list(population_all)
 
     by_service_class: dict[str, dict] = {}
     for sc in ("quick", "normal"):
@@ -201,19 +233,6 @@ def summarize_telemetry(
         and r["submitted_at"] is not None
         and r["started_at"] is not None
     ]
-    normal_started = [
-        r
-        for r in active_records
-        if r["service_class"] == "normal"
-        and r["submitted_at"] is not None
-        and r["started_at"] is not None
-    ]
-    all_started = [
-        r
-        for r in active_records
-        if r["submitted_at"] is not None and r["started_at"] is not None
-    ]
-    records_by_id = {r["job_id"]: r for r in active_records}
 
     queue_jumping_quick_jobs = 0
     total_bypassed_normal_jobs = 0
@@ -247,15 +266,15 @@ def summarize_telemetry(
         recorded_bypassed_ids = (q["dispatch"] or {}).get("bypassed_pending_normal_job_ids")
         if isinstance(recorded_bypassed_ids, list):
             bypassed_jobs = [
-                records_by_id[jid]
+                all_records_by_id[jid]
                 for jid in recorded_bypassed_ids
-                if jid in records_by_id
+                if jid in all_records_by_id
             ]
             bypassed_count = len(recorded_bypassed_ids)
         else:
             bypassed_jobs = [
                 n
-                for n in normal_started
+                for n in normal_started_unfiltered
                 if n["submitted_at"] <= q_sub and n["started_at"] > q_start
             ]
             bypassed_count = len(bypassed_jobs)
@@ -266,17 +285,17 @@ def summarize_telemetry(
             saved_for_q = sum((n["exec_s"] or 0.0) for n in bypassed_jobs)
             estimated_wait_saved_seconds += saved_for_q
 
-        # Attribute wait time
+        # Attribute wait time using full started-job history so boundary jobs are never misattributed
         in_flight = [
             o
-            for o in all_started
+            for o in all_started_unfiltered
             if o["job_id"] != q["job_id"]
             and o["started_at"] <= q_sub
             and (o["finished_at"] or o["started_at"]) > q_sub
         ]
         started_before_q = [
             o
-            for o in all_started
+            for o in all_started_unfiltered
             if o["job_id"] != q["job_id"] and q_sub < o["started_at"] < q_start
         ]
 
@@ -290,7 +309,6 @@ def summarize_telemetry(
             wait_attribution["paused_or_external_lease_block"] += 1
 
         if q_wait > 5.0 and in_flight:
-            # Attribute to the primary in-flight blocker
             blocker = max(
                 in_flight,
                 key=lambda o: min(q_start, o["finished_at"] or q_start) - q_sub,
@@ -314,23 +332,32 @@ def summarize_telemetry(
                 non_cooperative_blocker_count += 1
                 potential_wait_reducible_seconds += overlap_s
 
-    # Runtime hint accuracy on quick jobs
-    hinted_quick = [
+    # Runtime hint accuracy on completed quick jobs (failed/cancelled tracked separately)
+    hinted_quick_all = [
         r
         for r in active_records
         if r["service_class"] == "quick"
-        and (isinstance(r.get("runtime_hint_comparison"), dict) or isinstance(r.get("runtime_hint"), dict))
-        and r["exec_s"] is not None
+        and (
+            isinstance(r.get("runtime_hint_comparison"), dict)
+            or isinstance(r.get("runtime_hint"), dict)
+        )
+    ]
+    hinted_quick_done = [
+        r
+        for r in hinted_quick_all
+        if r["status"] == "done" and r["exec_s"] is not None
     ]
     within_expected = 0
     within_threshold = 0
-    for r in hinted_quick:
+    for r in hinted_quick_done:
         cmp_d = r.get("runtime_hint_comparison") or {}
         hint_d = r.get("runtime_hint") or {}
         exp_s = cmp_d.get("expected_seconds") or hint_d.get("expected_seconds")
-        if exp_s is not None and r["exec_s"] <= float(exp_s):
+        actual_s = cmp_d.get("actual_seconds")
+        measured_s = float(actual_s) if isinstance(actual_s, (int, float)) else float(r["exec_s"])
+        if exp_s is not None and measured_s <= float(exp_s):
             within_expected += 1
-        if r["exec_s"] <= quick_threshold_seconds:
+        if measured_s <= quick_threshold_seconds:
             within_threshold += 1
 
     quick_count = len(quick_started)
@@ -354,10 +381,11 @@ def summarize_telemetry(
         else 0.0,
         "wait_attribution": wait_attribution,
         "runtime_hint_accuracy": {
-            "evaluated_quick_jobs": len(hinted_quick),
+            "evaluated_quick_jobs": len(hinted_quick_done),
+            "non_done_hinted_quick_jobs": len(hinted_quick_all) - len(hinted_quick_done),
             "within_expected_seconds_count": within_expected,
             "within_quick_threshold_count": within_threshold,
-            "exceeded_quick_threshold_count": len(hinted_quick) - within_threshold,
+            "exceeded_quick_threshold_count": len(hinted_quick_done) - within_threshold,
         },
     }
 
@@ -370,11 +398,34 @@ def summarize_telemetry(
         and r["exec_s"] is not None
     ]
     fast_normals = [r for r in normal_done if r["exec_s"] <= quick_threshold_seconds]
-    fast_waited_gt_60 = [
-        r["wait_s"]
+    fast_waited_gt_60_jobs = [
+        r
         for r in fast_normals
         if r["wait_s"] is not None and r["wait_s"] > 60.0
     ]
+    fast_waited_gt_60 = [r["wait_s"] for r in fast_waited_gt_60_jobs]
+
+    # Separate wait reducible by Quick classification (queued behind older slow normal jobs)
+    # from wait behind an already-running in-flight blocker or same-route batch bursts.
+    reducible_by_quick_bypass_seconds = 0.0
+    for fn_job in fast_waited_gt_60_jobs:
+        fn_sub = fn_job["submitted_at"]
+        fn_start = fn_job["started_at"]
+        if fn_sub is None or fn_start is None:
+            continue
+        intervening_slow_normals = [
+            o
+            for o in normal_started_unfiltered
+            if o["job_id"] != fn_job["job_id"]
+            and o["route"] != fn_job["route"]
+            and fn_sub < o["started_at"] < fn_start
+            and (o["exec_s"] or 0.0) > quick_threshold_seconds
+        ]
+        bypassable_s = sum(
+            max(0.0, min(fn_start, o["finished_at"] or fn_start) - o["started_at"])
+            for o in intervening_slow_normals
+        )
+        reducible_by_quick_bypass_seconds += min(fn_job["wait_s"], bypassable_s)
 
     normal_by_route: dict[str, list[dict]] = defaultdict(list)
     for r in normal_done:
@@ -405,6 +456,7 @@ def summarize_telemetry(
             )
     candidate_routes.sort(key=lambda item: (-item["total_wait_seconds"], -item["count"]))
 
+    total_wait_gt_60_s = round(sum(fast_waited_gt_60), 2)
     unlabeled_quick_candidates = {
         "quick_threshold_seconds": quick_threshold_seconds,
         "total_normal_done_count": len(normal_done),
@@ -415,12 +467,22 @@ def summarize_telemetry(
         "waited_gt_60s_count": len(fast_waited_gt_60),
         "waited_gt_60s_p50_seconds": _pct(sorted(fast_waited_gt_60), 50),
         "waited_gt_60s_p90_seconds": _pct(sorted(fast_waited_gt_60), 90),
-        "total_avoidable_wait_seconds": round(sum(fast_waited_gt_60), 2),
+        "total_avoidable_wait_seconds": total_wait_gt_60_s,
+        "reducible_by_quick_bypass_seconds": round(
+            reducible_by_quick_bypass_seconds, 2
+        ),
+        "in_flight_or_same_route_batch_wait_seconds": round(
+            max(0.0, total_wait_gt_60_s - reducible_by_quick_bypass_seconds), 2
+        ),
         "candidate_routes": candidate_routes[:20],
     }
 
-    # Pause & checkpoint events from events/
+    # Pause & checkpoint events from events/, operator-actions/, and dispatch-policy.json
     events_dir = root / "events"
+    seen_pause_keys: set[str] = set()
+    seen_resume_keys: set[str] = set()
+    seen_job_action_ids: set[str] = set()
+
     queue_pause_events_count = 0
     queue_resume_events_count = 0
     total_recorded_paused_seconds = 0.0
@@ -432,26 +494,119 @@ def summarize_telemetry(
             ev = _load_json_safe(ev_path)
             if not ev:
                 continue
-            ev_ts = ev.get("timestamp")
+            ev_ts = (
+                ev.get("emitted_at")
+                if ev.get("emitted_at") is not None
+                else ev.get("timestamp")
+            )
             if cutoff is not None and isinstance(ev_ts, (int, float)) and ev_ts < cutoff:
                 continue
             kind = ev.get("kind")
             payload = ev.get("payload") or {}
             if kind == "queue_paused":
-                queue_pause_events_count += 1
+                dedup_key = str(
+                    payload.get("request_id")
+                    or payload.get("epoch")
+                    or ev.get("subject_id")
+                    or ev_path.name
+                )
+                if dedup_key not in seen_pause_keys:
+                    seen_pause_keys.add(dedup_key)
+                    queue_pause_events_count += 1
             elif kind == "queue_resumed":
-                queue_resume_events_count += 1
-                paused_s = payload.get("paused_seconds")
-                if isinstance(paused_s, (int, float)) and paused_s >= 0:
-                    total_recorded_paused_seconds += float(paused_s)
+                dedup_key = str(
+                    payload.get("request_id")
+                    or payload.get("epoch")
+                    or ev.get("subject_id")
+                    or ev_path.name
+                )
+                if dedup_key not in seen_resume_keys:
+                    seen_resume_keys.add(dedup_key)
+                    queue_resume_events_count += 1
+                    paused_s = payload.get("paused_seconds")
+                    if isinstance(paused_s, (int, float)) and paused_s >= 0:
+                        total_recorded_paused_seconds += float(paused_s)
             elif kind == "job_pause":
-                job_pause_events_count += 1
+                req_id = str(payload.get("request_id") or ev_path.name)
+                if req_id not in seen_job_action_ids:
+                    seen_job_action_ids.add(req_id)
+                    job_pause_events_count += 1
             elif kind == "job_resume":
+                req_id = str(payload.get("request_id") or ev_path.name)
+                if req_id not in seen_job_action_ids:
+                    seen_job_action_ids.add(req_id)
+                    job_resume_events_count += 1
+
+    # Also ingest operator-actions/*.json from the --admission-control console path
+    op_actions_dir = root / "operator-actions"
+    if op_actions_dir.is_dir():
+        for oa_path in sorted(op_actions_dir.glob("*.json")):
+            oa = _load_json_safe(oa_path)
+            if (
+                not oa
+                or oa.get("schema") != "gpu-greenroom.operator-action.v1"
+                or oa.get("phase") != "completed"
+            ):
+                continue
+            res = oa.get("result") or {}
+            req_d = oa.get("request") or {}
+            if res.get("idempotent"):
+                continue
+            oa_ts = res.get("acknowledged_at") or res.get("requested_at")
+            if cutoff is not None and isinstance(oa_ts, (int, float)) and oa_ts < cutoff:
+                continue
+            action = res.get("action") or req_d.get("action")
+            epoch = res.get("epoch") or req_d.get("epoch")
+            req_id = req_d.get("request_id") or oa_path.stem
+            dedup_keys = {str(k) for k in (req_id, epoch) if k}
+            if action == "pause":
+                if not (dedup_keys & seen_pause_keys):
+                    seen_pause_keys.update(dedup_keys)
+                    queue_pause_events_count += 1
+            elif action == "resume":
+                if not (dedup_keys & seen_resume_keys):
+                    seen_resume_keys.update(dedup_keys)
+                    queue_resume_events_count += 1
+                    paused_s = res.get("paused_seconds")
+                    if paused_s is None:
+                        prev_pause = oa.get("previous_pause") or res.get("previous_pause") or {}
+                        eff_at = prev_pause.get("effective_at") or prev_pause.get("requested_at")
+                        if isinstance(eff_at, (int, float)) and isinstance(oa_ts, (int, float)):
+                            paused_s = max(0.0, float(oa_ts) - float(eff_at))
+                    if isinstance(paused_s, (int, float)) and paused_s >= 0:
+                        total_recorded_paused_seconds += float(paused_s)
+
+    # Also ingest persisted per-job pause/resume actions from dispatch-policy.json
+    job_actions_map = policy.get("job_actions")
+    if isinstance(job_actions_map, dict):
+        for req_id, entry in job_actions_map.items():
+            if not isinstance(entry, dict) or str(req_id) in seen_job_action_ids:
+                continue
+            req_body = entry.get("request") or {}
+            act = req_body.get("action")
+            if act not in ("pause", "resume"):
+                continue
+            # Job actions in dispatch-policy.json don't carry an action timestamp unless requeued;
+            # include when cutoff is None or when the target job was active in the window.
+            target_jid = req_body.get("job_id")
+            if cutoff is not None and target_jid not in {r["job_id"] for r in active_records}:
+                continue
+            seen_job_action_ids.add(str(req_id))
+            if act == "pause":
+                job_pause_events_count += 1
+            elif act == "resume":
                 job_resume_events_count += 1
 
     coop_count = sum(1 for r in active_records if r["cooperative_checkpoint"])
     cont_count = sum(1 for r in active_records if r["continuation_of"])
     perf_win_count = sum(1 for r in active_records if r["performance_window"])
+    committed_handoffs_count = sum(
+        1 for r in active_records if r["committed_handoff"]
+    )
+    performance_window_deferrals_count = sum(
+        r["performance_deferrals_count"] for r in active_records
+    )
+    active_job_holds_count = len(policy.get("job_holds") or {})
 
     top_blocking_routes = sorted(
         blocker_route_stats.values(),
@@ -472,6 +627,7 @@ def summarize_telemetry(
         "total_recorded_paused_seconds": round(total_recorded_paused_seconds, 2),
         "job_pause_events_count": job_pause_events_count,
         "job_resume_events_count": job_resume_events_count,
+        "active_job_holds_count": active_job_holds_count,
         "in_flight_blockers_of_quick_jobs": {
             "total_blocked_quick_jobs": non_cooperative_blocker_count
             + cooperative_blocker_count,
@@ -547,7 +703,9 @@ def render_telemetry_text(report: dict) -> str:
         f"  - {fn['fast_normal_done_count']}/{fn['total_normal_done_count']} "
         f"({fn['fast_normal_fraction'] * 100:.1f}%) completed normal jobs finished <={fn['quick_threshold_seconds']:.0f}s; "
         f"{fn['waited_gt_60s_count']} waited >60s (wait p50={fn['waited_gt_60s_p50_seconds']:.1f}s, "
-        f"p90={fn['waited_gt_60s_p90_seconds']:.1f}s, total avoidable wait={fn['total_avoidable_wait_seconds']:.1f}s)"
+        f"p90={fn['waited_gt_60s_p90_seconds']:.1f}s, total >60s wait={fn['total_avoidable_wait_seconds']:.1f}s; "
+        f"reducible by quick bypass={fn['reducible_by_quick_bypass_seconds']:.1f}s, "
+        f"in-flight/batch wait={fn['in_flight_or_same_route_batch_wait_seconds']:.1f}s)"
     )
     if fn["candidate_routes"]:
         lines.append("  - Top candidate routes for quick_routes / --expected-seconds:")
@@ -561,13 +719,14 @@ def render_telemetry_text(report: dict) -> str:
     blk = pc["in_flight_blockers_of_quick_jobs"]
     lines.append("\n4. Pause & Cooperative Checkpoint Efficiency:")
     lines.append(
-        f"  - Cooperative checkpoint jobs: {pc['cooperative_checkpoint_jobs_count']} "
+        f"  - Per-job cooperative checkpointing (yields GPU): {pc['cooperative_checkpoint_jobs_count']} jobs "
         f"({pc['cooperative_checkpoint_fraction'] * 100:.2f}%), "
+        f"job pause actions={pc['job_pause_events_count']}, resumes={pc['job_resume_events_count']}, "
         f"committed handoffs={pc['committed_handoffs_count']}, "
         f"performance deferrals={pc['performance_window_deferrals_count']}"
     )
     lines.append(
-        f"  - Queue pause events={pc['queue_pause_events_count']}, "
+        f"  - Queue-wide start-gate pauses (holds dispatch): pauses={pc['queue_pause_events_count']}, "
         f"resumes={pc['queue_resume_events_count']} "
         f"(recorded paused time={pc['total_recorded_paused_seconds']:.1f}s)"
     )

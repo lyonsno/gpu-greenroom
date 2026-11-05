@@ -1886,10 +1886,13 @@ class GPUQueue:
             state = JobState.from_json(status_file.read_text())
         except (OSError, ValueError, KeyError, TypeError):
             return None
+        if state.job_id != job_dir.name:
+            return None
         score = (
             int((job_dir / "request.json").is_file())
             + int(status_file.is_file())
             + int((job_dir / "receipt.json").is_file())
+            + int(state.status.value == job_dir.parent.name)
         )
         return state, score
 
@@ -1900,12 +1903,12 @@ class GPUQueue:
         limit: int | None = None,
     ) -> list[JobState]:
         """List jobs, optionally filtered by status and/or capped to the N most recent."""
-        dirs = ["pending", "deferred", "running", "done", "failed", "cancelled"]
-        if status:
-            dirs = [status.value]
+        if limit is not None and limit <= 0:
+            return []
+        all_dirs = ("pending", "deferred", "running", "done", "failed", "cancelled")
         by_id: dict[str, tuple[int, int, JobState]] = {}
         order_counter = 0
-        for sub in dirs:
+        for sub in all_dirs:
             sub_dir = self.queue_dir / sub
             if not sub_dir.exists():
                 continue
@@ -1923,8 +1926,9 @@ class GPUQueue:
         results = [
             item[2]
             for item in sorted(by_id.values(), key=lambda entry: entry[1])
+            if status is None or item[2].status == status
         ]
-        if limit is not None and limit > 0:
+        if limit is not None:
             results = sorted(
                 results,
                 key=lambda j: (

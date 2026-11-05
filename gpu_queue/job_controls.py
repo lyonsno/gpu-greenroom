@@ -263,6 +263,7 @@ def perform(queue, *, job_id, request_digest, expected_status, expected_started_
                 job_id,
                 {
                     "job_id": job_id,
+                    "request_id": request_id,
                     "requested_by": requested_by,
                     "allow_bypass": allow_bypass,
                     "status": result.get("status"),

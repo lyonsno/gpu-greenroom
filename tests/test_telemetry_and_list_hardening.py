@@ -67,9 +67,27 @@ def test_list_jobs_and_get_job_tolerate_foreign_or_corrupt_status_json_and_suppo
     all_jobs = queue.list_jobs()
     assert [j.job_id for j in all_jobs] == ["job000000001", "job000000002", "job000000003"]
 
-    # limit returns the N most recent jobs by submission/start time
+    # limit returns the N most recent jobs by submission/start time, and <=0 returns []
     limited = queue.list_jobs(limit=2)
     assert [j.job_id for j in limited] == ["job000000002", "job000000003"]
+    assert queue.list_jobs(limit=0) == []
+
+    # Even if a stale/foreign status.json in failed/job000000001 parses as JobState(FAILED),
+    # list_jobs(JobStatus.FAILED) must not return job000000001 because done/job000000001 has higher completeness.
+    (dup_failed / "status.json").write_text(
+        json.dumps(
+            {
+                "job_id": "job000000001",
+                "status": "failed",
+                "job_type": "echo",
+                "input_path": "a",
+                "output_dir": "",
+                "params": {},
+                "submitted_at": 100.0,
+            }
+        )
+    )
+    assert queue.list_jobs(JobStatus.FAILED) == []
 
     # get_job() must resolve job000000001 from done/ without crashing on the foreign husk in failed/
     resolved = queue.get_job("job000000001")
@@ -173,6 +191,30 @@ def test_pause_and_resume_emit_events_and_record_paused_seconds(tmp_path: Path):
     resumed_ev = next(e for e in events if e["kind"] == "queue_resumed")
     assert resumed_ev["payload"]["epoch"] == pause_ack["epoch"]
     assert resumed_ev["payload"]["paused_seconds"] >= 0.01
+
+    # Also verify admission_control.transition() emits queue_paused / queue_resumed with paused_seconds
+    from gpu_queue import admission_control
+    from gpu_queue.telemetry import summarize_telemetry
+
+    ac_pause = admission_control.transition(
+        queue, action="pause", request_id="req_pause_1", owner="console-op"
+    )
+    assert ac_pause["effective_paused"] is True
+    time.sleep(0.01)
+    ac_resume = admission_control.transition(
+        queue,
+        action="resume",
+        request_id="req_resume_1",
+        owner="console-op",
+        epoch=ac_pause["epoch"],
+    )
+    assert ac_resume["effective_paused"] is False
+    assert isinstance(ac_resume.get("paused_seconds"), float) and ac_resume["paused_seconds"] >= 0.005
+
+    rep = summarize_telemetry(queue.queue_dir, since_hours=1.0)
+    # 2 pauses and 2 resumes total, deduplicated across events/ and operator-actions/
+    assert rep["pause_and_checkpoint_efficiency"]["queue_pause_events_count"] == 2
+    assert rep["pause_and_checkpoint_efficiency"]["queue_resume_events_count"] == 2
 
 
 def test_telemetry_summarizes_quick_wait_attribution_queue_jumps_false_normals_and_blockers(
@@ -306,6 +348,9 @@ def test_telemetry_summarizes_quick_wait_attribution_queue_jumps_false_normals_a
     fn = report["unlabeled_quick_candidates"]
     assert fn["fast_normal_done_count"] == 2
     assert fn["waited_gt_60s_count"] == 2
+    # Both fast_norm_1 (submitted at 130) and fast_norm_2 (submitted at 140) waited while
+    # norm_queued (started at 210, finished at 510, 300s) ran between their submission and start.
+    assert fn["reducible_by_quick_bypass_seconds"] == 600.0
     candidate_routes = [r["route"] for r in fn["candidate_routes"]]
     assert "route/fast-unlabeled" in candidate_routes
 
