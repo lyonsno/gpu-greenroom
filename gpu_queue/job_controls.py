@@ -257,6 +257,17 @@ def perform(queue, *, job_id, request_digest, expected_status, expected_started_
             updated['job_restores'] = {**config.get('job_restores', {}),job_id:result}
         updated['job_actions'] = {**config.get('job_actions', {}), request_id:{'request':body,'result':result}}
         dispatch.atomic_write(queue.queue_dir/'dispatch-policy.json', dispatch.validate(updated))
+        if action in {'pause', 'resume'}:
+            queue._emit_event_locked(
+                f"job_{action}",
+                job_id,
+                {
+                    "job_id": job_id,
+                    "requested_by": requested_by,
+                    "allow_bypass": allow_bypass,
+                    "status": result.get("status"),
+                },
+            )
         if action == 'requeue':
             _publish_retry(queue,result)
         return result

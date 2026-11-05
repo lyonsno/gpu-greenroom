@@ -324,7 +324,7 @@ def cmd_submit_command(args):
 def cmd_list(args):
     queue = get_queue(args)
     status_filter = JobStatus(args.status) if args.status else None
-    jobs = queue.list_jobs(status_filter)
+    jobs = queue.list_jobs(status_filter, limit=getattr(args, "limit", None))
 
     if not jobs:
         print("No jobs found.")
@@ -337,6 +337,20 @@ def cmd_list(args):
         elif job.started_at:
             elapsed = f" ({time.time() - job.started_at:.1f}s running)"
         print(f"  {job.job_id}  {job.status.value:10s}  {job.job_type:12s}  {os.path.basename(job.input_path)}{elapsed}")
+
+
+def cmd_telemetry(args):
+    from .telemetry import render_telemetry_text, summarize_telemetry
+    queue = get_queue(args)
+    report = summarize_telemetry(
+        queue.queue_dir,
+        since_hours=args.since_hours,
+        quick_threshold_seconds=args.quick_threshold_seconds,
+    )
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print(render_telemetry_text(report))
 
 
 def cmd_status(args):
@@ -926,7 +940,18 @@ def main():
     # list
     p_list = sub.add_parser("list", help="List jobs")
     p_list.add_argument("-s", "--status", choices=[status.value for status in JobStatus])
+    p_list.add_argument("-n", "--limit", type=int, default=None, help="Only show the N most recent jobs")
     p_list.set_defaults(func=cmd_list)
+
+    # telemetry
+    p_telemetry = sub.add_parser(
+        "telemetry",
+        help="Summarize quick-route wait times, queue-jump savings, unlabeled quick routes, and pause efficiency",
+    )
+    p_telemetry.add_argument("--since-hours", type=float, default=None, help="Restrict analysis to the last N hours")
+    p_telemetry.add_argument("--quick-threshold-seconds", type=float, default=30.0, help="Threshold in seconds for fast normal candidate detection (default: 30)")
+    p_telemetry.add_argument("--json", action="store_true", help="Output structured JSON telemetry report")
+    p_telemetry.set_defaults(func=cmd_telemetry)
 
     # status
     p_status = sub.add_parser("status", help="Get job status")

@@ -1000,6 +1000,16 @@ class GPUQueue:
                     "previous_contention_class": existing.get("contention_class"),
                 }
                 self._write_json_atomic(self.pause_path, state)
+                self._emit_event_locked(
+                    "queue_paused",
+                    state["epoch"],
+                    {
+                        "owner": state["owner"],
+                        "epoch": state["epoch"],
+                        "contention_class": state.get("contention_class"),
+                        "escalated": True,
+                    },
+                )
                 return {
                     "schema": PAUSE_ACK_SCHEMA,
                     "action": "pause",
@@ -1036,6 +1046,16 @@ class GPUQueue:
             "effective_at": effective_at,
         }
         self._write_json_atomic(self.pause_path, state)
+        self._emit_event_locked(
+            "queue_paused",
+            state["epoch"],
+            {
+                "owner": state["owner"],
+                "epoch": state["epoch"],
+                "contention_class": state.get("contention_class"),
+                "escalated": False,
+            },
+        )
         return {
             "schema": PAUSE_ACK_SCHEMA,
             "action": "pause",
@@ -1084,6 +1104,7 @@ class GPUQueue:
                     "acknowledged_at": time.time(),
                     "effective_paused": False,
                     "idempotent": True,
+                    "paused_seconds": 0.0,
                     "previous_pause": None,
                 }
             observed_epoch = existing.get("epoch")
@@ -1093,16 +1114,35 @@ class GPUQueue:
                     expected_epoch=epoch,
                     observed_epoch=observed_epoch,
                 )
+            ack_at = time.time()
+            started_pause_at = existing.get("effective_at") or existing.get("requested_at")
+            paused_seconds = (
+                round(max(0.0, ack_at - float(started_pause_at)), 4)
+                if isinstance(started_pause_at, (int, float))
+                else None
+            )
             self.pause_path.unlink()
+            self._emit_event_locked(
+                "queue_resumed",
+                observed_epoch or "legacy",
+                {
+                    "owner": owner,
+                    "epoch": observed_epoch,
+                    "paused_seconds": paused_seconds,
+                    "previous_owner": existing.get("owner"),
+                    "previous_contention_class": existing.get("contention_class"),
+                },
+            )
             return {
                 "schema": PAUSE_ACK_SCHEMA,
                 "action": "resume",
                 "owner": owner,
                 "epoch": observed_epoch,
                 "queue_dir": str(self.queue_dir.resolve()),
-                "acknowledged_at": time.time(),
+                "acknowledged_at": ack_at,
                 "effective_paused": False,
                 "idempotent": False,
+                "paused_seconds": paused_seconds,
                 "previous_pause": existing,
             }
 
@@ -1837,29 +1877,79 @@ class GPUQueue:
             shutil.move(str(pending_dir), str(dest))
             return True
 
-    def list_jobs(self, status: JobStatus | None = None) -> list[JobState]:
-        """List jobs, optionally filtered by status."""
-        results = []
+    @staticmethod
+    def _load_job_state_safe(job_dir: Path) -> tuple[JobState, int] | None:
+        status_file = job_dir / "status.json"
+        if not status_file.is_file():
+            return None
+        try:
+            state = JobState.from_json(status_file.read_text())
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+        score = (
+            int((job_dir / "request.json").is_file())
+            + int(status_file.is_file())
+            + int((job_dir / "receipt.json").is_file())
+        )
+        return state, score
+
+    def list_jobs(
+        self,
+        status: JobStatus | None = None,
+        *,
+        limit: int | None = None,
+    ) -> list[JobState]:
+        """List jobs, optionally filtered by status and/or capped to the N most recent."""
         dirs = ["pending", "deferred", "running", "done", "failed", "cancelled"]
         if status:
             dirs = [status.value]
+        by_id: dict[str, tuple[int, int, JobState]] = {}
+        order_counter = 0
         for sub in dirs:
             sub_dir = self.queue_dir / sub
             if not sub_dir.exists():
                 continue
             for job_dir in sorted(sub_dir.iterdir()):
-                status_file = job_dir / "status.json"
-                if status_file.exists():
-                    results.append(JobState.from_json(status_file.read_text()))
+                if not job_dir.is_dir():
+                    continue
+                loaded = self._load_job_state_safe(job_dir)
+                if loaded is None:
+                    continue
+                state, score = loaded
+                order_counter += 1
+                prev = by_id.get(state.job_id)
+                if prev is None or score > prev[0]:
+                    by_id[state.job_id] = (score, prev[1] if prev is not None else order_counter, state)
+        results = [
+            item[2]
+            for item in sorted(by_id.values(), key=lambda entry: entry[1])
+        ]
+        if limit is not None and limit > 0:
+            results = sorted(
+                results,
+                key=lambda j: (
+                    j.submitted_at or j.started_at or j.finished_at or 0.0,
+                    j.job_id,
+                ),
+            )[-limit:]
         return results
 
     def get_job(self, job_id: str) -> JobState | None:
-        """Get a specific job's state."""
+        """Get a specific job's state, tolerating foreign/corrupt status files."""
+        best_state: JobState | None = None
+        best_score = -1
         for sub in ("pending", "deferred", "running", "done", "failed", "cancelled"):
-            status_file = self.queue_dir / sub / job_id / "status.json"
-            if status_file.exists():
-                return JobState.from_json(status_file.read_text())
-        return None
+            job_dir = self.queue_dir / sub / job_id
+            if not job_dir.is_dir():
+                continue
+            loaded = self._load_job_state_safe(job_dir)
+            if loaded is None:
+                continue
+            state, score = loaded
+            if score > best_score:
+                best_state = state
+                best_score = score
+        return best_state
 
     def configure_dispatch(self, value, *, owner, reset_fairness=False):
         value=dispatch.validate(value)
@@ -2240,6 +2330,41 @@ class GPUQueue:
                 # Pause creation shares this short-lived transition lock, so
                 # returning from pause means no later pending-to-running move
                 # can belong to the paused epoch.
+                other_pending_dirs = [
+                    p
+                    for p in sorted((self.queue_dir / "pending").iterdir())
+                    if p.is_dir() and p != job_dir
+                ]
+                pending_count_at_claim = len(other_pending_dirs)
+                bypassed_normal_pairs: list[tuple[float, str]] = []
+                if service_class == "quick":
+                    for other_dir in other_pending_dirs:
+                        try:
+                            other_raw, other_digest = dispatch.read_request(
+                                other_dir / "request.json"
+                            )
+                            other_sub = float(other_raw.get("submitted_at") or 0.0)
+                            if (
+                                request.submitted_at
+                                and other_sub <= float(request.submitted_at)
+                            ):
+                                other_class, _ = dispatch.classify(
+                                    other_raw,
+                                    dispatch_policy,
+                                    request_digest=other_digest,
+                                    queue_dir=self.queue_dir,
+                                )
+                                if other_class == "normal":
+                                    bypassed_normal_pairs.append(
+                                        (other_sub, other_dir.name)
+                                    )
+                        except Exception:
+                            continue
+                bypassed_normal_pairs.sort()
+                bypassed_pending_normal_job_ids = [
+                    jid for _sub, jid in bypassed_normal_pairs
+                ]
+
                 job_dir = self._move_job(job_dir, "running")
                 state = JobState.from_json((job_dir / "status.json").read_text())
                 state.status = JobStatus.RUNNING
@@ -2247,8 +2372,15 @@ class GPUQueue:
                 state.pid = os.getpid()
                 state.worker_pid = os.getpid()
                 state.worker_capabilities = list(effective_claimant.get('capabilities', []))
-                state.dispatch={'mode':dispatch_policy['mode'],'service_class':service_class,
-                                'policy_epoch':dispatch_policy.get('epoch'),'eligibility_basis':basis}
+                state.dispatch={
+                    'mode':dispatch_policy['mode'],
+                    'service_class':service_class,
+                    'policy_epoch':dispatch_policy.get('epoch'),
+                    'eligibility_basis':basis,
+                    'pending_count_at_claim': pending_count_at_claim,
+                    'bypassed_pending_normal_count': len(bypassed_pending_normal_job_ids),
+                    'bypassed_pending_normal_job_ids': bypassed_pending_normal_job_ids,
+                }
                 if dispatch_policy['mode'] == 'two-class' and request.job_id in dispatch_policy.get('job_overrides', {}):
                     state.dispatch['operator_override'] = dispatch_policy['job_overrides'][request.job_id]
                 if dispatch_policy['mode']=='two-class':
@@ -2256,6 +2388,19 @@ class GPUQueue:
                         {'schema':'gpu-greenroom.dispatch-state.v1','last_class':service_class,
                          'job_id':state.job_id,'policy_epoch':dispatch_policy.get('epoch'),'claimed_at':state.started_at})
                 self._write_text_atomic(job_dir / "status.json", state.to_json())
+                queue_wait_seconds = (
+                    round(max(0.0, float(state.started_at) - float(request.submitted_at)), 4)
+                    if request.submitted_at
+                    else 0.0
+                )
+                print(
+                    f"[job-start] {state.job_id} class={service_class} "
+                    f"route={request.route_identity or state.job_type} "
+                    f"agent={request.agent_id or 'unattributed'} "
+                    f"wait={queue_wait_seconds:.2f}s "
+                    f"bypassed_normal={len(bypassed_pending_normal_job_ids)}",
+                    flush=True,
+                )
 
             # Structured command jobs carry exact argv and bypass the global
             # job-type registry and all template substitution.
@@ -2857,6 +3002,24 @@ class GPUQueue:
                 if ownership_unresolved
                 else self.queue_dir / dest_status / state.job_id
             )
+            injected_env = {
+                key: run_env[key]
+                for key in (
+                    "GREENROOM_JOB_ID",
+                    "GPU_GREENROOM_JOB_ID",
+                    "GPU_GREENROOM_QUEUE_DIR",
+                    "GPU_GREENROOM_CANCEL_REQUEST",
+                    "GPU_GREENROOM_CONTEXT",
+                    "GPU_GREENROOM_READY_FD",
+                    "GPU_GREENROOM_RESUME_CHECKPOINT",
+                )
+                if key in run_env
+            }
+            execution_seconds = (
+                round(max(0.0, float(state.finished_at) - float(state.started_at)), 4)
+                if (state.started_at is not None and state.finished_at is not None)
+                else None
+            )
             receipt = {
                 "job_id": state.job_id,
                 "job_type": state.job_type,
@@ -2878,6 +3041,7 @@ class GPUQueue:
                     else performance_report.get('status') if performance_report else None),
                 "effective_cwd": job_cwd,
                 "effective_env": job_env,
+                "injected_env": injected_env,
                 "environment_inheritance": "worker-plus-overlay",
                 "managed_context": run_env.get('GPU_GREENROOM_CONTEXT'),
                 "managed_context_record": str(final_job_dir/'context.json') if request.cooperative_checkpoint else None,
@@ -2890,8 +3054,11 @@ class GPUQueue:
                 "child_process_group": state.child_process_group,
                 "child_start_identity": state.child_start_identity,
                 "ignored_params": ignored_params if ignored_params else None,
+                "submitted_at": request.submitted_at,
                 "started_at": state.started_at,
                 "finished_at": state.finished_at,
+                "queue_wait_seconds": queue_wait_seconds,
+                "execution_seconds": execution_seconds,
                 "exit_code": state.exit_code,
                 "failure_phase": state.failure_phase,
                 "error_message": state.error_message,
@@ -2969,6 +3136,13 @@ class GPUQueue:
                         "finished_at": state.finished_at,
                     }
                 )
+            print(
+                f"[job-end] {state.job_id} status={receipt['status']} "
+                f"exit_code={state.exit_code} "
+                f"exec={(execution_seconds or 0.0):.2f}s "
+                f"wait={queue_wait_seconds:.2f}s",
+                flush=True,
+            )
             if dispatch_policy.get('runtime_history'):
                 from .runtime_history import record_completion
                 try:
