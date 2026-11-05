@@ -102,14 +102,18 @@ def yield_if_requested(*,save_checkpoint,quiesce,continuation,on_submitted=None)
         return False
     if list(queue.control_receipts_dir.glob('*-'+request.job_id+'-signal-*.json')):
         return False
-    config=dispatch.policy(queue.queue_dir)
-    pending=dispatch.pending_order(queue.queue_dir,config)
-    pending_request, pending_digest = dispatch.read_request(pending[0]/'request.json') if pending else (None, None)
-    quick_waiting=bool(pending and dispatch.classify(pending_request,config,request_digest=pending_digest,queue_dir=queue.queue_dir)[0]=='quick')
-    hold = config.get('job_holds', {}).get(request.job_id)
-    if hold and hold['request_digest'] != hashlib.sha256((job/'request.json').read_bytes()).hexdigest():
-        raise ValueError('pause request identity changed')
-    if not hold and not queue.is_paused() and (state.get('dispatch',{}).get('service_class')!='normal' or not quick_waiting):
+    # Pending jobs may be cancelled/renamed by the operator while a producer runs.
+    # Keep enumeration and the selected request read in the same snapshot.
+    with queue._coordination_lock():
+        config=dispatch.policy(queue.queue_dir)
+        pending=dispatch.pending_order(queue.queue_dir,config)
+        pending_request, pending_digest = dispatch.read_request(pending[0]/'request.json') if pending else (None, None)
+        quick_waiting=bool(pending and dispatch.classify(pending_request,config,request_digest=pending_digest,queue_dir=queue.queue_dir)[0]=='quick')
+        hold = config.get('job_holds', {}).get(request.job_id)
+        if hold and hold['request_digest'] != hashlib.sha256((job/'request.json').read_bytes()).hexdigest():
+            raise ValueError('pause request identity changed')
+        paused = queue.is_paused()
+    if not hold and not paused and (state.get('dispatch',{}).get('service_class')!='normal' or not quick_waiting):
         return False
     directory=queue.queue_dir/'outputs'/request.job_id/'checkpoints'
     pins=RetentionPins(queue.queue_dir)
