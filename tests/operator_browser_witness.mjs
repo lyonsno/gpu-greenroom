@@ -93,9 +93,9 @@ try {
   await command('Page.enable');
   await command('Runtime.enable');
   markPhase('initial-render');
-  await command('Page.navigate', {url: `${base}/#smoke-${requestId}`});
+  await command('Page.navigate', {url: `${base}/#${scenario==='attention'?'job':'smoke'}-${requestId}`});
   try {
-    await eventually(() => evaluate(`Boolean(document.querySelector('#smokeRequestList .smoke-card'))`), Boolean, 'initial Greenroom request render');
+    await eventually(() => evaluate(scenario==='attention'?`Boolean(document.querySelector('[data-performance="defer"]:not(:disabled)'))`:`Boolean(document.querySelector('#smokeRequestList .smoke-card'))`), Boolean, 'initial Greenroom request render');
   } catch (error) {
     writeFileSync(join(artifactDirectory, `${scenario}-document.json`), await evaluate(`JSON.stringify({href:location.href,body:document.body?.innerText})`));
     throw error;
@@ -107,7 +107,30 @@ try {
   writeFileSync(artifact, Buffer.from(initialFrame.data, 'base64'));
   screenshotArtifact = artifact;
 
-  if (scenario === 'lease-recovery') {
+  if (scenario === 'attention') {
+    for(const [width,height] of [[1440,1000],[390,844]]) {
+      await command('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:width===390});
+      await delay(250);
+      const layout=await evaluate(`({text:document.querySelector('#operatorAttention').innerText,overflow:document.documentElement.scrollWidth>innerWidth,buttons:[...document.querySelectorAll('#operatorAttention button')].map(n=>{const r=n.getBoundingClientRect();return {left:r.left,right:r.right,width:r.width}})})`);
+      assert.ok(layout.text.includes('Needs you'));
+      assert.ok(layout.text.includes('Quit Chrome'));
+      assert.equal(layout.overflow,false);
+      assert.ok(layout.buttons.every(b=>b.left>=0&&b.right<=width&&b.width>=30));
+      const shot=await command('Page.captureScreenshot',{format:'png',fromSurface:true});
+      writeFileSync(join(artifactDirectory,`attention-${width}.png`),Buffer.from(shot.data,'base64'));
+    }
+    await evaluate(`window.__decisions=[];const realFetch=window.fetch.bind(window);window.fetch=async(i,o)=>{if(String(i).endsWith('/api/performance-decision'))window.__decisions.push(JSON.parse(o.body));return realFetch(i,o)};const n=document.querySelector('[data-delay]');n.value='7';n.dispatchEvent(new Event('input',{bubbles:true}));n.focus()`);
+    await delay(5200);
+    assert.equal(await evaluate(`document.querySelector('[data-delay]').value`),'7');
+    await evaluate(`document.querySelector('[data-performance="defer"]').click()`);
+    await eventually(()=>evaluate(`last.jobs.find(j=>j.job_id===${JSON.stringify(requestId)})?.status`),v=>v==='deferred','actual worker deferral');
+    await eventually(()=>evaluate(`!attention.items.some(i=>i.job_id===${JSON.stringify(requestId)})`),Boolean,'cleared durable attention');
+    const decisions=await evaluate('window.__decisions');
+    assert.equal(decisions.length,1);
+    assert.equal(decisions[0].defer_minutes,7);
+    console.log(JSON.stringify({scenario,sourceRevision,effectiveRoute:base,browser:browserVersion.Browser,
+      artifact,decisions,assertions:['persistent top attention','desktop/mobile fit','delay draft survives refresh','one authenticated exact-attempt decision','worker defers without execution','attention clears']}));
+  } else if (scenario === 'lease-recovery') {
     await eventually(()=>evaluate(`document.querySelector('#queueState').textContent`),text=>text.includes('External workload blocks starts'),'effective external blocker');
     await evaluate(`window.__recoverCalls=[];window.__realFetch=window.fetch.bind(window);window.fetch=async(input,options)=>{if(String(input).endsWith('/api/lease/recover')){if(!window.__recoverCalls.length){window.__recoverCalls.push({status:'injected-network-failure',body:JSON.parse(options.body)});throw new Error('injected recovery network failure')}const r=await window.__realFetch(input,options);window.__recoverCalls.push({status:r.status,body:JSON.parse(options.body)});return r}return window.__realFetch(input,options)}`);
     for(const [width,height] of [[1440,1000],[390,844]]) {

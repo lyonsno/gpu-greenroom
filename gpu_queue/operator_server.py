@@ -9,6 +9,7 @@ import html
 import json
 import math
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -21,6 +22,7 @@ from .models import JobRequest
 from .admission_control import transition
 from .smoke_requests import READER_SHA256, SmokeRequestConflict, SmokeRequests
 from . import dispatch
+from .operator_attention import snapshot as attention_snapshot
 
 
 PAGE = r"""<!doctype html>
@@ -37,6 +39,7 @@ PAGE = r"""<!doctype html>
 dialog{width:480px;max-width:calc(100vw - 24px);max-height:calc(100dvh - 24px);overflow:auto;background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:20px}dialog::backdrop{background:#0009}dialog h2{font:600 18px/1.3 system-ui;margin:0 0 14px}dialog p{overflow-wrap:anywhere;white-space:pre-wrap}.dialog-actions{display:flex;justify-content:flex-end;flex-wrap:wrap;gap:10px;margin-top:20px}
 .job-actions.actions{width:100%;text-align:left;justify-content:flex-start;align-items:center;flex-wrap:wrap}.job-actions>button{flex-shrink:0;max-width:100%;height:auto;min-height:34px;white-space:normal;overflow-wrap:normal;padding:7px 10px}.job-actions>.meta{flex:0 1 auto;min-width:0}.job-actions>label{display:flex;align-items:center;gap:6px}.job-actions input{flex-shrink:0}#requeueDialog select{display:block;width:100%;margin-top:8px;min-height:36px;font:inherit;color:var(--text);background:#25292d;border:1px solid var(--line);border-radius:4px}#requeueDialog label{display:block}
 #lease{border-left:3px solid var(--amber);border-bottom:1px solid var(--line);padding:12px 14px;margin-top:14px;font-size:14px;overflow-wrap:anywhere}#lease[hidden]{display:none}#lease strong{color:var(--amber)}#lease .lease-controls{margin-top:12px}#leaseRecoveryDialog label{display:flex;align-items:flex-start;gap:8px}#leaseRecoveryDialog input{margin-top:4px;flex-shrink:0}#leaseRecoveryDialog .meta{margin-top:12px}#queueState{overflow-wrap:anywhere}
+#operatorAttention{border-left:3px solid var(--amber);padding:12px 14px;margin:12px 0;border-bottom:1px solid var(--line);overflow-wrap:anywhere}#operatorAttention h2{font:600 17px system-ui;margin:0 0 8px}#operatorAttention article{padding:10px 0;border-top:1px solid var(--line)}#operatorAttention .attention-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px}#operatorAttention button{height:auto;min-height:34px}#operatorAttention input{width:76px;min-height:34px;background:var(--bg);color:var(--text);border:1px solid var(--line);font:inherit;padding:6px}#operatorAttention a{color:var(--blue)}.job-item{scroll-margin-top:110px}
 @media(max-width:760px){header{display:grid;grid-template-columns:minmax(0,1fr) repeat(3,32px);gap:6px}header h1{grid-column:1;grid-row:1}.state{grid-column:1/-1;grid-row:2}#pause{grid-column:2;grid-row:1}#resume{grid-column:3;grid-row:1}#refresh{grid-column:4;grid-row:1}}
 </style>
 </head>
@@ -77,6 +80,39 @@ function auth(){return {'Authorization':'Bearer '+token,'Content-Type':'applicat
 let busy=false,draggedJob=null,queueAvailable=false;
 // Freshness belongs to the successful read, never to a redraw of cached data.
 const pollMs=5000,staleMs=3*pollMs,freshness={queue:{},smoke:{}};
+let attention=null,attentionError=null,attentionLoading=false;const attentionDelays=new Map();
+let jobArrivalHandled=false;
+function focusJobTarget(){if(jobArrivalHandled||!location.hash.startsWith('#job-'))return;const n=document.getElementById(location.hash.slice(1));if(n){n.scrollIntoView({block:'start'});jobArrivalHandled=true}}
+document.addEventListener('click',async event=>{const link=event.target.closest('a[href]');if(!link)return;const url=new URL(link.href);if(url.origin===location.origin&&url.hash.startsWith('#job-')){event.preventDefault();history.replaceState(null,'',url.pathname+url.search+url.hash);jobArrivalHandled=false;filter='active';await load();focusJobTarget()}});
+function attentionFresh(){return attention&&!attentionError&&Date.now()<Date.parse(attention.valid_until)}
+function renderAttention(){
+  let host=document.querySelector('#operatorAttention');if(!host){host=document.createElement('section');host.id='operatorAttention';host.setAttribute('aria-label','Operator attention');document.querySelector('main').prepend(host)}
+  const focusDelay=host.contains(document.activeElement)?document.activeElement.dataset.delay:null;
+  const items=attention?.items||[],fresh=attentionFresh(),disabled=!fresh||!queueAvailable||busy||!last?.job_control;
+  host.hidden=fresh&&items.length===0;
+  host.innerHTML='<h2>'+(!fresh?'Operator attention unavailable or stale':'Needs you · '+items.filter(i=>i.status==='waiting').length)+'</h2>'+(!fresh?'<p class="meta">'+esc(attentionError||'Waiting for a fresh service observation')+'</p>':'')+items.map(item=>{
+    const job=last?.jobs.find(j=>j.job_id===item.job_id),p=job?.performance_window;
+    const usable=!disabled&&item.web_action&&job?.status==='running'&&p?.attempt_id===item.attempt_id;
+    const controls=item.kind==='performance-confirmation'?(item.web_action?`<p>Quit Chrome or stop competing GPU activity before starting this measurement.</p><div class="attention-actions"><button data-performance="start" data-job="${esc(item.job_id)}" ${usable?'':'disabled'}>▶ Start measurement</button><label>Remind in <input type="number" min="0.01" step="any" value="${esc(attentionDelays.get(item.id)||5)}" data-delay="${esc(item.id)}" aria-label="Reminder minutes"> minutes</label><button data-performance="defer" data-job="${esc(item.job_id)}" ${usable?'':'disabled'}>Remind me later</button><button data-performance="cancel" data-job="${esc(item.job_id)}" ${usable?'':'disabled'}>Cancel run</button></div>`:'<p class="meta">This running attempt predates shared web decisions. Answer its native prompt; an updated worker is required for web response.</p>'):item.kind==='runtime-overrun'?`<p class="meta">Owner message: ${esc(item.owner_delivery)}${item.owner_report?' · Owner reports: '+esc(item.owner_report.note):''}</p><div class="attention-actions">${item.status==='waiting'?`<button data-watch="${esc(item.id)}" ${disabled?'disabled':''}>Keep watching · dismiss popup</button>`:'<span class="meta">Watching; job remains running</span>'}${job?.pause_control?.supported?`<button data-attention-pause="${esc(item.job_id)}" ${disabled?'disabled':''}>Ⅱ Request safe pause</button>`:'<span class="meta">Pause unsupported; see job controls to contact owner</span>'}</div>`:'';
+    return `<article id="attention-${esc(item.id)}"><strong>${esc(item.title)}</strong>${item.agent_id?'<div class="meta">'+esc(document.body.dataset.identityLabel||'Agent')+': '+esc(item.agent_id)+' · '+esc(item.job_id)+'</div>':''}<p>${esc(item.summary||'')}</p>${controls}<div class="attention-actions"><a href="${esc(item.target_url)}">${item.kind==='smoke'?'Open request':'View job and controls'}</a></div></article>`;
+  }).join('');
+  host.querySelectorAll('[data-delay]').forEach(n=>n.oninput=()=>attentionDelays.set(n.dataset.delay,n.value));
+  host.querySelectorAll('[data-performance]').forEach(n=>n.onclick=()=>answerPerformance(n.dataset.job,n.dataset.performance));
+  host.querySelectorAll('[data-watch]').forEach(n=>n.onclick=async()=>{try{await post('/api/attention-acknowledge',{item_id:n.dataset.watch});await loadAttention()}catch(e){err(e.message)}});
+  host.querySelectorAll('[data-attention-pause]').forEach(n=>n.onclick=()=>jobAction(n.dataset.attentionPause,'pause',{allow_bypass:true}));
+  if(focusDelay)host.querySelector(`[data-delay="${CSS.escape(focusDelay)}"]`)?.focus({preventScroll:true});
+}
+async function answerPerformance(id,action){
+  if(!attentionFresh()||!queueAvailable||busy)return;
+  const job=last?.jobs.find(j=>j.job_id===id),item=attention.items.find(i=>i.job_id===id&&i.kind==='performance-confirmation');
+  if(!job||!item)return;
+  const minutes=Number(attentionDelays.get(item.id)||5);if(action==='defer'&&(!Number.isFinite(minutes)||minutes<=0)){err('Choose a positive reminder delay');return}
+  try{await post('/api/performance-decision',{job_id:id,request_digest:job.request_digest,expected_started_at:job.started_at,attempt_id:item.attempt_id,action,defer_minutes:minutes});await loadAttention()}catch(e){err(e.message)}
+}
+async function loadAttention(){
+  if(attentionLoading)return;attentionLoading=true;
+  try{const r=await request('/api/attention',{headers:auth(),cache:'no-store'});if(!r.ok)throw new Error(await r.text());const value=await r.json();if(value.schema!=='gpu-greenroom.operator-attention.v1'||!Array.isArray(value.items)||!Number.isFinite(Date.parse(value.valid_until)))throw new Error('Invalid attention snapshot');attention=value;attentionError=value.errors?.length?value.errors.join('; '):null}catch(e){attentionError=e.message}finally{attentionLoading=false;renderAttention()}
+}
 let queueLoadGeneration=0,queueLoading=false,smokeLoading=false;
 function initFreshness(){
   const bar=document.createElement('div');bar.className='meta';
@@ -113,6 +149,7 @@ function updateFreshness(){
   }
   if(!readFresh('smoke')){smokeRefreshUnavailable=true;document.querySelectorAll('#smokeRequestList button').forEach(n=>n.disabled=true)}
   if(freshness.smoke.error&&smokeHasLoaded)document.querySelector('#smokeStatus').textContent='Refresh failed; showing last loaded requests';
+  renderAttention();
 }
 function canMove(j){return queueAvailable&&!busy&&j?.consistent&&j.status==='pending'&&j.request_digest&&!j.dispatch_error&&!last?.dispatch?.error&&last?.dispatch?.policy?.mode==='two-class'&&document.body.dataset.readOnly!=='true'&&(!last?.read_only||last?.admission_control)}
 function finishDrag(){draggedJob=null;document.querySelectorAll('.drop-target').forEach(n=>n.classList.remove('drop-target'));if(last)render(last)}
@@ -246,7 +283,7 @@ function render(s){
     const conflict=performanceWindow(j)+runtimeHint(j)+pauseEstimate(j)+(j.consistent?'':`<div class="meta">containment: ${esc(j.containment_status)} · declared: ${esc(j.declared_status)}</div>`);
     const manual=j.dispatch_override||j.dispatch?.operator_override;
     const choice=canMove(j)?`<label class="queue-choice">Queue <select class="dispatchClass" aria-label="Queue for ${esc(j.job_id)}" data-job-id="${esc(j.job_id)}"><option value="normal" ${j.dispatch_class==='normal'?'selected':''}>Automatic</option><option value="quick" ${j.dispatch_class==='quick'?'selected':''}>Quick</option></select></label>`:'';
-    return `<article class="job-item" data-job-id="${esc(j.job_id)}" draggable="${canMove(j)}"><div class="job-heading"><strong>${esc(j.job_id)}</strong><span class="pill ${esc(j.status)}">${esc(j.status)}</span>${j.dispatch_class==='quick'?`<span class="pill quick" title="${esc(j.dispatch_basis)}">${manual?'Manual Quick':'Quick'}</span>`:manual?'<span class="meta">Manual Automatic</span>':''}${j.queue_position?`<span class="meta">Queue ${esc(j.queue_position)}</span>`:''}</div>${conflict}<div class="route">${esc(route)}</div><div class="meta">${esc(document.body.dataset.identityLabel||'Agent')}: ${esc(j.agent_id||'not recorded')} · ${esc(j.job_type)}</div><div class="meta">${esc(j.repo_root||j.output_dir||j.record_error||'')}</div>${j.dispatch_error?'<div class="meta failed">Dispatch classification: '+esc(j.dispatch_error)+'</div>':''}<div class="job-timing"><div>Submitted: ${j.submitted_at?esc(new Date(j.submitted_at*1000).toLocaleString()):'not recorded'}</div><div>Queue wait: ${duration(j.queue_wait_seconds)}</div><div>Execution wall time: ${duration(j.execution_wall_seconds)}</div><div>GPU hold time: not recorded</div></div>${choice}<div class="job-actions actions">${a}</div></article>`;
+    return `<article id="job-${esc(j.job_id)}" class="job-item" data-job-id="${esc(j.job_id)}" draggable="${canMove(j)}"><div class="job-heading"><strong>${esc(j.job_id)}</strong><span class="pill ${esc(j.status)}">${esc(j.status)}</span>${j.dispatch_class==='quick'?`<span class="pill quick" title="${esc(j.dispatch_basis)}">${manual?'Manual Quick':'Quick'}</span>`:manual?'<span class="meta">Manual Automatic</span>':''}${j.queue_position?`<span class="meta">Queue ${esc(j.queue_position)}</span>`:''}</div>${conflict}<div class="route">${esc(route)}</div><div class="meta">${esc(document.body.dataset.identityLabel||'Agent')}: ${esc(j.agent_id||'not recorded')} · ${esc(j.job_type)}</div><div class="meta">${esc(j.repo_root||j.output_dir||j.record_error||'')}</div>${j.dispatch_error?'<div class="meta failed">Dispatch classification: '+esc(j.dispatch_error)+'</div>':''}<div class="job-timing"><div>Submitted: ${j.submitted_at?esc(new Date(j.submitted_at*1000).toLocaleString()):'not recorded'}</div><div>Queue wait: ${duration(j.queue_wait_seconds)}</div><div>Execution wall time: ${duration(j.execution_wall_seconds)}</div><div>GPU hold time: not recorded</div></div>${choice}<div class="job-actions actions">${a}</div></article>`;
   }).join('');
   document.querySelector('#jobs').innerHTML=jobMarkup(automatic);
   document.querySelector('#quickJobs').innerHTML=jobMarkup(quick);
@@ -255,6 +292,7 @@ function render(s){
     item.ondragend=finishDrag;
   });
   document.querySelectorAll('.dispatchClass').forEach(select=>select.onchange=()=>moveJob(s.jobs.find(j=>j.job_id===select.dataset.jobId),select.value));
+  focusJobTarget();
   updateFreshness();
 }
 async function load(){
@@ -387,7 +425,7 @@ function askCancel(id,force=false){
 }
 async function confirmCancel(){const selection=cancelSelection;if(!selection)return;document.querySelector('#cancelDialog').close();try{await post('/api/job-cancel',selection)}catch(e){err(e.message)}}
 async function act(kind,id){askCancel(id,kind==='kill')}
-document.querySelector('#pause').onclick=()=>post('/api/pause',{requested_by:'operator-console'}).catch(e=>err(e.message));document.querySelector('#resume').onclick=()=>post('/api/resume',{requested_by:'operator-console',epoch:last?.pause_state?.epoch}).catch(e=>err(e.message));document.querySelector('#refresh').onclick=load;document.querySelector('#refreshSmoke').onclick=loadSmoke;bindDropTargets();initFreshness();updateFreshness();load();loadSmoke();setInterval(()=>{if(liveQueueView()&&!queueLoading)load();if(!smokeLoading)loadSmoke()},pollMs);setInterval(updateFreshness,1000);document.addEventListener('visibilitychange',()=>{updateFreshness();if(!document.hidden){load();loadSmoke()}});
+document.querySelector('#pause').onclick=()=>post('/api/pause',{requested_by:'operator-console'}).catch(e=>err(e.message));document.querySelector('#resume').onclick=()=>post('/api/resume',{requested_by:'operator-console',epoch:last?.pause_state?.epoch}).catch(e=>err(e.message));document.querySelector('#refresh').onclick=()=>{load();loadAttention()};document.querySelector('#refreshSmoke').onclick=loadSmoke;bindDropTargets();initFreshness();updateFreshness();load();loadSmoke();loadAttention();setInterval(()=>{if(liveQueueView()&&!queueLoading)load();if(!smokeLoading)loadSmoke();loadAttention()},pollMs);setInterval(updateFreshness,1000);document.addEventListener('visibilitychange',()=>{updateFreshness();if(!document.hidden){load();loadSmoke();loadAttention()}});
 </script></body></html>"""
 
 
@@ -805,6 +843,17 @@ def make_handler(queue: GPUQueue | Path, token: str, *, read_only: bool = False,
                     return
                 self._json(HTTPStatus.OK, snapshot)
                 return
+            if path == '/api/attention':
+                root = queue if isinstance(queue,Path) else queue.queue_dir
+                try:
+                    value = json.loads((root/'operator-attention.json').read_text())
+                    if value.get('schema') != 'gpu-greenroom.operator-attention.v1':
+                        raise ValueError('invalid attention snapshot')
+                except (OSError,ValueError,TypeError) as error:
+                    self._json(HTTPStatus.SERVICE_UNAVAILABLE,{'error':str(error)})
+                    return
+                self._json(HTTPStatus.OK,value)
+                return
             self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
         def do_POST(self):
@@ -819,6 +868,51 @@ def make_handler(queue: GPUQueue | Path, token: str, *, read_only: bool = False,
                 self._json(HTTPStatus.FORBIDDEN, {"error": "read_only_monitor"})
                 return
             smoke_route = self._is_smoke_post_path(path)
+            if path in {'/api/performance-decision','/api/attention-acknowledge'}:
+                if not local_operator or not job_control:
+                    self._json(HTTPStatus.FORBIDDEN,{'error':'local_operator_job_controls_required'})
+                    return
+                try:
+                    body = self._body()
+                    root = queue if isinstance(queue,Path) else queue.queue_dir
+                    if path == '/api/attention-acknowledge':
+                        from .operator_attention import acknowledge
+                        if set(body) != {'item_id','request_id'}:
+                            raise ValueError('attention acknowledgement requires exact item identity')
+                        result = acknowledge(root,body['item_id'])
+                    else:
+                        from .performance_window import decide,decision,read_receipt
+                        if set(body) != {'job_id','request_digest','expected_started_at','attempt_id',
+                                        'request_id','action','defer_minutes'}:
+                            raise ValueError('performance decision requires exact attempt identity')
+                        if not isinstance(body['job_id'],str) or not re.fullmatch(r'[A-Za-z0-9_-]+',body['job_id']):
+                            raise ValueError('invalid job identity')
+                        q = GPUQueue(root)
+                        with q._coordination_lock():
+                            job = root/'running'/body['job_id']
+                            if not job.exists():
+                                candidates = [root/status/body['job_id'] for status in ('deferred','done','failed','cancelled')
+                                              if (root/status/body['job_id']).exists()]
+                                if len(candidates) != 1:
+                                    raise ValueError('performance attempt not found; refresh')
+                                job = candidates[0]
+                            request,digest = dispatch.read_request(job/'request.json')
+                            state = json.loads((job/'status.json').read_text())
+                            perf = read_receipt(job/'performance-window.json',JobRequest.from_json(json.dumps(request)))
+                            previous = decision(job,body['attempt_id'])
+                            expected_start = previous.get('started_at') if previous else state.get('started_at')
+                            if (digest != body['request_digest'] or expected_start != body['expected_started_at']
+                                    or (state.get('status') != 'running' and not previous)
+                                    or state.get('job_id') != body['job_id'] or perf.get('attempt_id') != body['attempt_id']
+                                    or perf.get('decision_protocol') != 'shared.v1'):
+                                raise ValueError('performance job changed or runner cannot consume web decisions')
+                            result = decide(job,attempt_id=body['attempt_id'],request_id=body['request_id'],
+                                action=body['action'],defer_minutes=body['defer_minutes'],source='operator-console')
+                except (OSError,ValueError,TypeError,KeyError,RuntimeError) as error:
+                    self._json(HTTPStatus.CONFLICT,{'error':str(error)})
+                    return
+                self._json(HTTPStatus.OK,result)
+                return
             if path == '/api/lease/recover':
                 if not local_operator:
                     self._json(HTTPStatus.FORBIDDEN, {'error':'local_operator_required'})
@@ -958,6 +1052,10 @@ def serve(queue_dir: str | Path, *, port: int = 8765, token: str | None = None, 
     queue = Path(queue_dir) if read_only or admission_control else GPUQueue(queue_dir)
     server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(queue, token, read_only=read_only, admission_control=admission_control, identity_label=identity_label, local_operator=local_operator, job_control=job_control))
     effective_port = server.server_address[1]
+    attention_stop = None
+    if not read_only and local_operator:
+        from .operator_attention import start
+        attention_stop = start(Path(queue_dir),operator_url(effective_port,token,local_operator=True))
     adapter = os.environ.get('GPU_GREENROOM_SMOKE_DELIVERY_ADAPTER')
     if adapter and not read_only:
         from .smoke_delivery import SmokeDelivery
@@ -965,7 +1063,12 @@ def serve(queue_dir: str | Path, *, port: int = 8765, token: str | None = None, 
         from .job_controls import start_feedback
         start_feedback(Path(queue_dir), adapter)
     print(operator_url(effective_port, token, local_operator=local_operator), flush=True)
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    finally:
+        if attention_stop:
+            attention_stop.set()
+        server.server_close()
 
 
 def main():

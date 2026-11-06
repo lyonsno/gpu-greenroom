@@ -884,6 +884,18 @@ def main():
     )
 
     sub = parser.add_subparsers(dest="command")
+    p_attention = sub.add_parser('attention-report',help='Report progress and revised remaining time for one running attempt')
+    p_attention.add_argument('--job-id',required=True)
+    p_attention.add_argument('--request-digest',required=True)
+    p_attention.add_argument('--started-at',type=float,required=True)
+    p_attention.add_argument('--remaining-seconds',type=float,required=True)
+    p_attention.add_argument('--note',required=True)
+    def report_attention(args):
+        from .operator_attention import progress
+        print(json.dumps(progress(Path(args.queue_dir).expanduser(),job_id=args.job_id,
+            request_digest=args.request_digest,started_at=args.started_at,note=args.note,
+            remaining_seconds=args.remaining_seconds),indent=2))
+    p_attention.set_defaults(func=report_attention)
     p_history = sub.add_parser('history', help='Read-only compatible command runtime history')
     p_history.add_argument('history_action', choices=['refresh','estimate'])
     p_history.add_argument('--index', required=True)

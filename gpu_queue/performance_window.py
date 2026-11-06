@@ -2,9 +2,12 @@
 
 import argparse
 import ctypes
+import fcntl
+import hashlib
 import json
 import math
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -15,6 +18,8 @@ import uuid
 CAPABILITY = 'performance-window.v1'
 SCHEMA = 'gpu-greenroom.performance-window.v1'
 DEFER_EXIT = 75
+# macOS SDK mach/message.h; observed on the effective CoreFoundation receive path.
+MACH_RCV_TIMED_OUT = 0x10004003
 
 
 def delay_seconds(minutes):
@@ -35,11 +40,65 @@ def atomic_write(path, value):
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
+        parent = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
     finally:
         Path(temporary).unlink(missing_ok=True)
 
 
-def _native_prompt(spec, error_message=None):
+def decision(job_dir, attempt_id):
+    if not isinstance(attempt_id, str) or not re.fullmatch(r'[a-f0-9]{32}', attempt_id):
+        raise ValueError('invalid performance attempt')
+    path = Path(job_dir)/f'performance-decision-{attempt_id}.json'
+    try:
+        value = json.loads(path.read_text())
+    except FileNotFoundError:
+        return None
+    if (value.get('attempt_id') != attempt_id or value.get('action') not in {'start','defer','cancel'}
+            or value.get('schema') != 'gpu-greenroom.performance-decision.v1'):
+        raise ValueError('invalid performance decision receipt')
+    if value['action'] == 'defer':
+        delay_seconds(value['defer_minutes'])
+    return value
+
+
+def decide(job_dir, *, attempt_id, request_id, action, source, defer_minutes=5):
+    """First valid native or web response wins; execution still belongs to the worker."""
+    if (not isinstance(request_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]+',request_id)
+            or action not in {'start','defer','cancel'} or not isinstance(source,str) or not source):
+        raise ValueError('invalid performance decision')
+    if action == 'defer':
+        delay_seconds(defer_minutes)
+    job_dir = Path(job_dir)
+    with (job_dir/'.performance-decision.lock').open('a') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        report = json.loads((job_dir/'performance-window.json').read_text())
+        if report.get('attempt_id') != attempt_id:
+            raise ValueError('performance attempt changed; refresh')
+        previous = decision(job_dir,attempt_id)
+        if previous:
+            return previous
+        if report.get('status') != 'waiting' or report.get('workload_started') is not False:
+            raise ValueError('performance attempt is no longer waiting')
+        value = {'schema':'gpu-greenroom.performance-decision.v1', 'job_id':report['job_id'],
+                 'attempt_id':attempt_id, 'request_id':request_id, 'action':action,
+                 'source':source, 'decided_at':time.time(),
+                 **({'defer_minutes':float(defer_minutes)} if action=='defer' else {})}
+        if (job_dir/'request.json').exists():
+            value['request_digest'] = hashlib.sha256((job_dir/'request.json').read_bytes()).hexdigest()
+            value['started_at'] = json.loads((job_dir/'status.json').read_text())['started_at']
+        atomic_write(job_dir/f'performance-decision-{attempt_id}.json',value)
+        return value
+
+
+def answer_from_decision(value):
+    return {'defer_minutes':value['defer_minutes']} if value['action']=='defer' else value['action']=='start'
+
+
+def _native_prompt(spec, error_message=None, *, check_answer=None):
     if sys.platform != 'darwin':
         raise RuntimeError('Native performance confirmation requires the macOS console')
     cf = ctypes.CDLL('/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation')
@@ -56,6 +115,8 @@ def _native_prompt(spec, error_message=None):
     cf.CFUserNotificationCreate.restype = ctypes.c_void_p
     cf.CFUserNotificationReceiveResponse.argtypes = [ctypes.c_void_p, ctypes.c_double, ctypes.POINTER(ctypes.c_ulong)]
     cf.CFUserNotificationReceiveResponse.restype = ctypes.c_int32
+    cf.CFUserNotificationCancel.argtypes = [ctypes.c_void_p]
+    cf.CFUserNotificationCancel.restype = ctypes.c_int32
     cf.CFUserNotificationGetResponseValue.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_long]
     cf.CFUserNotificationGetResponseValue.restype = ctypes.c_void_p
     cf.CFStringGetLength.argtypes = [ctypes.c_void_p]
@@ -74,7 +135,19 @@ def _native_prompt(spec, error_message=None):
         'Confirmation does not verify GPU quietness.')
     if error_message:
         message += '\n\n' + error_message
+    if spec.get('attention_url'):
+        message = (f"Job: {spec['job_id']}\nOwner: {spec.get('owner') or 'not recorded'}\n\n"
+                   f"{spec['reason']}\n\nThe owner was notified first. This alert does not stop the job. "
+                   'Greenroom has the current report and pause/owner controls.')
     values = []
+    notification = None
+    settled = False
+    native_path = (Path(spec['receipt_path']).parent/f"performance-native-{spec['attempt_id']}.json"
+                   if spec.get('receipt_path') and spec.get('attempt_id') else None)
+    def native_record(status, **fields):
+        if native_path:
+            atomic_write(native_path,{'schema':'gpu-greenroom.native-prompt.v1','job_id':spec['job_id'],
+                'attempt_id':spec['attempt_id'],'status':status,'at':time.time(),**fields})
     def keep(value):
         if not value:
             raise RuntimeError('Could not construct native performance confirmation')
@@ -86,11 +159,15 @@ def _native_prompt(spec, error_message=None):
         return keep(cf.CFStringCreateWithCString(None, text.encode('utf-8'), 0x08000100))
     try:
         dictionary = keep(cf.CFDictionaryCreateMutable(None, 0, None, None))
-        for name, text in (
+        fields = (
                 ('AlertHeader', 'Greenroom: performance measurement'), ('AlertMessage', message),
                 ('DefaultButtonTitle', 'Cancel run'), ('AlternateButtonTitle', 'Start measurement'),
                 ('OtherButtonTitle', 'Remind me later'), ('TextFieldTitles', 'Remind me in (minutes)'),
-                ('TextFieldValues', '5')):
+                ('TextFieldValues', '5'))
+        if spec.get('attention_url'):
+            fields = (('AlertHeader','Greenroom: runtime needs attention'),('AlertMessage',message),
+                      ('DefaultButtonTitle','Dismiss popup'),('AlternateButtonTitle','Open Greenroom'))
+        for name, text in fields:
             value = string(text)
             if name.startswith('TextField'):
                 value = keep(cf.CFArrayCreate(None, (ctypes.c_void_p * 1)(value), 1, None))
@@ -99,10 +176,34 @@ def _native_prompt(spec, error_message=None):
         notification = keep(cf.CFUserNotificationCreate(None, 0, 2, ctypes.byref(error), dictionary))
         if error.value:
             raise OSError(error.value, 'Native performance confirmation failed')
+        native_record('created',backend='CoreFoundation.CFUserNotificationCreate')
         response = ctypes.c_ulong(3)
-        code = cf.CFUserNotificationReceiveResponse(notification, 0, ctypes.byref(response))
-        if code:
-            raise OSError(code, 'Native performance response failed')
+        while True:
+            if check_answer and check_answer():
+                code = cf.CFUserNotificationCancel(notification)
+                if code:
+                    raise OSError(code,'Could not dismiss settled attention notification')
+                settled = True
+                return False
+            if spec.get('receipt_path') and spec.get('attempt_id'):
+                accepted = decision(Path(spec['receipt_path']).parent,spec['attempt_id'])
+                if accepted:
+                    code = cf.CFUserNotificationCancel(notification)
+                    if code:
+                        raise OSError(code,'Could not dismiss answered performance notification')
+                    settled = True
+                    native_record('dismissed-after-shared-decision',cancel_result=code,
+                                  decision_request_id=accepted['request_id'])
+                    return answer_from_decision(accepted)
+            # This bounds a blocking receive, not the operator's response window.
+            code = cf.CFUserNotificationReceiveResponse(notification, .25 if spec.get('receipt_path') or check_answer else 0,
+                                                       ctypes.byref(response))
+            if code == 0:
+                settled = True
+                native_record('native-response',response_flags=response.value)
+                break
+            if code != MACH_RCV_TIMED_OUT or not (spec.get('receipt_path') or check_answer):
+                raise OSError(code, 'Native performance response failed')
         if response.value == 2:
             value = cf.CFUserNotificationGetResponseValue(notification, key('TextFieldValues'), 0)
             if not value:
@@ -114,6 +215,8 @@ def _native_prompt(spec, error_message=None):
             return {'defer_minutes': buffer.value.decode('utf-8')}
         return response.value == 1
     finally:
+        if notification and not settled:
+            cf.CFUserNotificationCancel(notification)
         for value in reversed(values):
             cf.CFRelease(value)
 
@@ -222,17 +325,26 @@ def runner_command(job_dir, request, argv, timeout):
 
 
 def run(spec, *, prompt=None):
+    spec = {**spec, 'attempt_id':spec.get('attempt_id') or uuid.uuid4().hex}
     path = Path(spec['receipt_path'])
     report = {'schema': SCHEMA, 'job_id': spec['job_id'], 'owner': spec['owner'],
               'route': spec['route'], 'reason': spec['reason'], 'status': 'waiting',
               'phase': 'operator-confirmation', 'requested_at': time.time(),
               'backend': 'CoreFoundation.CFUserNotificationCreate',
+              'decision_protocol': 'shared.v1',
               'attempt_id': spec.get('attempt_id') or uuid.uuid4().hex,
               'quietness_proved': False, 'authority': 'operator-acknowledgement-only',
               'workload_started': False, 'workload_argv': spec['argv']}
     atomic_write(path, report)
     try:
-        answer = (prompt or native_dialog)(spec)
+        accepted = decision(path.parent,spec['attempt_id'])
+        answer = answer_from_decision(accepted) if accepted else (prompt or native_dialog)(spec)
+        accepted = decide(path.parent, attempt_id=spec['attempt_id'],request_id=uuid.uuid4().hex,
+                          action='defer' if isinstance(answer,dict) and 'defer_minutes' in answer else
+                                 'start' if answer is True else 'cancel', source='native',
+                          defer_minutes=answer.get('defer_minutes',5) if isinstance(answer,dict) else 5)
+        answer = answer_from_decision(accepted)
+        report['decision'] = accepted
         if isinstance(answer, dict) and 'defer_minutes' in answer:
             seconds = delay_seconds(answer['defer_minutes'])
             finished = time.time()

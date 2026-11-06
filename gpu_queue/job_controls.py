@@ -281,7 +281,7 @@ def feedback_event(path):
         raise ValueError('invalid saved job feedback')
     return {'schema':'gpu-greenroom.job-feedback-event.v1', 'event_id':value['event_id'],
             'request_id':value['job_id'], 'request_digest':value['request_digest'],
-            'kind':'pause-support', 'source':{'agent_id':value['target_diaulos']},
+            'kind':value.get('kind','pause-support'), 'source':{'agent_id':value['target_diaulos']},
             'record_path':str(path.resolve()), 'payload':{'text':value['text']}}
 
 
