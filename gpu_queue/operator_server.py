@@ -83,7 +83,7 @@ const pollMs=5000,staleMs=3*pollMs,freshness={queue:{},smoke:{}};
 let attention=null,attentionError=null,attentionLoading=false;const attentionDelays=new Map();
 let jobArrivalHandled=false;
 function focusJobTarget(){if(jobArrivalHandled||!location.hash.startsWith('#job-'))return;const n=document.getElementById(location.hash.slice(1));if(n){n.scrollIntoView({block:'start'});jobArrivalHandled=true}}
-document.addEventListener('click',async event=>{const link=event.target.closest('a[href]');if(!link)return;const url=new URL(link.href);if(url.origin===location.origin&&url.hash.startsWith('#job-')){event.preventDefault();history.replaceState(null,'',url.pathname+url.search+url.hash);jobArrivalHandled=false;filter='active';await load();focusJobTarget()}});
+function bindAttentionLinks(){document.addEventListener('click',async event=>{const link=event.target.closest('a[href]');if(!link)return;const url=new URL(link.href);if(url.origin===location.origin&&url.hash.startsWith('#job-')){event.preventDefault();history.replaceState(null,'',url.pathname+url.search+url.hash);jobArrivalHandled=false;filter='active';await load();focusJobTarget()}})}
 function attentionFresh(){return attention&&!attentionError&&Date.now()<Date.parse(attention.valid_until)}
 function renderAttention(){
   let host=document.querySelector('#operatorAttention');if(!host){host=document.createElement('section');host.id='operatorAttention';host.setAttribute('aria-label','Operator attention');document.querySelector('main').prepend(host)}
@@ -99,7 +99,7 @@ function renderAttention(){
   host.querySelectorAll('[data-delay]').forEach(n=>n.oninput=()=>attentionDelays.set(n.dataset.delay,n.value));
   host.querySelectorAll('[data-performance]').forEach(n=>n.onclick=()=>answerPerformance(n.dataset.job,n.dataset.performance));
   host.querySelectorAll('[data-watch]').forEach(n=>n.onclick=async()=>{try{await post('/api/attention-acknowledge',{item_id:n.dataset.watch});await loadAttention()}catch(e){err(e.message)}});
-  host.querySelectorAll('[data-attention-pause]').forEach(n=>n.onclick=()=>jobAction(n.dataset.attentionPause,'pause',{allow_bypass:true}));
+  host.querySelectorAll('[data-attention-pause]').forEach(n=>n.onclick=()=>pauseAttention(n.dataset.attentionPause,attention.items.find(i=>i.kind==='runtime-overrun'&&i.job_id===n.dataset.attentionPause)?.id));
   if(focusDelay)host.querySelector(`[data-delay="${CSS.escape(focusDelay)}"]`)?.focus({preventScroll:true});
 }
 async function answerPerformance(id,action){
@@ -108,6 +108,12 @@ async function answerPerformance(id,action){
   if(!job||!item)return;
   const minutes=Number(attentionDelays.get(item.id)||5);if(action==='defer'&&(!Number.isFinite(minutes)||minutes<=0)){err('Choose a positive reminder delay');return}
   try{await post('/api/performance-decision',{job_id:id,request_digest:job.request_digest,expected_started_at:job.started_at,attempt_id:item.attempt_id,action,defer_minutes:minutes});await loadAttention()}catch(e){err(e.message)}
+}
+async function pauseAttention(id,itemId){
+  if(!attentionFresh()||!queueAvailable||busy||!itemId)return;
+  if(await jobAction(id,'pause',{allow_bypass:true})){
+    try{await post('/api/attention-acknowledge',{item_id:itemId});await loadAttention()}catch(e){err(e.message)}
+  }
 }
 async function loadAttention(){
   if(attentionLoading)return;attentionLoading=true;
@@ -149,7 +155,6 @@ function updateFreshness(){
   }
   if(!readFresh('smoke')){smokeRefreshUnavailable=true;document.querySelectorAll('#smokeRequestList button').forEach(n=>n.disabled=true)}
   if(freshness.smoke.error&&smokeHasLoaded)document.querySelector('#smokeStatus').textContent='Refresh failed; showing last loaded requests';
-  renderAttention();
 }
 function canMove(j){return queueAvailable&&!busy&&j?.consistent&&j.status==='pending'&&j.request_digest&&!j.dispatch_error&&!last?.dispatch?.error&&last?.dispatch?.policy?.mode==='two-class'&&document.body.dataset.readOnly!=='true'&&(!last?.read_only||last?.admission_control)}
 function finishDrag(){draggedJob=null;document.querySelectorAll('.drop-target').forEach(n=>n.classList.remove('drop-target'));if(last)render(last)}
@@ -212,8 +217,8 @@ function jobControls(j){
   return `<span class="meta">${held?(p.phase==='paused'?'Paused':'Pause requested; waiting for checkpoint'):''}</span><button title="${held?'Resume':'Pause'} job" onclick="jobAction('${esc(j.job_id)}','${held?'resume':'pause'}',{allow_bypass:document.getElementById('bypass-${esc(j.job_id)}').checked})" ${disabled}>${held?'▶':'Ⅱ'}</button><label class="meta"><input id="bypass-${esc(j.job_id)}" type="checkbox" ${p.allow_bypass?'checked':''} ${disabled} onchange="${held?`jobAction('${esc(j.job_id)}','pause',{allow_bypass:this.checked})`:''}"> Let queued jobs run while paused</label>`;
 }
 async function jobAction(id,action,extra={}){
-  const job=last?.jobs.find(j=>j.job_id===id);if(!job)return;
-  try{await post('/api/job-action',{job_id:id,request_digest:job.request_digest,expected_status:job.status,expected_started_at:job.started_at??null,action,...extra})}catch(e){err(e.message)}
+  const job=last?.jobs.find(j=>j.job_id===id);if(!job||busy)return false;
+  try{await post('/api/job-action',{job_id:id,request_digest:job.request_digest,expected_status:job.status,expected_started_at:job.started_at??null,action,...extra});return true}catch(e){err(e.message);return false}
 }
 function askRequeue(id){
   const job=last?.jobs.find(j=>j.job_id===id);if(!job||!queueAvailable||busy)return;
@@ -425,7 +430,7 @@ function askCancel(id,force=false){
 }
 async function confirmCancel(){const selection=cancelSelection;if(!selection)return;document.querySelector('#cancelDialog').close();try{await post('/api/job-cancel',selection)}catch(e){err(e.message)}}
 async function act(kind,id){askCancel(id,kind==='kill')}
-document.querySelector('#pause').onclick=()=>post('/api/pause',{requested_by:'operator-console'}).catch(e=>err(e.message));document.querySelector('#resume').onclick=()=>post('/api/resume',{requested_by:'operator-console',epoch:last?.pause_state?.epoch}).catch(e=>err(e.message));document.querySelector('#refresh').onclick=()=>{load();loadAttention()};document.querySelector('#refreshSmoke').onclick=loadSmoke;bindDropTargets();initFreshness();updateFreshness();load();loadSmoke();loadAttention();setInterval(()=>{if(liveQueueView()&&!queueLoading)load();if(!smokeLoading)loadSmoke();loadAttention()},pollMs);setInterval(updateFreshness,1000);document.addEventListener('visibilitychange',()=>{updateFreshness();if(!document.hidden){load();loadSmoke();loadAttention()}});
+document.querySelector('#pause').onclick=()=>post('/api/pause',{requested_by:'operator-console'}).catch(e=>err(e.message));document.querySelector('#resume').onclick=()=>post('/api/resume',{requested_by:'operator-console',epoch:last?.pause_state?.epoch}).catch(e=>err(e.message));document.querySelector('#refresh').onclick=()=>{load();loadAttention()};document.querySelector('#refreshSmoke').onclick=loadSmoke;bindDropTargets();bindAttentionLinks();initFreshness();updateFreshness();renderAttention();load();loadSmoke();loadAttention();setInterval(()=>{if(liveQueueView()&&!queueLoading)load();if(!smokeLoading)loadSmoke();loadAttention()},pollMs);setInterval(()=>{updateFreshness();renderAttention()},1000);document.addEventListener('visibilitychange',()=>{updateFreshness();renderAttention();if(!document.hidden){load();loadSmoke();loadAttention()}});
 </script></body></html>"""
 
 
@@ -846,9 +851,8 @@ def make_handler(queue: GPUQueue | Path, token: str, *, read_only: bool = False,
             if path == '/api/attention':
                 root = queue if isinstance(queue,Path) else queue.queue_dir
                 try:
-                    value = json.loads((root/'operator-attention.json').read_text())
-                    if value.get('schema') != 'gpu-greenroom.operator-attention.v1':
-                        raise ValueError('invalid attention snapshot')
+                    from .operator_attention import validate
+                    value = validate(json.loads((root/'operator-attention.json').read_text()))
                 except (OSError,ValueError,TypeError) as error:
                     self._json(HTTPStatus.SERVICE_UNAVAILABLE,{'error':str(error)})
                     return

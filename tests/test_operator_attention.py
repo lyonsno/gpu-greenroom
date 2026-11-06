@@ -6,6 +6,10 @@ from http.server import ThreadingHTTPServer
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 from unittest.mock import Mock
+import os
+import subprocess
+import sys
+from datetime import datetime
 
 import pytest
 
@@ -180,3 +184,78 @@ def test_http_performance_decision_is_authenticated_and_binds_current_request(tm
         server.shutdown()
         thread.join()
         server.server_close()
+
+
+@pytest.mark.parametrize('diagnostic',['record_error','performance_window_error','missing-performance'])
+def test_unreadable_running_observation_cannot_claim_fresh_empty_attention(tmp_path,diagnostic):
+    from gpu_queue.operator_attention import snapshot
+    row = {'job_id':'one','status':'running','containment_status':'running','consistent':True,
+           'request_digest':'d'*64,'performance_window_reason':'measure'}
+    if diagnostic != 'missing-performance':
+        row[diagnostic]='unreadable record'
+    if diagnostic=='record_error':
+        row['consistent']=False
+    result=snapshot(tmp_path,{'jobs':[row]},'http://127.0.0.1:1/',now=1000)
+    assert result['errors'], 'Incomplete queue evidence was published as healthy empty attention'
+    assert result['items'][0]['job_id']=='one'
+    assert result['queue']['running']==1
+    assert datetime.fromisoformat(result['valid_until']).timestamp()==1000
+
+
+@pytest.mark.parametrize('invalid',[None,[],{'schema':'gpu-greenroom.operator-attention.v1'},
+    {'schema':'gpu-greenroom.operator-attention.v1','valid_until':'2099-01-01T00:00:00Z'}])
+def test_attention_api_returns_structured_unavailable_for_invalid_persisted_shape(tmp_path,invalid):
+    from gpu_queue.queue import GPUQueue
+    from gpu_queue.operator_server import make_handler
+    q=GPUQueue(tmp_path/'queue')
+    (q.queue_dir/'operator-attention.json').write_text(json.dumps(invalid))
+    server=ThreadingHTTPServer(('127.0.0.1',0),make_handler(q,'secret',local_operator=True))
+    thread=threading.Thread(target=server.serve_forever,daemon=True)
+    thread.start()
+    try:
+        with pytest.raises(HTTPError) as error:
+            urlopen(Request(f'http://127.0.0.1:{server.server_port}/api/attention',headers={'Authorization':'Bearer secret'}))
+        assert error.value.code==503
+        assert json.load(error.value)['error']
+    finally:
+        server.shutdown();thread.join();server.server_close()
+
+
+def test_native_witness_worker_refusal_is_failed_process_and_primary_report(tmp_path):
+    result=subprocess.run([sys.executable,'-m','tests.native_attention_witness','--output',str(tmp_path/'witness'),
+        '--port','0','--native','--auto-web-defer'],capture_output=True,text=True,
+        env={**os.environ,'GPU_GREENROOM_WORKER_CAPABILITIES':''})
+    assert result.returncode!=0, 'Failed automatic conformance returned process success'
+    primary=json.loads((tmp_path/'witness'/'witness.json').read_text())
+    assert primary['phase']=='failed'
+    assert primary['error']
+    assert json.loads((tmp_path/'witness'/'native-conformance.json').read_text())['phase']=='failed'
+
+
+def test_attention_schema_accepts_additions_but_not_retyped_or_missing_authority(tmp_path):
+    from gpu_queue.operator_attention import snapshot,validate
+    value=snapshot(tmp_path,{'jobs':[]},'http://127.0.0.1:8766/',now=1000)
+    assert validate({**value,'future_additive_field':{'supported':True}})
+    for replacement in ({'items':[None]}, {'items':[{'id':'x','status':'waiting','title':'test','target_url':'javascript:alert(1)'}]},
+                        {'queue':{'running':True,'waiting':0}}, {'observed_at':'1970-01-01T00:16:40'},
+                        {'items':[{'id':'x','title':'missing status','target_url':'http://127.0.0.1/'}]}):
+        with pytest.raises(ValueError):
+            validate({**value,**replacement})
+
+
+@pytest.mark.parametrize('pause_fails',[False,True])
+def test_attention_pause_dismisses_popup_only_after_pause_is_accepted(pause_fails):
+    from gpu_queue.operator_server import PAGE
+    script=PAGE.split('<script>',1)[1].split('</script>',1)[0]
+    script=script[:script.index("document.querySelector('#pause').onclick")]
+    setup="globalThis.location={hash:'',pathname:'/',search:''};globalThis.sessionStorage={getItem:()=>''};"
+    action='''
+attention={valid_until:new Date(Date.now()+15000).toISOString()};queueAvailable=true;
+last={jobs:[{job_id:'one',request_digest:'d'.repeat(64),status:'running',started_at:100}]};
+const calls=[];post=async(path,body)=>{calls.push(path);if(FAIL&&path==='/api/job-action')throw Error('pause refused')};
+err=()=>{};loadAttention=async()=>{};
+(async()=>{if(typeof pauseAttention!=='function')throw Error('No shared pause-and-dismiss action');await pauseAttention('one','item');console.log(JSON.stringify(calls))})();
+'''.replace('FAIL','true' if pause_fails else 'false')
+    result=subprocess.run(['node','-e',setup+script+action],capture_output=True,text=True)
+    assert result.returncode==0,result.stderr
+    assert json.loads(result.stdout)==(['/api/job-action'] if pause_fails else ['/api/job-action','/api/attention-acknowledge'])

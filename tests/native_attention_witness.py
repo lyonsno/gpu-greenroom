@@ -35,6 +35,7 @@ def main():
     server = None
     stop = None
     worker = None
+    automatic_result = {}
     try:
         report['source_revision'] = subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
         report['source_diff'] = subprocess.check_output(['git','diff'],text=True)
@@ -91,6 +92,7 @@ def main():
                 except BaseException as error:
                     result={'phase':'failed','error':str(error)}
                 performance_window.atomic_write(args.output/'native-conformance.json',result)
+                automatic_result.update(result)
                 threading.Thread(target=server.shutdown,daemon=True).start()
             threading.Thread(target=answer_web,daemon=True).start()
         report['phase']='serving'
@@ -101,6 +103,11 @@ def main():
         signal.signal(signal.SIGTERM,shutdown)
         signal.signal(signal.SIGINT,shutdown)
         server.serve_forever()
+        if args.auto_web_defer:
+            report['native_conformance_path']=str(args.output/'native-conformance.json')
+            if automatic_result.get('phase') != 'complete':
+                raise RuntimeError(automatic_result.get('error') or 'Automatic conformance ended without a result')
+        report['phase']='complete'
     except BaseException as error:
         report.update(phase='failed',error=str(error))
         raise

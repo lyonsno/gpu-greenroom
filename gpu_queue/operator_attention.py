@@ -7,8 +7,10 @@ import json
 import math
 from pathlib import Path
 import re
+import shlex
 import threading
 import time
+from urllib.parse import urlparse
 
 from . import dispatch, performance_window
 
@@ -23,6 +25,48 @@ def stamp(value):
 
 def number(value):
     return type(value) in (int,float) and math.isfinite(value) and value >= 0
+
+
+def validate(value):
+    if not isinstance(value,dict) or value.get('schema') != SCHEMA:
+        raise ValueError('attention snapshot must be a supported object')
+    def date(field):
+        raw=value.get(field)
+        if not isinstance(raw,str):
+            raise ValueError('attention observation/deadline missing')
+        parsed=datetime.fromisoformat(raw.replace('Z','+00:00'))
+        if parsed.tzinfo is None:
+            raise ValueError('attention timestamps require an explicit timezone')
+        return parsed.timestamp()
+    if date('valid_until') < date('observed_at'):
+        raise ValueError('attention deadline predates observation')
+    def url(raw):
+        if not isinstance(raw,str):
+            raise ValueError('attention URL missing')
+        parsed=urlparse(raw)
+        if (parsed.scheme not in {'http','https'} or not parsed.hostname or parsed.username or parsed.password
+                or any(c.isspace() for c in raw)):
+            raise ValueError('attention URL must be an absolute HTTP(S) address')
+        parsed.port  # Validate explicit port syntax as well.
+    url(value.get('monitor_url'))
+    if not isinstance(value.get('queue_dir'),str) or not Path(value['queue_dir']).is_absolute():
+        raise ValueError('attention queue identity missing')
+    queue=value.get('queue')
+    if not isinstance(queue,dict) or any(type(queue.get(k)) is not int or queue[k]<0 for k in ('running','waiting')):
+        raise ValueError('attention queue counts missing or invalid')
+    if not isinstance(value.get('items'),list):
+        raise ValueError('attention items missing')
+    ids=set()
+    for item in value['items']:
+        if not isinstance(item,dict) or any(not isinstance(item.get(k),str) or not item[k] for k in ('id','title','status')):
+            raise ValueError('invalid attention item')
+        if item['id'] in ids:
+            raise ValueError('duplicate attention identity')
+        ids.add(item['id'])
+        url(item.get('target_url'))
+    if not isinstance(value.get('errors',[]),list) or any(not isinstance(e,str) for e in value.get('errors',[])):
+        raise ValueError('invalid attention diagnostics')
+    return value
 
 
 def attempt_key(row):
@@ -69,6 +113,18 @@ def snapshot(root, state, monitor_url, *, now=None):
     with (directory/'update.lock').open('a') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX)
         for row in state['jobs']:
+            diagnostics=[str(row[k]) for k in ('record_error','performance_window_error','runtime_hint_error') if row.get(k)]
+            if row.get('containment_status')=='running' and not row.get('consistent'):
+                diagnostics.append('running containment has inconsistent state')
+            if (row.get('status')=='running' and row.get('performance_window_reason')
+                    and not row.get('performance_window') and not row.get('performance_window_error')):
+                diagnostics.append('required performance receipt missing')
+            if diagnostics:
+                errors.extend(f'{row["job_id"]}: {message}' for message in diagnostics)
+                items.append({'id':'unverified-'+row['job_id'],'job_id':row['job_id'],
+                              'kind':'unverified','status':'unverified','title':'Job state unverified',
+                              'summary':'; '.join(diagnostics),'target_url':monitor_url+'#job-'+row['job_id']})
+                continue
             if row.get('status') != 'running' or not row.get('consistent') or not row.get('request_digest'):
                 continue
             job_id = row['job_id']
@@ -124,7 +180,7 @@ def snapshot(root, state, monitor_url, *, now=None):
                     'text':(f'Greenroom runtime check: {job_id} has exceeded its {expected:g}s producer estimate. '
                             f'Execution has run {now-start:.0f}s, excluding performance confirmation wait. '
                             'Please inspect progress or failure, then report a revised remaining time with '
-                            f'gpu-greenroom --queue-dir {root} attention-report --job-id {job_id} '
+                            f'gpu-greenroom --queue-dir {shlex.quote(str(root))} attention-report --job-id {job_id} '
                             f'--request-digest {row["request_digest"]} --started-at {row["started_at"]} '
                             '--remaining-seconds SECONDS --note "what is happening". '
                             'This is advisory, not a stop request. No acknowledgement-only reply is needed.')})
@@ -148,8 +204,8 @@ def snapshot(root, state, monitor_url, *, now=None):
                           'kind':'smoke','status':'waiting','target_url':monitor_url+'#smoke-'+request['id']})
     return {'schema':SCHEMA,'observed_at':stamp(now),'valid_until':stamp(now if errors else now+FRESH_SECONDS),
             'monitor_url':monitor_url,'queue_dir':str(root.resolve()),
-            'queue':{'running':sum(j.get('status')=='running' for j in state['jobs']),
-                     'waiting':sum(j.get('status') in {'pending','deferred'} for j in state['jobs']),
+            'queue':{'running':sum((j.get('containment_status') or j.get('status'))=='running' for j in state['jobs']),
+                     'waiting':sum((j.get('containment_status') or j.get('status')) in {'pending','deferred'} for j in state['jobs']),
                      'paused':state.get('paused')},'items':items,'errors':errors}
 
 
@@ -192,7 +248,7 @@ def start(root, monitor_url, *, notices=True):
         while not stop.is_set():
             try:
                 value = snapshot(root,queue_snapshot(root,'active',read_only=True),monitor_url)
-                dispatch.atomic_write(root/'operator-attention.json',value)
+                dispatch.atomic_write(root/'operator-attention.json',validate(value))
                 for item in value['items']:
                     if notices and item['kind']=='runtime-overrun' and item['status']=='waiting' and item['id'] not in popups:
                         record_path = root/'operator-attention'/(item['id']+'.json')

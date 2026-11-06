@@ -22,7 +22,7 @@ def test_shared_page_preserves_actions_and_explains_legacy_pause():
     harness = '''const vm=require('node:vm'); const nodes={};
 const context={URLSearchParams, location:{hash:'',pathname:'/'},history:{replaceState(){}},
 sessionStorage:{getItem(){return ''}},fetch(){return new Promise(()=>{})},setInterval(){},setTimeout(){},
-document:{body:{dataset:{}},createElement(){return {}},addEventListener(){},querySelector(s){return nodes[s]??=( {style:{},dataset:{},prepend(){}} )},querySelectorAll(){return []}}};
+document:{body:{dataset:{}},createElement(){return {}},addEventListener(){},querySelector(s){return nodes[s]??=( {style:{},dataset:{},prepend(){},contains(){return false},querySelectorAll(){return []}} )},querySelectorAll(){return []}}};
 vm.createContext(context);
 '''
     harness += 'vm.runInContext('+json.dumps(script)+',context);\n'
