@@ -99,6 +99,11 @@ def test_recovery_requires_positive_settlement_not_just_dead_server(queue, api):
 
 
 def test_confirmed_legacy_recovery_is_receipted_and_idempotent(queue, api):
+    import sys
+    from gpu_queue.models import JobRequest, JobStatus
+    pending = JobRequest(job_type='command', input_path='', command_argv=[sys.executable,'-c','pass'])
+    queue.submit(pending)
+    assert queue.run_one({}) is False
     before = queue.current_lease_path.read_bytes()
     body = recovery_request(queue)
     status, result = api(body)
@@ -110,6 +115,8 @@ def test_confirmed_legacy_recovery_is_receipted_and_idempotent(queue, api):
     assert receipt['original_record_json'].encode() == before
     assert receipt['request'] == body
     assert receipt['result'] == result
+    assert queue.run_one({}) is True
+    assert queue.get_job(pending.job_id).status == JobStatus.DONE
     assert api(body) == (200, result)
     conflict, _ = api({**body, 'reason':'different reason'})
     assert conflict == 409
