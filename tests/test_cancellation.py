@@ -420,9 +420,8 @@ def test_crash_recovery_cancel_precedes_both_deferral_paths(tmp_path,monkeypatch
     state.worker_pid,state.child_pid,state.child_process_group = 999999,child.pid,child.pid
     state.child_start_identity,state.worker_capabilities = identity,['job-cancellation.v1']
     (job/'status.json').write_text(state.to_json())
-    spec = {'job_id':request.job_id,'owner':request.agent_id,'route':request.job_type,
-        'reason':request.performance_window,'receipt_path':str(job/'performance-window.json'),
-        'argv':request.command_argv,'timeout':None}
+    launch = performance_window.runner_command(job,request,request.command_argv,None)
+    spec = json.loads(Path(launch[-1]).read_text())
     assert performance_window.run(spec,prompt=lambda _: {'defer_minutes':5})==performance_window.DEFER_EXIT
     report = performance_window.read_receipt(job/'performance-window.json',request)
     if committed:
