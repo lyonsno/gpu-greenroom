@@ -547,6 +547,12 @@ def cmd_doctor(args):
     running = queue.list_jobs(JobStatus.RUNNING)
     from .lease_controls import observe, admission
     lease, lease_blocker = observe(queue.queue_dir)
+    from . import dispatch
+    dispatch_error = None
+    try:
+        dispatch.pending_order(queue.queue_dir, dispatch.policy(queue.queue_dir))
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        dispatch_error = str(error)
     report = {
         "schema": "gpu-greenroom.doctor.v1",
         "healthy": all(check["ok"] for check in checks.values()),
@@ -554,7 +560,8 @@ def cmd_doctor(args):
         "cli_executable": cli_executable,
         "checks": checks,
         "execution_admission": admission(lease_blocker=lease_blocker,
-            paused=queue.is_paused(), running_ids=[job.job_id for job in running]),
+            paused=queue.is_paused(), running_ids=[job.job_id for job in running],
+            dispatch_error=dispatch_error),
         "lease": lease,
         "queue": {
             "paused": queue.is_paused(),

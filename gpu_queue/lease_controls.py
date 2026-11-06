@@ -8,7 +8,7 @@ from pathlib import Path
 import re
 import time
 
-from .admission_control import write_durable
+from .admission_control import sync_directory, write_durable
 from .models import ExternalLease, LeaseStatus
 
 
@@ -43,7 +43,15 @@ def observe(queue_dir):
                 or lease.ttl_seconds <= 0):
             raise ValueError('external lease renewal identity is invalid')
         age = max(0, time.time() - lease.renewed_at)
-        unknown = lease.lifecycle_state == LeaseStatus.OWNERSHIP_UNKNOWN or age > lease.ttl_seconds
+        unknown_reason = (lease.unknown_reason or 'ownership_unknown'
+                          if lease.lifecycle_state == LeaseStatus.OWNERSHIP_UNKNOWN
+                          else 'ttl_expired' if age > lease.ttl_seconds
+                          else 'holder_identity_unbound' if not lease.pid or not lease.process_start_identity
+                          else None)
+        unknown = unknown_reason is not None
+        if unknown:
+            payload = {**payload, 'recorded_lifecycle_state': lease.lifecycle_state.value,
+                       'lifecycle_state': 'ownership_unknown', 'unknown_reason': unknown_reason}
         return payload, {
             'kind': 'external_lease', 'lease_id': lease.lease_id,
             'owner': lease.owner, 'agent_id': lease.agent_id, 'repo_root': lease.repo_root,
@@ -51,7 +59,7 @@ def observe(queue_dir):
             'process_group': lease.process_group, 'process_start_identity': lease.process_start_identity,
             'lifecycle_state': 'ownership_unknown' if unknown else lease.lifecycle_state.value,
             'recorded_lifecycle_state': lease.lifecycle_state.value,
-            'reason': (lease.unknown_reason or 'ttl_expired') if unknown else lease.lifecycle_state.value,
+            'reason': unknown_reason if unknown else lease.lifecycle_state.value,
             'renewal_age_seconds': age, 'ttl_seconds': lease.ttl_seconds,
             'record_sha256': hashlib.sha256(raw).hexdigest(),
             'recovery': {
@@ -62,7 +70,7 @@ def observe(queue_dir):
                            'Recorded process identity alone does not establish external GPU settlement'),
             },
         }
-    except (ValueError, TypeError, KeyError, AttributeError, UnicodeError) as error:
+    except (ValueError, TypeError, KeyError, AttributeError, UnicodeError, OverflowError) as error:
         return None, _unreadable(error)
 
 
@@ -166,6 +174,7 @@ def recover(queue, *, lease_id, expected_record_sha256, expected_start_identity,
                     'settled_record_json': lease.to_json(), 'result': result,
                 }
                 directory.mkdir(exist_ok=True)
+                sync_directory(queue.queue_dir)
                 write_durable(receipt_path, prior)
                 settled = lease
             queue._write_lease_locked(settled)

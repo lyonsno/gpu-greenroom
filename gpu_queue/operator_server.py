@@ -201,6 +201,7 @@ function renderLease(s){
   host.innerHTML=`<strong>${unknown?'External ownership unknown; queue blocked':'External workload holds the queue'}</strong><div>${esc(blocker.owner)} · ${esc(blocker.effective_route)}</div><div class="meta">Lease: ${esc(blocker.lease_id)}<br>Reported by: ${esc(blocker.agent_id)}<br>${esc(blocker.repo_root)}<br>State: ${esc(blocker.lifecycle_state)} · ${esc(blocker.reason)}<br>Last renewal: ${duration(blocker.renewal_age_seconds)} ago · TTL: ${duration(blocker.ttl_seconds)}<br>Recorded PID: ${esc(blocker.pid??'not recorded')} · Process group: ${esc(blocker.process_group??'not recorded')}<br>${esc(blocker.recovery.reason)}</div>${blocker.recovery.available&&s.lease_recovery_enabled?'<div class="lease-controls"><button id="reviewLease" type="button">Review recovery</button></div>':''}`;
   const review=host.querySelector('#reviewLease');if(review){review.disabled=busy||!queueAvailable;review.onclick=()=>askLeaseRecovery(blocker)}
 }
+let leaseRecoveryAttempt=null;
 function askLeaseRecovery(blocker){
   if(!queueAvailable||busy)return;
   let dialog=document.querySelector('#leaseRecoveryDialog');
@@ -208,8 +209,9 @@ function askLeaseRecovery(blocker){
   dialog.querySelector('#leaseRecoveryIdentity').textContent=`${blocker.owner}\n${blocker.effective_route}\nLease: ${blocker.lease_id}`;
   const checkbox=dialog.querySelector('#leaseStopped'),confirm=dialog.querySelector('#confirmLeaseRecovery');checkbox.checked=false;confirm.disabled=true;
   checkbox.onchange=()=>{confirm.disabled=!checkbox.checked||!queueAvailable||busy};
-  const body={lease_id:blocker.lease_id,expected_record_sha256:blocker.record_sha256,expected_start_identity:blocker.process_start_identity??null,request_id:crypto.randomUUID(),quiescence_confirmed:true,reason:'Operator confirms the external GPU workload, including browser work, has stopped'};
-  confirm.onclick=async()=>{if(!checkbox.checked||!queueAvailable||busy)return;dialog.close();try{await post('/api/lease/recover',body)}catch(e){err(e.message)}};
+  if(leaseRecoveryAttempt?.expected_record_sha256!==blocker.record_sha256)leaseRecoveryAttempt={lease_id:blocker.lease_id,expected_record_sha256:blocker.record_sha256,expected_start_identity:blocker.process_start_identity??null,request_id:crypto.randomUUID(),quiescence_confirmed:true,reason:'Operator confirms the external GPU workload, including browser work, has stopped'};
+  const body=leaseRecoveryAttempt;
+  confirm.onclick=async()=>{if(!checkbox.checked||!queueAvailable||busy)return;dialog.close();try{await post('/api/lease/recover',body);if(leaseRecoveryAttempt===body)leaseRecoveryAttempt=null}catch(e){err(e.message)}};
   dialog.showModal();dialog.querySelector('button[value="back"]').focus();
 }
 function render(s){
@@ -369,7 +371,7 @@ async function repeatSmoke(button){const id=button.dataset.id;if(smokeSubmitting
 async function loadSmokeRun(id){if(smokeRunLoads.has(id))return;smokeRunLoads.add(id);const version=smokeRunVersion(lastSmoke?.items.find(i=>i.request.id===id));try{const r=await request(`/api/smoke-requests/${encodeURIComponent(id)}/run`,{headers:auth()});if(!r.ok)throw new Error(await r.text());const run=await r.json(),item=lastSmoke?.items.find(i=>i.request.id===id);if(version!==smokeRunVersion(item))return;if(run.schema!=='gpu-greenroom.smoke-run.v1'||run.request_digest!==item?.request_digest||run.job_id!==item?.display?.job_id||run.review_digest!==item?.display?.review_digest)throw new Error('Last-run identity changed; refresh before loading');run.participation=item.response?.participation||'not-recorded';smokeRuns.set(id,run);smokeRunVersions.set(id,version);renderSmoke(lastSmoke)}catch(e){smokeRunOpen.delete(id);err(e.message)}finally{smokeRunLoads.delete(id)}}
 async function loadSmokeAudio(button){const id=button.dataset.id,index=button.dataset.index,item=lastSmoke?.items.find(i=>i.request.id===id),binding=smokeAudioBinding(item,index);if(!binding)return;button.disabled=true;try{const r=await request(`/api/smoke-requests/${encodeURIComponent(id)}/audio/${index}`,{headers:{...auth(),'X-Greenroom-Artifact-SHA256':item.presentation.review_artifacts[index].sha256}});if(!r.ok)throw new Error(await r.text());const blob=await r.blob();if(binding!==smokeAudioBinding(lastSmoke?.items.find(i=>i.request.id===id),index))return;const player=document.createElement('audio');player.controls=true;player.preload='metadata';player.src=URL.createObjectURL(blob);smokeAudio.set(id+':'+index,player);smokeAudioBindings.set(id+':'+index,binding);renderSmoke(lastSmoke)}catch(e){err(e.message);button.disabled=false}}
 async function sendSmokeResponse(event){event.preventDefault();const form=event.currentTarget,id=form.dataset.id,button=form.querySelector('button[type="submit"]'),participation=form.querySelector('input[name="participation"]:checked')?.value;let text=form.querySelector('textarea').value;if(participation==='not-tried'&&!text.trim())text="I didn't get to try this session.";if(smokeSubmitting.has(id)||smokeAccepted.has(id))return;smokeSubmitting.add(id);button.disabled=true;try{const r=await request(`/api/smoke-requests/${encodeURIComponent(id)}/response`,{method:'POST',headers:auth(),body:JSON.stringify({text,...(participation?{participation}:{})})});if(!r.ok)throw new Error(await r.text());smokeAccepted.add(id);smokeDrafts.delete(id);await loadSmoke()}catch(e){err(e.message)}finally{smokeSubmitting.delete(id);const current=document.querySelector(`form.smokeReply[data-id="${CSS.escape(id)}"] button[type="submit"]`);if(current)current.disabled=smokeRefreshUnavailable||smokeAccepted.has(id)}}
-async function post(path,body={}){if(busy)return;busy=true;if(last)render(last);try{const r=await request(path,{method:'POST',headers:auth(),body:JSON.stringify({...body,request_id:crypto.randomUUID()})});if(!r.ok)throw new Error(await r.text())}finally{busy=false;await load()}}
+async function post(path,body={}){if(busy)return;busy=true;if(last)render(last);try{const r=await request(path,{method:'POST',headers:auth(),body:JSON.stringify({request_id:crypto.randomUUID(),...body})});if(!r.ok)throw new Error(await r.text())}finally{busy=false;await load()}}
 let cancelSelection=null,cancelFocus=null;
 function askCancel(id,force=false){
   const job=last?.jobs.find(j=>j.job_id===id);if(!job||!queueAvailable||busy)return;
@@ -576,10 +578,6 @@ def queue_snapshot(queue: GPUQueue | Path, view: str = "all", *, read_only: bool
         else:
             paused, pause = True, json.loads(text) if text.strip() else None
     else:
-        try:
-            queue.lease_status()
-        except (OSError, ValueError, TypeError, KeyError):
-            pass
         paused, pause = queue.is_paused(), queue.pause_state()
     lease_payload, lease_blocker = lease_controls.observe(queue_dir)
     running_dir = queue_dir / 'running'

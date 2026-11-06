@@ -56,66 +56,70 @@ def _run_operator_browser_witness(tmp_path, scenario, *, responded=False):
     if '/Applications/Google Chrome.app/' in str(Path(chrome).resolve()):
         pytest.fail('The installed GUI Chrome app must not be used for headless verification')
 
-    queue_dir = tmp_path / "queue"
-    queue_dir.mkdir(exist_ok=True)
-    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(queue_dir, "secret", admission_control=True, local_operator=True, job_control=scenario=='job-cancel'))
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    base = f"http://127.0.0.1:{server.server_address[1]}"
-    identity = str(uuid4())
-    request = {
-        "schema": "gpu-greenroom.interactive-smoke.v1",
-        "id": identity,
-        "kind": "interactive-smoke",
-        "source": {"agent_id": "greenroom-floor-manager", "repo_root": str(tmp_path)},
-        "title": "Browser witness request",
-        "prompt": "Observe a deterministic local candidate page.",
-        "url": base,
-        "availability": "prepared",
-        "availability_note": "The isolated candidate monitor is running.",
-    }
-    smoke_requests = SmokeRequests(queue_dir / "smoke-requests")
-    smoke_requests.submit(request)
-    owned_worker = None
-    owned_queue = None
-    if scenario == 'job-cancel':
-        import sys
-        import time
-        owned_queue = GPUQueue(queue_dir)
-        marker = tmp_path/'cancel-browser-started'
-        running = JobRequest(job_type='command', input_path='', job_id='browser-running',
-            agent_id='fixture-running-owner', route_identity='fixture/browser-cancel-running',
-            command_argv=[sys.executable,'-c',f"import signal,time,pathlib; signal.signal(signal.SIGTERM,signal.SIG_IGN); pathlib.Path({str(marker)!r}).touch(); time.sleep(60)"])
-        owned_queue.submit(running)
-        owned_worker = threading.Thread(target=owned_queue.run_one,args=({},))
-        owned_worker.start()
-        until = time.monotonic()+8
-        while not marker.exists() and time.monotonic()<until:
-            time.sleep(.01)
-        assert marker.exists()
-        owned_queue.submit(JobRequest(job_type='command', input_path='', job_id='browser-pending',
-            agent_id='fixture-queued-owner', route_identity='fixture/browser-cancel-pending', command_argv=[sys.executable,'-c','pass']))
-    if scenario == 'quick-drag':
-        from tests.test_quick_dispatch import policy, submit
-        queue = GPUQueue(queue_dir)
-        queue.configure_dispatch(policy(), owner='synthetic-console-witness')
-        submit(queue, 'long', 1)
-        submit(queue, 'long', 2)
-    if scenario == 'lease-recovery':
-        from tests.test_external_blocker_recovery import legacy_lease
-        legacy_lease(GPUQueue(queue_dir))
-    if responded:
-        smoke_requests.respond(identity, "The local browser witness has a durable response.")
-    witness = Path(__file__).with_name("operator_browser_witness.mjs")
-    revision = subprocess.run(
-        ["git", "rev-parse", "HEAD"], check=True, capture_output=True, text=True,
-    ).stdout.strip()
-    diff = subprocess.run(
-        ["git", "diff", "--binary", "HEAD", "--", "gpu_queue", "tests"], check=True, capture_output=True,
-    ).stdout
-    source_fingerprint = hashlib.sha256(diff + b"\0" + witness.read_bytes()).hexdigest()[:12]
-    source_identity = f"{revision}+candidate-{source_fingerprint}"
+    server = thread = owned_worker = owned_queue = None
+    base = source_identity = result = None
+    phase = 'server-bind'
     try:
+        queue_dir = tmp_path / "queue"
+        queue_dir.mkdir(exist_ok=True)
+        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(queue_dir, "secret", admission_control=True, local_operator=True, job_control=scenario=='job-cancel'))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        phase = 'fixture-setup'
+        identity = str(uuid4())
+        request = {
+            "schema": "gpu-greenroom.interactive-smoke.v1",
+            "id": identity,
+            "kind": "interactive-smoke",
+            "source": {"agent_id": "greenroom-floor-manager", "repo_root": str(tmp_path)},
+            "title": "Browser witness request",
+            "prompt": "Observe a deterministic local candidate page.",
+            "url": base,
+            "availability": "prepared",
+            "availability_note": "The isolated candidate monitor is running.",
+        }
+        smoke_requests = SmokeRequests(queue_dir / "smoke-requests")
+        smoke_requests.submit(request)
+        if scenario == 'job-cancel':
+            import sys
+            import time
+            owned_queue = GPUQueue(queue_dir)
+            marker = tmp_path/'cancel-browser-started'
+            running = JobRequest(job_type='command', input_path='', job_id='browser-running',
+                agent_id='fixture-running-owner', route_identity='fixture/browser-cancel-running',
+                command_argv=[sys.executable,'-c',f"import signal,time,pathlib; signal.signal(signal.SIGTERM,signal.SIG_IGN); pathlib.Path({str(marker)!r}).touch(); time.sleep(60)"])
+            owned_queue.submit(running)
+            owned_worker = threading.Thread(target=owned_queue.run_one,args=({},))
+            owned_worker.start()
+            until = time.monotonic()+8
+            while not marker.exists() and time.monotonic()<until:
+                time.sleep(.01)
+            assert marker.exists()
+            owned_queue.submit(JobRequest(job_type='command', input_path='', job_id='browser-pending',
+                agent_id='fixture-queued-owner', route_identity='fixture/browser-cancel-pending', command_argv=[sys.executable,'-c','pass']))
+        if scenario == 'quick-drag':
+            from tests.test_quick_dispatch import policy, submit
+            queue = GPUQueue(queue_dir)
+            queue.configure_dispatch(policy(), owner='synthetic-console-witness')
+            submit(queue, 'long', 1)
+            submit(queue, 'long', 2)
+        if scenario == 'lease-recovery':
+            from tests.test_external_blocker_recovery import legacy_lease
+            legacy_lease(GPUQueue(queue_dir))
+        if responded:
+            smoke_requests.respond(identity, "The local browser witness has a durable response.")
+        phase = 'source-identity'
+        witness = Path(__file__).with_name("operator_browser_witness.mjs")
+        revision = subprocess.run(
+            ["git", "rev-parse", "HEAD"], check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        diff = subprocess.run(
+            ["git", "diff", "--binary", "HEAD", "--", "gpu_queue", "tests"], check=True, capture_output=True,
+        ).stdout
+        source_fingerprint = hashlib.sha256(diff + b"\0" + witness.read_bytes()).hexdigest()[:12]
+        source_identity = f"{revision}+candidate-{source_fingerprint}"
+        phase = 'browser-witness'
         try:
             result = subprocess.run(
                 [node, str(witness), chrome, base, scenario, identity, source_identity, str(tmp_path)],
@@ -137,7 +141,7 @@ def _run_operator_browser_witness(tmp_path, scenario, *, responded=False):
         report = json.loads(result.stdout.strip().splitlines()[-1])
         assert report["effectiveRoute"] == base
         assert report["effectiveMode"] == "admission-control with disposable request fixture"
-        assert report["apiBehavior"] == ("real authenticated API; injected refresh outage only" if scenario == 'quick-drag' else "real authenticated API" if scenario in {'performance-deferred','job-cancel','lease-recovery'} else "scenario-specific browser fetch interception")
+        assert report["apiBehavior"] == ("real authenticated API; injected refresh outage only" if scenario == 'quick-drag' else "real authenticated API; injected first recovery transport failure only" if scenario == 'lease-recovery' else "real authenticated API" if scenario in {'performance-deferred','job-cancel'} else "scenario-specific browser fetch interception")
         assert report["sourceRevision"] == source_identity
         assert report["browser"].startswith("Chrome/")
         assert Path(report["artifact"]).is_file() and Path(report["artifact"]).stat().st_size > 0
@@ -147,6 +151,17 @@ def _run_operator_browser_witness(tmp_path, scenario, *, responded=False):
             config = dispatch.policy(queue_dir)
             assert len(config['action_receipts']) == 4
             assert all(item['service_class'] == 'normal' for item in config['job_overrides'].values())
+    except BaseException as error:
+        failure_path = tmp_path/f'{scenario}-failure.json'
+        if not failure_path.exists():
+            failure_path.write_text(json.dumps({
+                'failurePhase': phase, 'error': str(error), 'effectiveRoute': base,
+                'requestedBrowser': chrome,
+                'lastTrustworthyEvidence': {'sourceRevision': source_identity,
+                    'stdout': result.stdout if result else None,
+                    'stderr': result.stderr if result else None},
+            }))
+        raise
     finally:
         if owned_worker is not None:
             if owned_worker.is_alive() and owned_queue._owned_child is not None:
@@ -154,9 +169,11 @@ def _run_operator_browser_witness(tmp_path, scenario, *, responded=False):
                 if proc.poll() is None:
                     os.killpg(proc.pid,signal.SIGKILL)
             owned_worker.join(8)
-        server.shutdown()
-        server.server_close()
-        thread.join()
+        if thread is not None and thread.is_alive():
+            server.shutdown()
+            thread.join()
+        if server is not None:
+            server.server_close()
 
 
 def test_browser_drag_and_touch_choice_change_actual_pending_dispatch(tmp_path):
@@ -165,6 +182,52 @@ def test_browser_drag_and_touch_choice_change_actual_pending_dispatch(tmp_path):
 
 def test_browser_external_blocker_and_confirmed_recovery(tmp_path):
     _run_operator_browser_witness(tmp_path, 'lease-recovery')
+
+
+@pytest.mark.parametrize('failure', ['server-bind', 'fixture-setup', 'source-identity'])
+def test_browser_witness_reports_setup_failure_and_closes_acquired_server(tmp_path, monkeypatch, failure):
+    import sys
+    monkeypatch.setenv('GREENROOM_CHROME', sys.executable)
+    import tests.test_external_blocker_recovery as lease_fixture
+    servers = []
+    def fail(*args, **kwargs):
+        raise OSError('injected '+failure)
+    real_server = ThreadingHTTPServer
+    def server(*args, **kwargs):
+        if failure == 'server-bind':
+            return fail()
+        value = real_server(*args, **kwargs)
+        servers.append(value)
+        return value
+    monkeypatch.setattr(__import__(__name__, fromlist=['ThreadingHTTPServer']), 'ThreadingHTTPServer', server)
+    if failure == 'fixture-setup':
+        monkeypatch.setattr(lease_fixture, 'legacy_lease', fail)
+    if failure == 'source-identity':
+        monkeypatch.setattr(subprocess, 'run', fail)
+    with pytest.raises(OSError, match='injected'):
+        _run_operator_browser_witness(tmp_path, 'lease-recovery')
+    report = json.loads((tmp_path/'lease-recovery-failure.json').read_text())
+    assert report['failurePhase'] == failure
+    assert 'injected' in report['error']
+    assert report['lastTrustworthyEvidence']['sourceRevision'] is None
+    assert all(server.socket.fileno() == -1 for server in servers)
+
+
+def test_browser_witness_reports_spawn_failure_and_removes_owned_profile(tmp_path):
+    import sys
+    node = shutil.which('node')
+    if not node:
+        pytest.skip('Node.js required')
+    result = subprocess.run([node, str(Path(__file__).with_name('operator_browser_witness.mjs')),
+        str(tmp_path/'missing-browser'), 'http://127.0.0.1:1', 'lease-recovery',
+        'fixture', 'fixture-source', str(tmp_path)], capture_output=True, text=True)
+    assert result.returncode != 0
+    report = json.loads((tmp_path/'lease-recovery-failure.json').read_text())
+    assert report['failurePhase'] == 'chrome-startup'
+    assert 'ENOENT' in report['error']
+    assert report['lastTrustworthyEvidence']['screenshotArtifact'] is None
+    owner = json.loads((tmp_path/'lease-recovery-browser-owner.json').read_text())
+    assert not Path(owner['profile']).exists()
 
 
 def test_browser_keeps_accepted_smoke_reply_disabled_after_refresh_failure(tmp_path):
@@ -332,7 +395,8 @@ def test_read_only_wins_over_admission_control_for_smoke_response_route(tmp_path
         thread.join()
 
 
-def test_operator_snapshot_serializes_external_lease(tmp_path):
+@pytest.mark.parametrize('read_only', [False, True])
+def test_operator_snapshot_serializes_external_lease(tmp_path, read_only):
     queue = GPUQueue(tmp_path / "queue")
     lease = ExternalLease(
         owner="chrome",
@@ -346,12 +410,14 @@ def test_operator_snapshot_serializes_external_lease(tmp_path):
         interruptible=True,
     )
     queue._write_text_atomic(queue.current_lease_path, lease.to_json())
-
-    snapshot = queue_snapshot(queue)
+    original = queue.current_lease_path.read_bytes()
+    snapshot = queue_snapshot(queue.queue_dir if read_only else queue)
 
     assert snapshot["lease"]["owner"] == "chrome"
     assert snapshot["lease"]["lifecycle_state"] == "ownership_unknown"
     assert snapshot["lease"]["unknown_reason"] == "holder_identity_unbound"
+    assert snapshot['lease']['recorded_lifecycle_state'] == 'active'
+    assert queue.current_lease_path.read_bytes() == original
     json.dumps(snapshot)
 
 

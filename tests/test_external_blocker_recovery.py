@@ -288,3 +288,68 @@ def test_doctor_separates_service_checks_from_external_dispatch_obstruction(queu
     assert result['queue']['paused'] is False
     assert result['execution_admission']['state'] == 'external_lease'
     assert result['execution_admission']['blockers'][0]['lease_id'] == 'legacy-page'
+
+
+@pytest.mark.parametrize('representation', ['path', 'queue'])
+def test_snapshot_preserves_malformed_expired_active_authority(queue, representation):
+    record = json.loads(queue.current_lease_path.read_text())
+    record['lifecycle_state'] = LeaseStatus.ACTIVE.value
+    del record['pid']
+    queue.current_lease_path.write_text(json.dumps(record))
+    original = queue.current_lease_path.read_bytes()
+    state = queue_snapshot(queue.queue_dir if representation == 'path' else queue, 'active')
+    assert state['execution_admission']['state'] == 'unknown'
+    assert state['execution_admission']['blockers'][0]['recovery']['available'] is False
+    assert queue.current_lease_path.read_bytes() == original
+
+
+@pytest.mark.parametrize('field', ['claimed_at', 'renewed_at', 'ttl_seconds'])
+def test_overflowing_json_integer_is_visible_through_snapshot_and_doctor(queue, capsys, field):
+    from types import SimpleNamespace
+    from gpu_queue.cli import cmd_doctor
+    record = json.loads(queue.current_lease_path.read_text())
+    record[field] = 10**400
+    queue.current_lease_path.write_text(json.dumps(record))
+    for surface in (queue.queue_dir, queue):
+        state = queue_snapshot(surface, 'active')['execution_admission']
+        assert state['state'] == 'unknown'
+        assert state['blockers'][0]['recovery']['available'] is False
+    cmd_doctor(SimpleNamespace(queue_dir=str(queue.queue_dir)))
+    assert json.loads(capsys.readouterr().out)['execution_admission']['state'] == 'unknown'
+
+
+def test_first_recovery_persists_journal_parent_before_lease_transition(queue, monkeypatch):
+    import os
+    from gpu_queue import admission_control, lease_controls
+    syncs = []
+    original_sync = os.fsync
+    original_write = queue._write_lease_locked
+    def sync(fd):
+        info = os.fstat(fd)
+        for path in (queue.queue_dir, queue.queue_dir/'operator-lease-recoveries'):
+            if path.exists() and (info.st_dev, info.st_ino) == (path.stat().st_dev, path.stat().st_ino):
+                syncs.append(path)
+        return original_sync(fd)
+    def write(lease):
+        directory = queue.queue_dir/'operator-lease-recoveries'
+        assert queue.queue_dir in syncs
+        assert directory in syncs
+        assert syncs.index(queue.queue_dir) < syncs.index(directory)
+        assert json.loads((directory/'recover-one.json').read_text())['phase'] == 'prepared'
+        return original_write(lease)
+    monkeypatch.setattr(admission_control.os, 'fsync', sync)
+    monkeypatch.setattr(queue, '_write_lease_locked', write)
+    lease_controls.recover(queue, **recovery_request(queue))
+
+
+def test_doctor_reports_same_dispatch_policy_error_as_monitor(queue, capsys):
+    from types import SimpleNamespace
+    from gpu_queue.cli import cmd_doctor
+    queue.current_lease_path.unlink()
+    (queue.queue_dir/'dispatch-policy.json').write_text('{}')
+    state = queue_snapshot(queue.queue_dir, 'active')['execution_admission']
+    cmd_doctor(SimpleNamespace(queue_dir=str(queue.queue_dir)))
+    observed = json.loads(capsys.readouterr().out)['execution_admission']
+    assert observed == state
+    assert observed['state'] == 'dispatch_blocked'
+    assert observed['blockers'][0]['kind'] == 'dispatch_policy'
