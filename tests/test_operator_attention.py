@@ -161,6 +161,21 @@ def test_http_performance_decision_is_authenticated_and_binds_current_request(tm
         return urlopen(Request(base+'/api/performance-decision',data=json.dumps(value).encode(),
             headers={'Authorization':'Bearer '+token,'Content-Type':'application/json'}))
     try:
+        for filename in ('status.json','request.json','performance-decision-'+'a'*32+'.json'):
+            damaged=job/filename
+            original=damaged.read_bytes() if damaged.exists() else None
+            try:
+                for malformed in (None,[],{}):
+                    damaged.write_text(json.dumps(malformed))
+                    with pytest.raises(HTTPError) as error:
+                        send(body)
+                    assert error.value.code==409
+                    assert json.load(error.value)['error']
+            finally:
+                if original is None:
+                    damaged.unlink(missing_ok=True)
+                else:
+                    damaged.write_bytes(original)
         for changes,code in [({'request_digest':'e'*64},409),({'expected_started_at':99},409),
                               ({'attempt_id':'b'*32},409),({'defer_minutes':False},409)]:
             with pytest.raises(HTTPError) as error:
@@ -200,6 +215,36 @@ def test_unreadable_running_observation_cannot_claim_fresh_empty_attention(tmp_p
     assert result['items'][0]['job_id']=='one'
     assert result['queue']['running']==1
     assert datetime.fromisoformat(result['valid_until']).timestamp()==1000
+
+
+@pytest.mark.parametrize('damage',['missing-status','missing-request','corrupt-request'])
+def test_actual_queue_reader_preserves_missing_record_attention(tmp_path,damage):
+    from gpu_queue.queue import GPUQueue
+    from gpu_queue.models import JobRequest,JobStatus
+    from gpu_queue.operator_server import queue_snapshot
+    from gpu_queue.operator_attention import snapshot
+    queue=GPUQueue(tmp_path/'queue')
+    request=JobRequest(job_type='command',input_path='',performance_window='measure',
+                       agent_id='owner',route_identity='cpu/test')
+    pending=queue.submit(request)
+    state=queue.get_job(request.job_id)
+    state.status,state.started_at=JobStatus.RUNNING,100.
+    (pending/'status.json').write_text(state.to_json())
+    job=queue.queue_dir/'running'/request.job_id
+    pending.rename(job)
+    perf=waiting(job)
+    perf.update(job_id=request.job_id,quietness_proved=False,authority='operator-acknowledgement-only')
+    (job/'performance-window.json').write_text(json.dumps(perf))
+    assert snapshot(queue.queue_dir,queue_snapshot(queue.queue_dir,'active'), 'http://127.0.0.1:1/')['items'][0]['kind']=='performance-confirmation'
+    if damage=='corrupt-request':
+        (job/'request.json').write_text('{')
+    else:
+        (job/('status.json' if damage=='missing-status' else 'request.json')).unlink()
+    result=snapshot(queue.queue_dir,queue_snapshot(queue.queue_dir,'active'), 'http://127.0.0.1:1/',now=1000)
+    assert result['errors'],'Actual reader composition concealed missing record uncertainty'
+    assert result['queue']['running']==1
+    assert result['items'][0]['job_id']==request.job_id
+    assert result['valid_until']==result['observed_at']
 
 
 @pytest.mark.parametrize('invalid',[None,[],{'schema':'gpu-greenroom.operator-attention.v1'},

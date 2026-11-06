@@ -49,7 +49,7 @@ def atomic_write(path, value):
         Path(temporary).unlink(missing_ok=True)
 
 
-def decision(job_dir, attempt_id):
+def decision(job_dir, attempt_id, *, job_id=None):
     if not isinstance(attempt_id, str) or not re.fullmatch(r'[a-f0-9]{32}', attempt_id):
         raise ValueError('invalid performance attempt')
     path = Path(job_dir)/f'performance-decision-{attempt_id}.json'
@@ -57,10 +57,22 @@ def decision(job_dir, attempt_id):
         value = json.loads(path.read_text())
     except FileNotFoundError:
         return None
-    if (value.get('attempt_id') != attempt_id or value.get('action') not in {'start','defer','cancel'}
-            or value.get('schema') != 'gpu-greenroom.performance-decision.v1'):
+    if (not isinstance(value,dict) or value.get('attempt_id') != attempt_id
+            or not isinstance(value.get('action'),str) or value['action'] not in {'start','defer','cancel'}
+            or value.get('schema') != 'gpu-greenroom.performance-decision.v1'
+            or not isinstance(value.get('job_id'),str) or not value['job_id']
+            or (job_id is not None and value['job_id'] != job_id)
+            or not isinstance(value.get('request_id'),str) or not re.fullmatch(r'[A-Za-z0-9_-]+',value['request_id'])
+            or not isinstance(value.get('source'),str) or not value['source']
+            or type(value.get('decided_at')) not in (int,float) or not math.isfinite(value['decided_at'])):
         raise ValueError('invalid performance decision receipt')
+    if ('request_digest' in value or 'started_at' in value) and (
+            not isinstance(value.get('request_digest'),str) or not re.fullmatch(r'[a-f0-9]{64}',value['request_digest'])
+            or type(value.get('started_at')) not in (int,float) or not math.isfinite(value['started_at'])):
+        raise ValueError('invalid saved decision attempt binding')
     if value['action'] == 'defer':
+        if type(value.get('defer_minutes')) not in (int,float):
+            raise ValueError('invalid saved deferral delay')
         delay_seconds(value['defer_minutes'])
     return value
 
@@ -76,9 +88,11 @@ def decide(job_dir, *, attempt_id, request_id, action, source, defer_minutes=5):
     with (job_dir/'.performance-decision.lock').open('a') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX)
         report = json.loads((job_dir/'performance-window.json').read_text())
+        if not isinstance(report,dict) or not isinstance(report.get('job_id'),str) or not report['job_id']:
+            raise ValueError('invalid performance request receipt')
         if report.get('attempt_id') != attempt_id:
             raise ValueError('performance attempt changed; refresh')
-        previous = decision(job_dir,attempt_id)
+        previous = decision(job_dir,attempt_id,job_id=report['job_id'])
         if previous:
             return previous
         if report.get('status') != 'waiting' or report.get('workload_started') is not False:
@@ -186,7 +200,7 @@ def _native_prompt(spec, error_message=None, *, check_answer=None):
                 settled = True
                 return False
             if spec.get('receipt_path') and spec.get('attempt_id'):
-                accepted = decision(Path(spec['receipt_path']).parent,spec['attempt_id'])
+                accepted = decision(Path(spec['receipt_path']).parent,spec['attempt_id'],job_id=spec['job_id'])
                 if accepted:
                     code = cf.CFUserNotificationCancel(notification)
                     if code:
@@ -337,7 +351,7 @@ def run(spec, *, prompt=None):
               'workload_started': False, 'workload_argv': spec['argv']}
     atomic_write(path, report)
     try:
-        accepted = decision(path.parent,spec['attempt_id'])
+        accepted = decision(path.parent,spec['attempt_id'],job_id=spec['job_id'])
         answer = answer_from_decision(accepted) if accepted else (prompt or native_dialog)(spec)
         accepted = decide(path.parent, attempt_id=spec['attempt_id'],request_id=uuid.uuid4().hex,
                           action='defer' if isinstance(answer,dict) and 'defer_minutes' in answer else

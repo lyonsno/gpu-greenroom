@@ -112,10 +112,18 @@ def snapshot(root, state, monitor_url, *, now=None):
     directory.mkdir(parents=True,exist_ok=True)
     with (directory/'update.lock').open('a') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX)
-        for row in state['jobs']:
+        rows=list(state['jobs'])
+        observed_ids={row['job_id'] for row in rows}
+        for job_id in state.get('running_job_ids',[]):
+            if job_id not in observed_ids:
+                rows.append({'job_id':job_id,'containment_status':'running','consistent':False,
+                             'record_error':'Running containment omitted from job observations'})
+        for row in rows:
             diagnostics=[str(row[k]) for k in ('record_error','performance_window_error','runtime_hint_error') if row.get(k)]
             if row.get('containment_status')=='running' and not row.get('consistent'):
                 diagnostics.append('running containment has inconsistent state')
+            if (row.get('containment_status') or row.get('status'))=='running' and not row.get('request_digest'):
+                diagnostics.append('required running request identity missing or unreadable')
             if (row.get('status')=='running' and row.get('performance_window_reason')
                     and not row.get('performance_window') and not row.get('performance_window_error')):
                 diagnostics.append('required performance receipt missing')
@@ -204,8 +212,8 @@ def snapshot(root, state, monitor_url, *, now=None):
                           'kind':'smoke','status':'waiting','target_url':monitor_url+'#smoke-'+request['id']})
     return {'schema':SCHEMA,'observed_at':stamp(now),'valid_until':stamp(now if errors else now+FRESH_SECONDS),
             'monitor_url':monitor_url,'queue_dir':str(root.resolve()),
-            'queue':{'running':sum((j.get('containment_status') or j.get('status'))=='running' for j in state['jobs']),
-                     'waiting':sum((j.get('containment_status') or j.get('status')) in {'pending','deferred'} for j in state['jobs']),
+            'queue':{'running':sum((j.get('containment_status') or j.get('status'))=='running' for j in rows),
+                     'waiting':sum((j.get('containment_status') or j.get('status')) in {'pending','deferred'} for j in rows),
                      'paused':state.get('paused')},'items':items,'errors':errors}
 
 

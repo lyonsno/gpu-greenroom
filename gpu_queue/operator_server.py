@@ -461,6 +461,10 @@ def queue_snapshot(queue: GPUQueue | Path, view: str = "all", *, read_only: bool
         for job_dir in sorted(status_dir.iterdir()) if status_dir.is_dir() else ():
             status_path = job_dir / "status.json"
             if not status_path.is_file():
+                if job_dir.is_dir():
+                    jobs.append({'job_id':job_dir.name,'job_type':'unknown','status':'inconsistent',
+                                 'containment_status':containment_status,'consistent':False,
+                                 'record_error':'Required status.json is missing or unreadable'})
                 continue
             try:
                 row = json.loads(status_path.read_text())
@@ -902,8 +906,14 @@ def make_handler(queue: GPUQueue | Path, token: str, *, read_only: bool = False,
                                 job = candidates[0]
                             request,digest = dispatch.read_request(job/'request.json')
                             state = json.loads((job/'status.json').read_text())
+                            if (not isinstance(request,dict) or request.get('job_id') != body['job_id']
+                                    or not isinstance(state,dict) or not {'job_id','status','started_at'}.issubset(state)
+                                    or state['status'] not in {'running','deferred','done','failed','cancelled'}
+                                    or (state['started_at'] is not None and
+                                        (type(state['started_at']) not in (int,float) or not math.isfinite(state['started_at'])))):
+                                raise ValueError('Performance request or status identity is malformed')
                             perf = read_receipt(job/'performance-window.json',JobRequest.from_json(json.dumps(request)))
-                            previous = decision(job,body['attempt_id'])
+                            previous = decision(job,body['attempt_id'],job_id=body['job_id'])
                             expected_start = previous.get('started_at') if previous else state.get('started_at')
                             if (digest != body['request_digest'] or expected_start != body['expected_started_at']
                                     or (state.get('status') != 'running' and not previous)
