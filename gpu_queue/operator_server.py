@@ -195,7 +195,7 @@ function performanceWindow(j){
 function renderLease(s){
   const host=document.querySelector('#lease'),blocker=s.execution_admission?.blockers.find(b=>b.kind==='external_lease'||b.kind==='unreadable_lease');
   host.hidden=!blocker;
-  if(!blocker){host.replaceChildren();return}
+  if(!blocker){host.textContent='';return}
   if(blocker.kind==='unreadable_lease'){host.innerHTML='<strong>Dispatch blocked: external lease state unreadable</strong><div class="meta">'+esc(blocker.reason)+'</div>';return}
   const unknown=blocker.lifecycle_state==='ownership_unknown';
   host.innerHTML=`<strong>${unknown?'External ownership unknown; queue blocked':'External workload holds the queue'}</strong><div>${esc(blocker.owner)} · ${esc(blocker.effective_route)}</div><div class="meta">Lease: ${esc(blocker.lease_id)}<br>Reported by: ${esc(blocker.agent_id)}<br>${esc(blocker.repo_root)}<br>State: ${esc(blocker.lifecycle_state)} · ${esc(blocker.reason)}<br>Last renewal: ${duration(blocker.renewal_age_seconds)} ago · TTL: ${duration(blocker.ttl_seconds)}<br>Recorded PID: ${esc(blocker.pid??'not recorded')} · Process group: ${esc(blocker.process_group??'not recorded')}<br>${esc(blocker.recovery.reason)}</div>${blocker.recovery.available&&s.lease_recovery_enabled?'<div class="lease-controls"><button id="reviewLease" type="button">Review recovery</button></div>':''}`;
