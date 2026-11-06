@@ -353,3 +353,30 @@ def test_doctor_reports_same_dispatch_policy_error_as_monitor(queue, capsys):
     assert observed == state
     assert observed['state'] == 'dispatch_blocked'
     assert observed['blockers'][0]['kind'] == 'dispatch_policy'
+
+
+@pytest.mark.parametrize('field', ['pid', 'process_group', 'renewed_at', 'process_start_identity'])
+def test_worker_observation_preserves_missing_authority_and_cannot_enable_recovery(queue, capsys, field):
+    from types import SimpleNamespace
+    from gpu_queue.cli import cmd_doctor
+    from gpu_queue.lease_controls import recover
+    record = json.loads(queue.current_lease_path.read_text())
+    record['lifecycle_state'] = LeaseStatus.ACTIVE.value
+    del record[field]
+    queue.current_lease_path.write_text(json.dumps(record))
+    original = queue.current_lease_path.read_bytes()
+    assert queue_snapshot(queue.queue_dir)['execution_admission']['state'] == 'unknown'
+    assert queue.run_one({}) is False
+    assert queue.current_lease_path.read_bytes() == original
+    state = queue_snapshot(queue)['execution_admission']
+    assert state['state'] == 'unknown'
+    assert state['blockers'][0]['recovery']['available'] is False
+    cmd_doctor(SimpleNamespace(queue_dir=str(queue.queue_dir)))
+    assert json.loads(capsys.readouterr().out)['execution_admission']['state'] == 'unknown'
+    body = dict(lease_id='legacy-page', expected_start_identity='recorded-server-start',
+        expected_record_sha256=hashlib.sha256(original).hexdigest(), request_id='malformed',
+        quiescence_confirmed=True, reason='operator confirms stopped')
+    with pytest.raises((ValueError, RuntimeError)):
+        recover(queue, **body)
+    assert queue.current_lease_path.read_bytes() == original
+    assert not (queue.queue_dir/'operator-lease-recoveries').exists()

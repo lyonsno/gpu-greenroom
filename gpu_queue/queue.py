@@ -881,9 +881,12 @@ class GPUQueue:
         return lease
 
     def _refresh_lease_observation_locked(self) -> ExternalLease | None:
-        lease = self._read_lease_locked()
-        if lease is None:
+        from .lease_controls import decode_record
+        try:
+            raw = self.current_lease_path.read_bytes()
+        except FileNotFoundError:
             return None
+        _, lease = decode_record(raw)
         if lease.lifecycle_state in (LeaseStatus.RELEASED, LeaseStatus.OWNERSHIP_UNKNOWN):
             return lease
         if lease.ttl_seconds is not None and time.time() - lease.renewed_at > lease.ttl_seconds:
@@ -937,7 +940,11 @@ class GPUQueue:
             return self._external_execution_blocked_locked()
 
     def _external_execution_blocked_locked(self) -> bool:
-        lease = self._refresh_lease_observation_locked()
+        from .lease_controls import LeaseRecordError
+        try:
+            lease = self._refresh_lease_observation_locked()
+        except (OSError, LeaseRecordError):
+            return True
         return lease is not None and lease.lifecycle_state != LeaseStatus.RELEASED
 
     def _read_pause_state_locked(self) -> dict | None:
@@ -1553,8 +1560,12 @@ class GPUQueue:
         A quiesced grant moves the current lease into handoff. A non-quiesced
         grant records a pending checkpoint; release_lease completes the handoff.
         """
+        from .lease_controls import LeaseRecordError
         with self._coordination_lock():
-            lease = self._refresh_lease_observation_locked()
+            try:
+                lease = self._refresh_lease_observation_locked()
+            except LeaseRecordError:
+                lease = None
             bump = self._read_bump_locked(bump_id)
             if bump is None:
                 raise KeyError(f"bump {bump_id} not found")

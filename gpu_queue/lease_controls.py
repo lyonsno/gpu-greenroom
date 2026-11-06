@@ -12,6 +12,41 @@ from .admission_control import sync_directory, write_durable
 from .models import ExternalLease, LeaseStatus
 
 
+class LeaseRecordError(RuntimeError):
+    pass
+
+
+def decode_record(raw):
+    try:
+        return _decode_record(raw)
+    except (ValueError, TypeError, KeyError, AttributeError, UnicodeError, OverflowError) as error:
+        raise LeaseRecordError(f'external lease record invalid; recovery requires original authority: {error}') from error
+
+
+def _decode_record(raw):
+    payload = json.loads(raw)
+    lease = ExternalLease.from_json(raw.decode())
+    if not isinstance(payload, dict) or not all(isinstance(payload.get(key), str) and payload[key].strip() for key in (
+        'lease_id', 'owner', 'agent_id', 'repo_root', 'effective_route', 'lifecycle_state',
+    )) or not {'renewed_at', 'ttl_seconds', 'claimed_at', 'pid', 'process_group',
+               'process_start_identity'}.issubset(payload):
+        raise ValueError('external lease identity is incomplete')
+    if any(value is not None and (type(value) is not int or value < 1)
+           for value in (lease.pid, lease.process_group)):
+        raise ValueError('external process identity is invalid')
+    if lease.process_start_identity is not None and (
+            not isinstance(lease.process_start_identity, str) or not lease.process_start_identity.strip()):
+        raise ValueError('external process start identity is invalid')
+    if type(lease.claimed_at) not in (int, float) or not math.isfinite(lease.claimed_at):
+        raise ValueError('external lease acquisition time is invalid')
+    if lease.lifecycle_state != LeaseStatus.RELEASED and (
+            type(lease.renewed_at) not in (int, float) or not math.isfinite(lease.renewed_at)
+            or type(lease.ttl_seconds) not in (int, float) or not math.isfinite(lease.ttl_seconds)
+            or lease.ttl_seconds <= 0):
+        raise ValueError('external lease renewal identity is invalid')
+    return payload, lease
+
+
 def observe(queue_dir):
     path = Path(queue_dir) / 'leases' / 'current.json'
     try:
@@ -21,27 +56,9 @@ def observe(queue_dir):
     except OSError as error:
         return None, _unreadable(error)
     try:
-        payload = json.loads(raw)
-        lease = ExternalLease.from_json(raw.decode())
-        if not isinstance(payload, dict) or not all(isinstance(payload.get(key), str) and payload[key].strip() for key in (
-            'lease_id', 'owner', 'agent_id', 'repo_root', 'effective_route', 'lifecycle_state',
-        )) or not {'renewed_at', 'ttl_seconds', 'claimed_at', 'pid', 'process_group',
-                   'process_start_identity'}.issubset(payload):
-            raise ValueError('external lease identity is incomplete')
-        if any(value is not None and (type(value) is not int or value < 1)
-               for value in (lease.pid, lease.process_group)):
-            raise ValueError('external process identity is invalid')
-        if lease.process_start_identity is not None and (
-                not isinstance(lease.process_start_identity, str) or not lease.process_start_identity.strip()):
-            raise ValueError('external process start identity is invalid')
-        if type(lease.claimed_at) not in (int, float) or not math.isfinite(lease.claimed_at):
-            raise ValueError('external lease acquisition time is invalid')
+        payload, lease = decode_record(raw)
         if lease.lifecycle_state == LeaseStatus.RELEASED:
             return payload, None
-        if (type(lease.renewed_at) not in (int, float) or not math.isfinite(lease.renewed_at)
-                or type(lease.ttl_seconds) not in (int, float) or not math.isfinite(lease.ttl_seconds)
-                or lease.ttl_seconds <= 0):
-            raise ValueError('external lease renewal identity is invalid')
         age = max(0, time.time() - lease.renewed_at)
         unknown_reason = (lease.unknown_reason or 'ownership_unknown'
                           if lease.lifecycle_state == LeaseStatus.OWNERSHIP_UNKNOWN
@@ -70,7 +87,7 @@ def observe(queue_dir):
                            'Recorded process identity alone does not establish external GPU settlement'),
             },
         }
-    except (ValueError, TypeError, KeyError, AttributeError, UnicodeError, OverflowError) as error:
+    except LeaseRecordError as error:
         return None, _unreadable(error)
 
 
