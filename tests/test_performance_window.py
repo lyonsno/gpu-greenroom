@@ -246,6 +246,13 @@ def test_input_changed_during_confirmation_never_executes(tmp_path):
     plan = admission.prepare(queue, manifest)
     request = JobRequest.from_json(json.dumps(plan['job_request']))
     job = admission.submit_prepared(queue, plan)
+    from gpu_queue.models import JobStatus
+    state = queue.get_job(request.job_id)
+    state.status, state.started_at = JobStatus.RUNNING, time.time()
+    (job/'status.json').write_text(state.to_json())
+    running = queue.queue_dir/'running'/request.job_id
+    job.rename(running)
+    job = running
     launch = performance_window.runner_command(job, request, request.command_argv, None)
     value = json.loads(Path(launch[-1]).read_text())
     def prompt(_):

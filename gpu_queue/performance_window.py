@@ -70,11 +70,39 @@ def decision(job_dir, attempt_id, *, job_id=None):
             not isinstance(value.get('request_digest'),str) or not re.fullmatch(r'[a-f0-9]{64}',value['request_digest'])
             or type(value.get('started_at')) not in (int,float) or not math.isfinite(value['started_at'])):
         raise ValueError('invalid saved decision attempt binding')
+    expected = attempt_binding(job_dir,attempt_id,job_id=job_id)
+    if expected and any(value.get(key) != field for key,field in expected.items()):
+        raise ValueError('saved decision conflicts with original request or execution attempt')
     if value['action'] == 'defer':
         if type(value.get('defer_minutes')) not in (int,float):
             raise ValueError('invalid saved deferral delay')
         delay_seconds(value['defer_minutes'])
     return value
+
+
+def attempt_binding(job_dir, attempt_id, *, job_id=None):
+    """The worker's launch record retains original authority after a deferral clears start time."""
+    job_dir = Path(job_dir)
+    if not any((job_dir/name).exists() for name in ('request.json','status.json','performance-launch.json')):
+        return None  # Standalone unit/CPU invocations have no queued execution authority.
+    try:
+        launch = json.loads((job_dir/'performance-launch.json').read_text())
+        request_bytes = (job_dir/'request.json').read_bytes()
+        request = json.loads(request_bytes)
+        state = json.loads((job_dir/'status.json').read_text())
+    except (OSError,ValueError) as error:
+        raise ValueError('original performance attempt binding unavailable') from error
+    if (not all(isinstance(v,dict) for v in (launch,request,state))
+            or launch.get('schema') != SCHEMA or launch.get('attempt_id') != attempt_id
+            or launch.get('job_id') != request.get('job_id') or launch.get('job_id') != state.get('job_id')
+            or (job_id is not None and launch.get('job_id') != job_id)
+            or launch.get('request_digest') != hashlib.sha256(request_bytes).hexdigest()
+            or type(launch.get('started_at')) not in (int,float) or not math.isfinite(launch['started_at'])
+            or state.get('status') not in {'running','deferred','done','failed','cancelled'}
+            or (state.get('status')=='running' and state.get('started_at') != launch['started_at'])
+            or (state.get('started_at') is not None and state['started_at'] != launch['started_at'])):
+        raise ValueError('original performance request or execution attempt conflicts')
+    return {key:launch[key] for key in ('request_digest','started_at')}
 
 
 def decide(job_dir, *, attempt_id, request_id, action, source, defer_minutes=5):
@@ -92,6 +120,7 @@ def decide(job_dir, *, attempt_id, request_id, action, source, defer_minutes=5):
             raise ValueError('invalid performance request receipt')
         if report.get('attempt_id') != attempt_id:
             raise ValueError('performance attempt changed; refresh')
+        binding = attempt_binding(job_dir,attempt_id,job_id=report['job_id'])
         previous = decision(job_dir,attempt_id,job_id=report['job_id'])
         if previous:
             return previous
@@ -101,9 +130,8 @@ def decide(job_dir, *, attempt_id, request_id, action, source, defer_minutes=5):
                  'attempt_id':attempt_id, 'request_id':request_id, 'action':action,
                  'source':source, 'decided_at':time.time(),
                  **({'defer_minutes':float(defer_minutes)} if action=='defer' else {})}
-        if (job_dir/'request.json').exists():
-            value['request_digest'] = hashlib.sha256((job_dir/'request.json').read_bytes()).hexdigest()
-            value['started_at'] = json.loads((job_dir/'status.json').read_text())['started_at']
+        if binding:
+            value.update(binding)
         atomic_write(job_dir/f'performance-decision-{attempt_id}.json',value)
         return value
 
@@ -151,7 +179,7 @@ def _native_prompt(spec, error_message=None, *, check_answer=None):
         message += '\n\n' + error_message
     if spec.get('attention_url'):
         message = (f"Job: {spec['job_id']}\nOwner: {spec.get('owner') or 'not recorded'}\n\n"
-                   f"{spec['reason']}\n\nThe owner was notified first. This alert does not stop the job. "
+                   f"{spec['reason']}\n\nAn owner notice was saved first; Greenroom shows its delivery status. This alert does not stop the job. "
                    'Greenroom has the current report and pause/owner controls.')
     values = []
     notification = None
@@ -329,6 +357,8 @@ def runner_command(job_dir, request, argv, timeout):
             'route': request.route_identity or request.job_type, 'reason': request.performance_window,
             'argv': argv, 'timeout': timeout, 'attempt_id': uuid.uuid4().hex,
             'receipt_path': str((job_dir / 'performance-window.json').resolve())}
+    spec['request_digest'] = hashlib.sha256((job_dir/'request.json').read_bytes()).hexdigest()
+    spec['started_at'] = json.loads((job_dir/'status.json').read_text())['started_at']
     validation_path = job_dir / 'validation.json'
     if 'command-preflight.v1' in request.required_worker_capabilities or validation_path.exists():
         spec['validation'] = json.loads(validation_path.read_text())
@@ -351,6 +381,9 @@ def run(spec, *, prompt=None):
               'workload_started': False, 'workload_argv': spec['argv']}
     atomic_write(path, report)
     try:
+        binding = attempt_binding(path.parent,spec['attempt_id'],job_id=spec['job_id'])
+        if binding and any(spec.get(key) != field for key,field in binding.items()):
+            raise ValueError('runner invocation conflicts with original execution attempt')
         accepted = decision(path.parent,spec['attempt_id'],job_id=spec['job_id'])
         answer = answer_from_decision(accepted) if accepted else (prompt or native_dialog)(spec)
         accepted = decide(path.parent, attempt_id=spec['attempt_id'],request_id=uuid.uuid4().hex,

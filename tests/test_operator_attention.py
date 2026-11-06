@@ -133,7 +133,8 @@ def test_owner_progress_suppresses_escalation_only_for_its_exact_attempt(tmp_pat
     assert not list(tmp_path.rglob('cancel-request.json'))
 
 
-def test_http_performance_decision_is_authenticated_and_binds_current_request(tmp_path):
+@pytest.mark.parametrize('corrupt_saved',[None,'missing','digest','start'])
+def test_http_performance_decision_is_authenticated_and_binds_current_request(tmp_path,corrupt_saved):
     from gpu_queue.queue import GPUQueue
     from gpu_queue.models import JobRequest,JobStatus
     from gpu_queue import dispatch
@@ -151,6 +152,9 @@ def test_http_performance_decision_is_authenticated_and_binds_current_request(tm
     report.update(job_id=request.job_id,decision_protocol='shared.v1',quietness_proved=False,
                   authority='operator-acknowledgement-only')
     (job/'performance-window.json').write_text(json.dumps(report))
+    (job/'performance-launch.json').write_text(json.dumps({'schema':performance_window.SCHEMA,
+        'job_id':request.job_id,'attempt_id':'a'*32,'request_digest':dispatch.read_request(job/'request.json')[1],
+        'started_at':100.}))
     server = ThreadingHTTPServer(('127.0.0.1',0),make_handler(queue,'secret',local_operator=True,job_control=True))
     thread = threading.Thread(target=server.serve_forever,daemon=True)
     thread.start()
@@ -189,6 +193,23 @@ def test_http_performance_decision_is_authenticated_and_binds_current_request(tm
         assert answer['action']=='defer' and answer['defer_minutes']==7
         with send(body) as response:
             assert json.load(response)==answer
+        if corrupt_saved:
+            changed=dict(answer)
+            altered_body=dict(body)
+            if corrupt_saved=='missing':
+                changed.pop('request_digest',None);changed.pop('started_at',None)
+                altered_body['expected_started_at']=None
+            elif corrupt_saved=='digest':
+                changed['request_digest']='e'*64
+            else:
+                changed['started_at']=99.
+                altered_body['expected_started_at']=99.
+            decision_path=job/('performance-decision-'+'a'*32+'.json')
+            decision_path.write_text(json.dumps(changed))
+            with pytest.raises(HTTPError) as error:
+                send(altered_body)
+            assert error.value.code==409
+            decision_path.write_text(json.dumps(answer))
         state.status,state.started_at=JobStatus.DEFERRED,None
         (job/'status.json').write_text(state.to_json())
         job.rename(queue.queue_dir/'deferred'/job.name)
@@ -199,6 +220,40 @@ def test_http_performance_decision_is_authenticated_and_binds_current_request(tm
         server.shutdown()
         thread.join()
         server.server_close()
+
+
+@pytest.mark.parametrize('damage',['missing','digest','start'])
+def test_real_runner_refuses_contradictory_saved_start_without_launch(tmp_path,damage):
+    from gpu_queue.queue import GPUQueue
+    from gpu_queue.models import JobRequest,JobStatus
+    queue=GPUQueue(tmp_path/'queue')
+    marker=tmp_path/'executed'
+    request=JobRequest(job_type='command',input_path='',agent_id='owner',route_identity='cpu/test',
+        performance_window='measure',command_argv=[sys.executable,'-c',f'from pathlib import Path;Path({str(marker)!r}).write_text("ran")'])
+    pending=queue.submit(request)
+    state=queue.get_job(request.job_id)
+    state.status,state.started_at=JobStatus.RUNNING,100.
+    (pending/'status.json').write_text(state.to_json())
+    job=queue.queue_dir/'running'/request.job_id
+    pending.rename(job)
+    command=performance_window.runner_command(job,request,request.command_argv,None)
+    spec=json.loads((job/'performance-launch.json').read_text())
+    report=waiting(job,spec['attempt_id'])
+    report.update(job_id=request.job_id)
+    (job/'performance-window.json').write_text(json.dumps(report))
+    accepted=performance_window.decide(job,attempt_id=spec['attempt_id'],request_id='original',action='start',source='web')
+    if damage=='missing':
+        accepted.pop('request_digest',None);accepted.pop('started_at',None)
+    elif damage=='digest':
+        accepted['request_digest']='e'*64
+    else:
+        accepted['started_at']=99.
+    (job/f'performance-decision-{spec["attempt_id"]}.json').write_text(json.dumps(accepted))
+    completed=subprocess.run(command,capture_output=True,text=True)
+    assert completed.returncode!=0,'Contradictory saved Start launched the real workload'
+    result=json.loads((job/'performance-window.json').read_text())
+    assert result['status']=='failed' and result['workload_started'] is False
+    assert not marker.exists()
 
 
 @pytest.mark.parametrize('diagnostic',['record_error','performance_window_error','missing-performance'])
