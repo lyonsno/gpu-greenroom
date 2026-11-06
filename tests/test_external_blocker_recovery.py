@@ -258,6 +258,20 @@ def test_missing_authority_fields_cannot_be_filled_by_dataclass_defaults(queue):
     assert state['execution_admission']['blockers'][0]['recovery']['available'] is False
 
 
+@pytest.mark.parametrize('field,value', [
+    ('owner', {'name':'unexpected shape'}), ('repo_root', True),
+    ('effective_route', ['another shape']), ('pid', 'server'),
+    ('process_start_identity', 12), ('claimed_at', float('nan')),
+])
+def test_retyped_lease_authority_is_unknown_not_recoverable(queue, field, value):
+    record = json.loads(queue.current_lease_path.read_text())
+    record[field] = value
+    queue.current_lease_path.write_text(json.dumps(record))
+    state = queue_snapshot(queue.queue_dir, 'active')
+    assert state['execution_admission']['state'] == 'unknown'
+    assert state['execution_admission']['blockers'][0]['recovery']['available'] is False
+
+
 def test_doctor_separates_service_checks_from_external_dispatch_obstruction(queue, capsys):
     from types import SimpleNamespace
     from gpu_queue.cli import cmd_doctor

@@ -23,11 +23,19 @@ def observe(queue_dir):
     try:
         payload = json.loads(raw)
         lease = ExternalLease.from_json(raw.decode())
-        if not isinstance(payload, dict) or not all(payload.get(key) for key in (
+        if not isinstance(payload, dict) or not all(isinstance(payload.get(key), str) and payload[key].strip() for key in (
             'lease_id', 'owner', 'agent_id', 'repo_root', 'effective_route', 'lifecycle_state',
         )) or not {'renewed_at', 'ttl_seconds', 'claimed_at', 'pid', 'process_group',
                    'process_start_identity'}.issubset(payload):
             raise ValueError('external lease identity is incomplete')
+        if any(value is not None and (type(value) is not int or value < 1)
+               for value in (lease.pid, lease.process_group)):
+            raise ValueError('external process identity is invalid')
+        if lease.process_start_identity is not None and (
+                not isinstance(lease.process_start_identity, str) or not lease.process_start_identity.strip()):
+            raise ValueError('external process start identity is invalid')
+        if type(lease.claimed_at) not in (int, float) or not math.isfinite(lease.claimed_at):
+            raise ValueError('external lease acquisition time is invalid')
         if lease.lifecycle_state == LeaseStatus.RELEASED:
             return payload, None
         if (type(lease.renewed_at) not in (int, float) or not math.isfinite(lease.renewed_at)
