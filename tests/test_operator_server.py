@@ -101,6 +101,9 @@ def _run_operator_browser_witness(tmp_path, scenario, *, responded=False):
         queue.configure_dispatch(policy(), owner='synthetic-console-witness')
         submit(queue, 'long', 1)
         submit(queue, 'long', 2)
+    if scenario == 'lease-recovery':
+        from tests.test_external_blocker_recovery import legacy_lease
+        legacy_lease(GPUQueue(queue_dir))
     if responded:
         smoke_requests.respond(identity, "The local browser witness has a durable response.")
     witness = Path(__file__).with_name("operator_browser_witness.mjs")
@@ -134,7 +137,7 @@ def _run_operator_browser_witness(tmp_path, scenario, *, responded=False):
         report = json.loads(result.stdout.strip().splitlines()[-1])
         assert report["effectiveRoute"] == base
         assert report["effectiveMode"] == "admission-control with disposable request fixture"
-        assert report["apiBehavior"] == ("real authenticated API; injected refresh outage only" if scenario == 'quick-drag' else "real authenticated API" if scenario in {'performance-deferred','job-cancel'} else "scenario-specific browser fetch interception")
+        assert report["apiBehavior"] == ("real authenticated API; injected refresh outage only" if scenario == 'quick-drag' else "real authenticated API" if scenario in {'performance-deferred','job-cancel','lease-recovery'} else "scenario-specific browser fetch interception")
         assert report["sourceRevision"] == source_identity
         assert report["browser"].startswith("Chrome/")
         assert Path(report["artifact"]).is_file() and Path(report["artifact"]).stat().st_size > 0
@@ -158,6 +161,10 @@ def _run_operator_browser_witness(tmp_path, scenario, *, responded=False):
 
 def test_browser_drag_and_touch_choice_change_actual_pending_dispatch(tmp_path):
     _run_operator_browser_witness(tmp_path, 'quick-drag')
+
+
+def test_browser_external_blocker_and_confirmed_recovery(tmp_path):
+    _run_operator_browser_witness(tmp_path, 'lease-recovery')
 
 
 def test_browser_keeps_accepted_smoke_reply_disabled_after_refresh_failure(tmp_path):

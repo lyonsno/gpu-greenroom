@@ -545,12 +545,17 @@ def cmd_doctor(args):
 
     pending = queue.list_jobs(JobStatus.PENDING)
     running = queue.list_jobs(JobStatus.RUNNING)
+    from .lease_controls import observe, admission
+    lease, lease_blocker = observe(queue.queue_dir)
     report = {
         "schema": "gpu-greenroom.doctor.v1",
         "healthy": all(check["ok"] for check in checks.values()),
         "effective_queue_dir": str(queue.queue_dir.resolve()),
         "cli_executable": cli_executable,
         "checks": checks,
+        "execution_admission": admission(lease_blocker=lease_blocker,
+            paused=queue.is_paused(), running_ids=[job.job_id for job in running]),
+        "lease": lease,
         "queue": {
             "paused": queue.is_paused(),
             "pending": len(pending),

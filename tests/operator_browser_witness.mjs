@@ -101,7 +101,38 @@ try {
   writeFileSync(artifact, Buffer.from(initialFrame.data, 'base64'));
   screenshotArtifact = artifact;
 
-  if (scenario === 'job-cancel') {
+  if (scenario === 'lease-recovery') {
+    await eventually(()=>evaluate(`document.querySelector('#queueState').textContent`),text=>text.includes('External workload blocks starts'),'effective external blocker');
+    await evaluate(`window.__recoverCalls=[];window.__realFetch=window.fetch.bind(window);window.fetch=async(input,options)=>{const r=await window.__realFetch(input,options);if(String(input).endsWith('/api/lease/recover'))window.__recoverCalls.push({status:r.status,body:JSON.parse(options.body)});return r}`);
+    for(const [width,height] of [[1440,1000],[390,844]]) {
+      await command('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:width===390});
+      const banner=await evaluate(`({text:document.querySelector('#lease').innerText,overflow:document.documentElement.scrollWidth>innerWidth})`);
+      assert.ok(banner.text.includes('page-owner')&&banner.text.includes('fixture/browser-work')&&banner.text.includes('legacy-page'),JSON.stringify(banner));
+      assert.equal(banner.overflow,false);
+      const frame=await command('Page.captureScreenshot',{format:'png',fromSurface:true});
+      writeFileSync(join(artifactDirectory,`${scenario}-blocker-${width}.png`),Buffer.from(frame.data,'base64'));
+      await evaluate(`document.querySelector('#reviewLease').click()`);
+      const modal=await evaluate(`(()=>{const d=document.querySelector('#leaseRecoveryDialog'),r=d.getBoundingClientRect();return {open:d.open,text:d.innerText,disabled:document.querySelector('#confirmLeaseRecovery').disabled,left:r.left,right:r.right,top:r.top,bottom:r.bottom,focus:document.activeElement?.textContent}})()`);
+      assert.equal(modal.open,true);
+      assert.ok(modal.text.includes('browser')&&modal.text.includes('fixture/browser-work'));
+      assert.equal(modal.disabled,true);
+      assert.equal(modal.focus,'Keep blocked');
+      assert.ok(modal.left>=0&&modal.right<=width&&modal.top>=0&&modal.bottom<=height,JSON.stringify(modal));
+      const dialogFrame=await command('Page.captureScreenshot',{format:'png',fromSurface:true});
+      writeFileSync(join(artifactDirectory,`${scenario}-modal-${width}.png`),Buffer.from(dialogFrame.data,'base64'));
+      await evaluate(`document.querySelector('#leaseRecoveryDialog button[value="back"]').click()`);
+      assert.equal(await evaluate(`window.__recoverCalls.length`),0);
+    }
+    await evaluate(`document.querySelector('#reviewLease').click();document.querySelector('#leaseStopped').click();document.querySelector('#confirmLeaseRecovery').click()`);
+    await eventually(()=>evaluate(`window.__recoverCalls.length`),n=>n===1,'one exact recovery request');
+    assert.equal(await evaluate(`window.__recoverCalls[0].status`),200);
+    assert.equal(await evaluate(`window.__recoverCalls[0].body.quiescence_confirmed`),true);
+    await eventually(()=>evaluate(`document.querySelector('#lease').hidden`),Boolean,'released blocker disappears');
+    assert.ok(await evaluate(`document.querySelector('#queueState').textContent.includes('Queue starts enabled')`));
+    markPhase('owned-browser-shutdown');
+    await command('Browser.close');
+    console.log(JSON.stringify({scenario,sourceRevision,effectiveRoute:base,effectiveMode:'admission-control with disposable request fixture',apiBehavior:'real authenticated API',browser:browserVersion.Browser,artifact,assertions:['actual expired lease visible','effective header','desktop/mobile fit','explicit browser settlement confirmation','keep blocked has no mutation','one exact recovery request','released blocker disappears']}));
+  } else if (scenario === 'job-cancel') {
     await eventually(() => evaluate(`document.querySelectorAll('.job-item').length`), n=>n===2, 'actual queue jobs');
     await evaluate(`window.__cancelCalls=[];window.__realFetch=window.fetch.bind(window);window.fetch=async(input,options)=>{const r=await window.__realFetch(input,options);if(String(input).endsWith('/api/job-cancel'))window.__cancelCalls.push({status:r.status,body:JSON.parse(options.body)});return r}`);
     for (const [width,height] of [[1440,1000],[390,844]]) {

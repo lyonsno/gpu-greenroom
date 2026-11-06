@@ -36,6 +36,8 @@ PAGE = r"""<!doctype html>
 .queue-column.drop-target{outline:2px solid var(--blue);outline-offset:6px}.queue-column[data-drop-class]{min-height:200px}.job-item[draggable="true"]{cursor:grab}.job-item[draggable="true"]:active{cursor:grabbing}.queue-choice{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted);margin-top:10px}.queue-choice select{font:inherit;color:var(--text);background:#25292d;border:1px solid var(--line);border-radius:4px;padding:7px;min-height:34px}
 dialog{width:480px;max-width:calc(100vw - 24px);max-height:calc(100dvh - 24px);overflow:auto;background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:20px}dialog::backdrop{background:#0009}dialog h2{font:600 18px/1.3 system-ui;margin:0 0 14px}dialog p{overflow-wrap:anywhere;white-space:pre-wrap}.dialog-actions{display:flex;justify-content:flex-end;flex-wrap:wrap;gap:10px;margin-top:20px}
 .job-actions.actions{width:100%;text-align:left;justify-content:flex-start;align-items:center;flex-wrap:wrap}.job-actions>button{flex-shrink:0;max-width:100%;height:auto;min-height:34px;white-space:normal;overflow-wrap:normal;padding:7px 10px}.job-actions>.meta{flex:0 1 auto;min-width:0}.job-actions>label{display:flex;align-items:center;gap:6px}.job-actions input{flex-shrink:0}#requeueDialog select{display:block;width:100%;margin-top:8px;min-height:36px;font:inherit;color:var(--text);background:#25292d;border:1px solid var(--line);border-radius:4px}#requeueDialog label{display:block}
+#lease{border-left:3px solid var(--amber);border-bottom:1px solid var(--line);padding:12px 14px;margin-top:14px;font-size:14px;overflow-wrap:anywhere}#lease[hidden]{display:none}#lease strong{color:var(--amber)}#lease .lease-controls{margin-top:12px}#leaseRecoveryDialog label{display:flex;align-items:flex-start;gap:8px}#leaseRecoveryDialog input{margin-top:4px;flex-shrink:0}#leaseRecoveryDialog .meta{margin-top:12px}#queueState{overflow-wrap:anywhere}
+@media(max-width:760px){header{display:grid;grid-template-columns:minmax(0,1fr) repeat(3,32px);gap:6px}header h1{grid-column:1;grid-row:1}.state{grid-column:1/-1;grid-row:2}#pause{grid-column:2;grid-row:1}#resume{grid-column:3;grid-row:1}#refresh{grid-column:4;grid-row:1}}
 </style>
 </head>
 <body><header><h1>GPU Greenroom</h1><div class="state"><span id="dot" class="dot"></span><span id="queueState">loading</span></div><div class="spacer"></div><button id="pause" title="Pause queue" class="icon">Ⅱ</button><button id="resume" title="Resume queue" class="icon">▶</button><button id="refresh" title="Refresh" class="icon">↻</button></header>
@@ -98,6 +100,7 @@ function updateFreshness(){
   }
   if(wasAvailable!==queueAvailable&&last)render(last);
   document.querySelectorAll('#confirmCancel,#requeueConfirm').forEach(n=>n.disabled=busy||!queueAvailable);
+  const leaseConfirm=document.querySelector('#confirmLeaseRecovery');if(leaseConfirm)leaseConfirm.disabled=busy||!queueAvailable||!document.querySelector('#leaseStopped').checked;
   document.querySelectorAll('#smokeRequestList .smoke-card').forEach(card=>{
     const item=lastSmoke?.items.find(i=>'smoke-'+i.request.id===card.id),host=card.querySelector('.job-actions');
     if(host){const job=last?.jobs.find(j=>j.job_id===item?.display?.job_id&&j.status===item?.display?.job_state),markup=nativeActions(job);if(host.innerHTML!==markup)host.innerHTML=markup}
@@ -105,7 +108,7 @@ function updateFreshness(){
   if(!queueAvailable){
     document.querySelector('#queueState').textContent=freshness.queue.error?'State unavailable':last?'Queue state stale':'Waiting for queue state';
     document.querySelector('#dot').className='dot paused';
-    document.querySelectorAll('#pause,#resume,.job-actions button,.job-actions input,.dispatchClass,#confirmCancel,#requeueConfirm').forEach(n=>n.disabled=true);
+    document.querySelectorAll('#pause,#resume,.job-actions button,.job-actions input,.dispatchClass,#confirmCancel,#requeueConfirm,#reviewLease,#confirmLeaseRecovery').forEach(n=>n.disabled=true);
     document.querySelectorAll('.job-item').forEach(n=>n.draggable=false);
   }
   if(!readFresh('smoke')){smokeRefreshUnavailable=true;document.querySelectorAll('#smokeRequestList button').forEach(n=>n.disabled=true)}
@@ -189,20 +192,40 @@ function performanceWindow(j){
   const phase=j.status==='cancelled'?'Cancelled':j.performance_window_error?'Unverified: '+j.performance_window_error:deferred?'Reminder after '+new Date(deferred.deferred_until*1000).toLocaleTimeString()+' · Other work may proceed':p?.status==='deferred'?'Awaiting fresh confirmation':p?(labels[j.performance_window_effective_status||p.status]+(j.performance_window_effective_status==='interrupted'?' · '+(j.failure_phase||j.status):'')):'Confirmation required at dispatch';
   return '<div class="meta"><strong>Performance measurement: '+esc(phase)+'</strong><br>'+esc(j.performance_window_reason)+(p?'<br>Operator wait: '+duration(p.operator_wait_seconds)+' · Command wall: '+duration(p.command_wall_seconds):'')+'</div>';
 }
+function renderLease(s){
+  const host=document.querySelector('#lease'),blocker=s.execution_admission?.blockers.find(b=>b.kind==='external_lease'||b.kind==='unreadable_lease');
+  host.hidden=!blocker;
+  if(!blocker){host.replaceChildren();return}
+  if(blocker.kind==='unreadable_lease'){host.innerHTML='<strong>Dispatch blocked: external lease state unreadable</strong><div class="meta">'+esc(blocker.reason)+'</div>';return}
+  const unknown=blocker.lifecycle_state==='ownership_unknown';
+  host.innerHTML=`<strong>${unknown?'External ownership unknown; queue blocked':'External workload holds the queue'}</strong><div>${esc(blocker.owner)} · ${esc(blocker.effective_route)}</div><div class="meta">Lease: ${esc(blocker.lease_id)}<br>Reported by: ${esc(blocker.agent_id)}<br>${esc(blocker.repo_root)}<br>State: ${esc(blocker.lifecycle_state)} · ${esc(blocker.reason)}<br>Last renewal: ${duration(blocker.renewal_age_seconds)} ago · TTL: ${duration(blocker.ttl_seconds)}<br>Recorded PID: ${esc(blocker.pid??'not recorded')} · Process group: ${esc(blocker.process_group??'not recorded')}<br>${esc(blocker.recovery.reason)}</div>${blocker.recovery.available&&s.lease_recovery_enabled?'<div class="lease-controls"><button id="reviewLease" type="button">Review recovery</button></div>':''}`;
+  const review=host.querySelector('#reviewLease');if(review){review.disabled=busy||!queueAvailable;review.onclick=()=>askLeaseRecovery(blocker)}
+}
+function askLeaseRecovery(blocker){
+  if(!queueAvailable||busy)return;
+  let dialog=document.querySelector('#leaseRecoveryDialog');
+  if(!dialog){dialog=document.createElement('dialog');dialog.id='leaseRecoveryDialog';dialog.innerHTML='<form method="dialog"><h2>Confirm external workload stopped</h2><p id="leaseRecoveryIdentity"></p><p>No process will be stopped. Browser GPU work can outlive its web server.</p><label><input id="leaseStopped" type="checkbox">I have stopped this external GPU workload, including its browser work.</label><p class="meta">This records operator-confirmed settlement, not automatic proof from expiry or a dead PID.</p><div class="dialog-actions"><button value="back" autofocus>Keep blocked</button><button id="confirmLeaseRecovery" class="danger" type="button" disabled>Confirm stopped and recover</button></div></form>';document.body.append(dialog)}
+  dialog.querySelector('#leaseRecoveryIdentity').textContent=`${blocker.owner}\n${blocker.effective_route}\nLease: ${blocker.lease_id}`;
+  const checkbox=dialog.querySelector('#leaseStopped'),confirm=dialog.querySelector('#confirmLeaseRecovery');checkbox.checked=false;confirm.disabled=true;
+  checkbox.onchange=()=>{confirm.disabled=!checkbox.checked||!queueAvailable||busy};
+  const body={lease_id:blocker.lease_id,expected_record_sha256:blocker.record_sha256,expected_start_identity:blocker.process_start_identity??null,request_id:crypto.randomUUID(),quiescence_confirmed:true,reason:'Operator confirms the external GPU workload, including browser work, has stopped'};
+  confirm.onclick=async()=>{if(!checkbox.checked||!queueAvailable||busy)return;dialog.close();try{await post('/api/lease/recover',body)}catch(e){err(e.message)}};
+  dialog.showModal();dialog.querySelector('button[value="back"]').focus();
+}
 function render(s){
   last=s;
   if(draggedJob)return;
-  const state=s.admission_state==='paused_running'?'Paused; work still running':s.paused?'Paused; no queued job running':'Queue starts enabled';
+  const external=s.execution_admission?.state==='external_lease',unknown=s.execution_admission?.state==='unknown';
+  const state=unknown?'Dispatch blocked; lease state unknown':external?'External workload blocks starts'+(s.paused?' · Queue paused':''):s.admission_state==='paused_running'?'Paused; work still running':s.paused?'Paused; no queued job running':'Queue starts enabled';
   document.querySelector('#queueState').textContent=queueAvailable?state:freshness.queue.error?'State unavailable':'Queue state stale';
   if(s.dispatch?.error)document.querySelector('#queueState').textContent+=' · Dispatch blocked: '+s.dispatch.error;
-  document.querySelector('#dot').className='dot'+(s.paused||!queueAvailable?' paused':'');
+  document.querySelector('#dot').className='dot'+(s.paused||external||unknown||!queueAvailable?' paused':'');
   document.querySelector('#pause').disabled=busy||!queueAvailable||s.paused;
   document.querySelector('#resume').disabled=busy||!queueAvailable||!s.paused||(s.admission_control&&!s.pause_state?.epoch);
   const pm=document.querySelector('#pauseMeta'),p=s.pause_state;
   pm.hidden=false;pm.textContent=`Observed: ${new Date(s.observed_at*1000).toLocaleString()}`+(p?` · Pause owner: ${p.owner||'not recorded'} · epoch ${p.epoch||'not recorded'}`:'');
   if(s.paused&&!p?.epoch)pm.textContent+=' · Legacy pause: epoch not recorded.'+(s.admission_control?' Verify pause ownership and recover through the native queue CLI; browser resume cannot bind this marker.':'');
-  const lease=document.querySelector('#lease');lease.hidden=!s.lease;
-  lease.textContent=s.lease?`Recorded external owner: ${s.lease.owner} · ${s.lease.effective_route} · ${s.lease.lifecycle_state}`:'';
+  renderLease(s);
   document.querySelector('#filters').innerHTML=statuses.map(x=>`<button class="filter ${s.view===x?'active':''}" data-filter="${x}">${x==='recoverable'?'Restore cancelled':x}</button>`).join('');
   document.querySelectorAll('[data-filter]').forEach(b=>b.onclick=()=>{filter=b.dataset.filter;load()});
   const smokeJobs=new Set((lastSmoke?.items||[]).map(item=>item.display?.job_id).filter(Boolean));
@@ -543,12 +566,9 @@ def queue_snapshot(queue: GPUQueue | Path, view: str = "all", *, read_only: bool
             if view != 'recoverable' or row.get('requeue_available'):
                 jobs.append(row)
     jobs.sort(key=lambda item: (item.get("submitted_at") or 0), reverse=True)
-    lease_payload = None
+    from . import lease_controls
     pause_path = queue_dir / "paused"
     if read_only:
-        lease_path = queue_dir / "leases" / "current.json"
-        if lease_path.exists():
-            lease_payload = json.loads(lease_path.read_text())
         try:
             text = pause_path.read_text()
         except FileNotFoundError:
@@ -556,10 +576,12 @@ def queue_snapshot(queue: GPUQueue | Path, view: str = "all", *, read_only: bool
         else:
             paused, pause = True, json.loads(text) if text.strip() else None
     else:
-        lease = queue.lease_status()
-        if lease is not None:
-            lease_payload = json.loads(lease.to_json())
+        try:
+            queue.lease_status()
+        except (OSError, ValueError, TypeError, KeyError):
+            pass
         paused, pause = queue.is_paused(), queue.pause_state()
+    lease_payload, lease_blocker = lease_controls.observe(queue_dir)
     running_dir = queue_dir / 'running'
     running_ids = sorted(path.name for path in running_dir.iterdir()) if running_dir.is_dir() else []
     try:
@@ -583,6 +605,9 @@ def queue_snapshot(queue: GPUQueue | Path, view: str = "all", *, read_only: bool
         "running_job_ids": running_ids,
         "pause_state": pause,
         "lease": lease_payload,
+        "execution_admission": lease_controls.admission(
+            lease_blocker=lease_blocker, paused=paused, running_ids=running_ids,
+            dispatch_error=dispatch_state.get('error')),
         "dispatch": dispatch_state,
         "jobs": jobs,
     }
@@ -776,6 +801,7 @@ def make_handler(queue: GPUQueue | Path, token: str, *, read_only: bool = False,
                     snapshot = queue_snapshot(queue, view, read_only=read_only or admission_control)
                     snapshot['admission_control'] = admission_control
                     snapshot['job_control'] = job_control and not read_only
+                    snapshot['lease_recovery_enabled'] = local_operator and not read_only
                 except ValueError:
                     self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_view"})
                     return
@@ -795,6 +821,24 @@ def make_handler(queue: GPUQueue | Path, token: str, *, read_only: bool = False,
                 self._json(HTTPStatus.FORBIDDEN, {"error": "read_only_monitor"})
                 return
             smoke_route = self._is_smoke_post_path(path)
+            if path == '/api/lease/recover':
+                if not local_operator:
+                    self._json(HTTPStatus.FORBIDDEN, {'error':'local_operator_required'})
+                    return
+                try:
+                    from .lease_controls import recover
+                    body = self._body()
+                    required = {'lease_id','expected_record_sha256','expected_start_identity',
+                                'request_id','quiescence_confirmed','reason'}
+                    if set(body) != required:
+                        raise ValueError('lease recovery requires the exact displayed identity and settlement confirmation')
+                    root = queue if isinstance(queue, Path) else queue.queue_dir
+                    result = recover(GPUQueue(root), **body)
+                except (ValueError, TypeError, KeyError, OSError, RuntimeError) as error:
+                    self._json(HTTPStatus.CONFLICT, {'error':str(error)})
+                    return
+                self._json(HTTPStatus.OK, result)
+                return
             if path == '/api/job-action':
                 if not job_control:
                     self._json(HTTPStatus.FORBIDDEN, {'error':'job_controls_disabled'})
