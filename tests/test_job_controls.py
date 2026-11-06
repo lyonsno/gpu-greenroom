@@ -136,9 +136,12 @@ def test_popup_cancel_failed_state_is_recoverable_but_launched_work_is_not(tmp_p
     q = GPUQueue(tmp_path)
     path = job(q,performance_window='fixture timing')
     req = JobRequest.from_json((path/'request.json').read_text())
-    spec = {'schema':performance_window.SCHEMA,'job_id':path.name,'owner':req.agent_id,
-        'route':req.route_identity,'reason':req.performance_window,'argv':req.command_argv,
-        'timeout':None,'receipt_path':str(path/'performance-window.json')}
+    state = JobState.from_json((path/'status.json').read_text())
+    state.status,state.started_at = JobStatus.RUNNING,1.
+    (path/'status.json').write_text(state.to_json())
+    path = path.rename(tmp_path/'running'/path.name)
+    launch = performance_window.runner_command(path,req,req.command_argv,None)
+    spec = json.loads(Path(launch[-1]).read_text())
     assert performance_window.run(spec,prompt=lambda spec:False) == 125
     state = JobState.from_json((path/'status.json').read_text())
     state.status,state.started_at,state.finished_at,state.exit_code = JobStatus.FAILED,1,2,125
