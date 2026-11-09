@@ -115,12 +115,18 @@ def cmd_submit(args):
             request.output_dir = request.output_dir or str(queue.queue_dir / 'outputs' / request.job_id)
             values['output_dir'] = request.output_dir
             request.command_argv = [_safe_substitute(value, values) for value in config['cmd']]
+            request.command_argv[0] = admission.executable(request.command_argv, cwd, config.get('env') or {})
             request.command_cwd = str(Path(cwd).resolve())
             request.repo_root = request.command_cwd
             request.command_env = config.get('env') or {}
             request.command_timeout = config.get('timeout')
             request.route_identity = f'job-type:{request.job_type}'
             request.output_class = config.get('output_class')
+            safe_params = {k:v for k,v in request.params.items() if k not in {'cwd','env','input_path','output_dir'}}
+            template = ' '.join(config['cmd'])
+            request.params['_producer_typed_command'] = {
+                'defaults': config.get('defaults', {}), 'substitutions': values,
+                'ignored_params': {k:v for k,v in safe_params.items() if '{'+k+'}' not in template}}
         job_dir = queue.submit(request)
     except (OSError, ValueError, TypeError, KeyError) as error:
         print(json.dumps(_write_submission_failure(queue, args, error), indent=2), file=sys.stderr)
