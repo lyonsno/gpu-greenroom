@@ -161,13 +161,21 @@ def test_interpreter_entry_script_is_bound_with_relative_path_or_flags(tmp_path,
     assert not list((queue.queue_dir / 'pending').iterdir())
 
 
-def test_preflight_cooperative_combination_is_refused_before_save_or_gpu(tmp_path):
+def test_prepared_cooperative_job_keeps_preflight_and_requires_capable_worker(tmp_path):
     manifest = command(tmp_path)
     manifest['cooperative_checkpoint'] = True
+    manifest['preflight'] = preflight(tmp_path)
     queue = GPUQueue(tmp_path / 'queue')
-    with pytest.raises(ValueError, match='successor'):
-        admission.prepare(queue, manifest)
+    plan = admission.prepare(queue, manifest)
     assert not list((queue.queue_dir / 'pending').iterdir())
+    submitted = admission.submit_prepared(queue, plan)
+    request = JobRequest.from_json((submitted / 'request.json').read_text())
+    validation = json.loads((submitted / 'validation.json').read_text())
+    assert request.cooperative_checkpoint is True
+    assert 'prepared-checkpoint-continuation.v1' in request.required_worker_capabilities
+    assert validation['preflight']['result']['valid'] is True
+    assert validation['preflight_spec'] == manifest['preflight']
+    admission.assert_current(request, validation)
 
 
 def test_prepared_and_pending_validation_dependencies_are_retained(tmp_path):
