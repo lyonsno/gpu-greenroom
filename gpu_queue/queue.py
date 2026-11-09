@@ -1709,6 +1709,8 @@ class GPUQueue:
         queue_dir/outputs/<job_id>/. If output_dir is under /tmp or
         /private/tmp, records a volatile_output warning.
         """
+        from .producer_checkpoints import bind as bind_producer_checkpoint
+        bind_producer_checkpoint(request)
         if type(request.cooperative_checkpoint) is not bool:
             raise ValueError('cooperative_checkpoint must be a boolean')
         from . import runtime_hints
@@ -2507,6 +2509,12 @@ class GPUQueue:
                 }
 
                 cmd = [_safe_substitute(part, substitutions) for part in cmd_template]
+            from .producer_checkpoints import assert_current as assert_producer_checkpoint
+            try:
+                assert_producer_checkpoint(request)
+            except (ValueError, OSError, KeyError, TypeError) as error:
+                state.status, state.failure_phase, state.exit_code = JobStatus.FAILED, 'producer_checkpoint_preflight', -1
+                state.error_message = str(error)
             state.effective_route = shlex.join(cmd)
             (job_dir / "status.json").write_text(state.to_json())
 

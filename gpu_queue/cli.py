@@ -107,6 +107,20 @@ def cmd_submit(args):
                   'input_path': request.input_path, 'output_dir': request.output_dir}
         argv = [_safe_substitute(value, values) for value in config['cmd']]
         admission.executable(argv, cwd, config.get('env') or {})
+        from .producer_checkpoints import discover
+        declaration = discover(cwd, argv, cwd)
+        if declaration is not None:
+            if any(config.get(key) for key in ('source_attestation', 'runtime_identity_cmd', 'artifact_manifest')):
+                raise ValueError('checkpoint typed command needs an adapter preserving its source-attestation contract')
+            request.output_dir = request.output_dir or str(queue.queue_dir / 'outputs' / request.job_id)
+            values['output_dir'] = request.output_dir
+            request.command_argv = [_safe_substitute(value, values) for value in config['cmd']]
+            request.command_cwd = str(Path(cwd).resolve())
+            request.repo_root = request.command_cwd
+            request.command_env = config.get('env') or {}
+            request.command_timeout = config.get('timeout')
+            request.route_identity = f'job-type:{request.job_type}'
+            request.output_class = config.get('output_class')
         job_dir = queue.submit(request)
     except (OSError, ValueError, TypeError, KeyError) as error:
         print(json.dumps(_write_submission_failure(queue, args, error), indent=2), file=sys.stderr)
