@@ -2,11 +2,24 @@
 
 import json
 from pathlib import Path
+import re
 
 from . import admission
 
 
 PARAM = "_producer_checkpoint"
+OWNER_CAPABILITY = "producer-owned-checkpoints.v1"
+
+
+def checkpoint_owner(request):
+    """Checkpoint custody is distinct from an attributed caller identity."""
+    if isinstance(request.agent_id, str) and request.agent_id.strip():
+        return request.agent_id
+    binding = request.params.get(PARAM, {})
+    owner = binding.get("owner") if isinstance(binding, dict) else None
+    if not isinstance(owner, str) or not re.fullmatch(r"job:[A-Za-z0-9_-]+", owner):
+        raise ValueError("checkpoint continuation requires caller or job-owned checkpoint custody")
+    return owner
 
 
 def discover(repo_root, argv, cwd):
@@ -23,7 +36,12 @@ def discover(repo_root, argv, cwd):
             or not all(isinstance(p, str) and p and not Path(p).is_absolute()
                        and ".." not in Path(p).parts for p in entries)):
         raise ValueError("invalid producer checkpoint declaration")
-    scripts = admission.entry_script(argv, cwd)
+    try:
+        scripts = admission.entry_script(argv, cwd)
+    except ValueError:
+        # Discovery is narrower than prevalidated interpreter admission. A
+        # module/shell wrapper is not evidence of this declared entrypoint.
+        return None
     if len(scripts) != 1:
         return None
     script = Path(scripts[0]).resolve()
@@ -48,7 +66,8 @@ def assert_current(request):
         value = record[key]
         if admission.file_binding(value["path"]) != value:
             raise ValueError(f"producer checkpoint {key} changed after submission")
-    if discover(request.repo_root, request.command_argv, request.command_cwd) != record:
+    discovered = discover(request.repo_root, request.command_argv, request.command_cwd)
+    if discovered is None or any(record.get(key) != value for key, value in discovered.items()):
         raise ValueError("producer checkpoint binding does not name this command")
 
 
@@ -60,9 +79,14 @@ def bind(request):
         declaration = discover(request.repo_root, request.command_argv, request.command_cwd)
     if declaration is None:
         return
-    if admission.CAPABILITY in request.required_worker_capabilities:
-        raise ValueError("producer checkpoint continuation cannot discard prepared-command validation")
-    if not isinstance(request.agent_id, str) or not request.agent_id.strip():
-        raise ValueError("checkpoint-capable producer requires an explicit job owner")
+    if request.agent_id is None and "owner" not in declaration:
+        declaration = {**declaration, "owner": "job:" + request.job_id}
     request.cooperative_checkpoint = True
     request.params = {**request.params, PARAM: declaration}
+    checkpoint_owner(request)
+    for capability in ("structured-command.v2", "checkpoint-continuation.v1", *([OWNER_CAPABILITY] if request.agent_id is None else [])):
+        if capability not in request.required_worker_capabilities:
+            request.required_worker_capabilities.append(capability)
+    if admission.CAPABILITY in request.required_worker_capabilities:
+        if "prepared-checkpoint-continuation.v1" not in request.required_worker_capabilities:
+            request.required_worker_capabilities.append("prepared-checkpoint-continuation.v1")

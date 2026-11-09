@@ -96,7 +96,7 @@ def _safe_substitute(template: str, mapping: dict) -> str:
 def effective_worker_capabilities() -> frozenset[str]:
     configured = os.environ.get("GPU_GREENROOM_WORKER_CAPABILITIES")
     if configured is None:
-        return DEFAULT_WORKER_CAPABILITIES | {dispatch.CAPABILITY,dispatch.OVERRIDE_CAPABILITY,'structured-command.v2','checkpoint-continuation.v1',admission.CAPABILITY,performance_window.CAPABILITY,'job-cancellation.v1',dispatch.HISTORY_CAPABILITY,'runtime-hint.v1','operator-job-controls.v1'}
+        return DEFAULT_WORKER_CAPABILITIES | {dispatch.CAPABILITY,dispatch.OVERRIDE_CAPABILITY,'structured-command.v2','checkpoint-continuation.v1',admission.CAPABILITY,performance_window.CAPABILITY,'job-cancellation.v1',dispatch.HISTORY_CAPABILITY,'runtime-hint.v1','operator-job-controls.v1','producer-owned-checkpoints.v1','prepared-checkpoint-continuation.v1'}
     return frozenset(
         capability.strip()
         for capability in configured.split(",")
@@ -1728,8 +1728,10 @@ class GPUQueue:
             if performance_window.CAPABILITY not in request.required_worker_capabilities:
                 request.required_worker_capabilities.append(performance_window.CAPABILITY)
         if request.cooperative_checkpoint:
-            if not request.command_argv or not isinstance(request.agent_id,str) or not request.agent_id.strip():
+            from .producer_checkpoints import checkpoint_owner
+            if not request.command_argv:
                 raise ValueError('checkpoint continuation requires a structured command and explicit owner')
+            checkpoint_owner(request)
             if 'checkpoint-continuation.v1' not in request.required_worker_capabilities:
                 request.required_worker_capabilities.append('checkpoint-continuation.v1')
             if (request.command_env or {}).get('GPU_GREENROOM_RESUME_CHECKPOINT') and (
@@ -2479,6 +2481,11 @@ class GPUQueue:
                 cmd = list(cmd_template)
                 ignored_params = {}
                 substitutions = {}
+                typed = request.params.get('_producer_typed_command') if request.params.get('_producer_checkpoint') else None
+                if typed is not None:
+                    job_defaults = typed['defaults']
+                    ignored_params = typed['ignored_params']
+                    substitutions = typed['substitutions']
             else:
                 # Per-job overrides: cwd and env from params (removed before template subs)
                 override_keys = {"cwd", "env"}

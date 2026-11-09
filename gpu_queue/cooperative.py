@@ -13,6 +13,7 @@ from .models import JobRequest
 from .queue import GPUQueue
 from .models import JobState
 from .cancellation import read_request as read_cancellation
+from .producer_checkpoints import checkpoint_owner
 
 
 def report_pause_estimate(seconds, *, checkpoint=''):
@@ -89,6 +90,7 @@ def _context():
     request_bytes=(job/'request.json').read_bytes()
     state=json.loads((job/'status.json').read_text())
     request=JobRequest.from_json(request_bytes.decode())
+    checkpoint_owner(request)
     if (context['job_id']!=job.name or state.get('job_id')!=job.name or state.get('status')!='running'
             or hashlib.sha256(request_bytes).hexdigest()!=context['request_sha256']
             or state.get('child_process_group')!=os.getpgrp()
@@ -106,7 +108,7 @@ def load_checkpoint():
     queue,job,request,_=context
     raw=Path(path).read_bytes()
     value=json.loads(raw)
-    if (value.get('schema')!='gpu-greenroom.checkpoint.v1' or value.get('owner')!=request.agent_id
+    if (value.get('schema')!='gpu-greenroom.checkpoint.v1' or value.get('owner')!=checkpoint_owner(request)
             or value.get('queue_dir')!=str(queue.queue_dir.resolve())
             or value.get('job_id')!=request.params.get('continuation_of')
             or value.get('route_identity')!=request.route_identity):
@@ -137,10 +139,11 @@ def yield_if_requested(*,save_checkpoint,quiesce,continuation,on_submitted=None)
     directory=queue.queue_dir/'outputs'/request.job_id/'checkpoints'
     pins=RetentionPins(queue.queue_dir)
     existing=pins.entries().get(request.job_id)
-    if existing and existing.get('owner') not in (None,request.agent_id):
+    owner = checkpoint_owner(request)
+    if existing and existing.get('owner') not in (None,owner):
         raise ValueError('checkpoint output pin is owned by a different producer')
     if not existing or existing.get('until') is not None:
-        pins.pin(request.job_id,owner=request.agent_id,
+        pins.pin(request.job_id,owner=owner,
                  reason='Checkpoint recovery state; release explicitly after it is no longer needed')
     directory.mkdir(parents=True,exist_ok=True)
     payload=save_checkpoint(directory)
@@ -148,7 +151,7 @@ def yield_if_requested(*,save_checkpoint,quiesce,continuation,on_submitted=None)
         raise ValueError('save_checkpoint must return a JSON descriptor of durable saved state')
     checkpoint=directory/'checkpoint.json'
     dispatch.atomic_write(checkpoint,{'schema':'gpu-greenroom.checkpoint.v1','job_id':request.job_id,
-        'queue_dir':str(queue.queue_dir.resolve()),'owner':request.agent_id,'route_identity':request.route_identity,
+        'queue_dir':str(queue.queue_dir.resolve()),'owner':owner,'route_identity':request.route_identity,
         'saved_at':time.time(),'payload':payload})
     if quiesce() is not True:
         return False
@@ -158,7 +161,7 @@ def yield_if_requested(*,save_checkpoint,quiesce,continuation,on_submitted=None)
             raise ValueError('operator pause requires a resumable continuation')
         raise SystemExit(0)
     if (not isinstance(next_request,JobRequest) or next_request.job_id==request.job_id
-            or next_request.agent_id!=request.agent_id or next_request.repo_root!=request.repo_root
+            or next_request.agent_id!=request.agent_id or checkpoint_owner(next_request)!=owner or next_request.repo_root!=request.repo_root
             or next_request.route_identity!=request.route_identity or next_request.command_cwd!=request.command_cwd
             or not next_request.command_argv or next_request.command_argv[0]!=request.command_argv[0]):
         raise ValueError('continuation must preserve owner, repo, route and executable identity')
@@ -169,12 +172,21 @@ def yield_if_requested(*,save_checkpoint,quiesce,continuation,on_submitted=None)
                          'checkpoint_sha256':hashlib.sha256(checkpoint.read_bytes()).hexdigest()}
     overlay=request.command_env if next_request.command_env is None else next_request.command_env
     next_request.command_env={**(overlay or {}),'GPU_GREENROOM_RESUME_CHECKPOINT':str(checkpoint.resolve())}
+    validation = None
+    from . import admission
+    if admission.CAPABILITY in request.required_worker_capabilities:
+        parent_validation = json.loads((job/'validation.json').read_text())
+        admission.assert_current(request, parent_validation)
+        if parent_validation.get('preflight') and 'preflight_spec' not in parent_validation:
+            raise ValueError('prepared checkpoint lacks the original successor preflight specification')
+        validation = admission.validate(queue, next_request, parent_validation.get('preflight_spec'))
+        next_request.params[admission.DIGEST_PARAM] = admission.digest(validation)
     with queue._coordination_lock():
         if read_cancellation(job,JobState.from_json(json.dumps(state))):
             return False
         if queue.get_job(next_request.job_id) is not None:
             raise ValueError('continuation job identity is already in use')
-        stage=queue.submit(next_request,_staged=True)
+        stage=queue.submit(next_request,_staged=True,validation=validation)
     prepared_request_sha=hashlib.sha256((stage/'request.json').read_bytes()).hexdigest()
     prepared_state_sha=hashlib.sha256((stage/'status.json').read_bytes()).hexdigest()
     try:

@@ -134,8 +134,6 @@ def normalize_manifest(value):
     cooperative = payload.get('cooperative_checkpoint', False)
     if type(cooperative) is not bool or cooperative and schema == 'gpu-greenroom.command.v1':
         raise ValueError('cooperative_checkpoint requires command.v2 or v3 and a boolean')
-    if cooperative and (schema == 'gpu-greenroom.command.v3' or preflight is not None):
-        raise ValueError('command.v3 cooperative continuation requires successor validation support; use the separate command.v2 checkpoint contract')
     owner = payload.get('agent_id')
     if owner is not None and (not isinstance(owner, str) or not owner.strip()):
         raise ValueError('agent_id must be a non-empty string when supplied')
@@ -213,7 +211,7 @@ def command_request(payload, *, prepared=False):
         capabilities.append('performance-window.v1')
     if payload.get('runtime_hint') is not None:
         capabilities.append(runtime_hints.CAPABILITY)
-    return JobRequest(job_type='command',input_path='',agent_id=payload.get('agent_id'),
+    request = JobRequest(job_type='command',input_path='',agent_id=payload.get('agent_id'),
         repo_root=payload['repo_root'],command_cwd=payload['cwd'],command_argv=payload['argv'],
         command_env=payload.get('env'),command_timeout=payload.get('timeout'),output_dir=payload.get('output_dir',''),
         output_class=payload.get('output_class'),route_identity=payload['route_identity'],
@@ -221,6 +219,11 @@ def command_request(payload, *, prepared=False):
         performance_window=payload.get('performance_window'),runtime_profile=payload.get('runtime_profile'),
         runtime_hint=payload.get('runtime_hint'),
         required_worker_capabilities=capabilities)
+    from .producer_checkpoints import bind
+    bind(request)
+    if prepared and request.cooperative_checkpoint and 'prepared-checkpoint-continuation.v1' not in request.required_worker_capabilities:
+        request.required_worker_capabilities.append('prepared-checkpoint-continuation.v1')
+    return request
 
 
 def prepare(queue, manifest):
@@ -249,6 +252,7 @@ def validate(queue, request, preflight):
     report = {'schema': SCHEMA, 'valid': False, 'phase': 'input-binding', 'validated_at': time.time(),
               'request_digest': request_identity(request), 'bound_scope': 'command-and-declared-inputs',
               'gpu_execution_authority': False, 'bindings': [], 'report_path': str(directory / 'validation.json')}
+    report['preflight_spec'] = deepcopy(preflight)
     try:
         paths = [request.command_argv[0]]
         paths += entry_script(request.command_argv, request.command_cwd)
