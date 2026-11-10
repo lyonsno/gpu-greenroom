@@ -11,6 +11,19 @@ PARAM = "_producer_checkpoint"
 OWNER_CAPABILITY = "producer-owned-checkpoints.v1"
 
 
+def typed_command_metadata(request):
+    if PARAM not in request.params or "_producer_typed_command" not in request.params:
+        return None
+    value = request.params["_producer_typed_command"]
+    if not isinstance(value, dict) or any(
+        not isinstance(value.get(key), dict)
+        or not all(isinstance(name, str) for name in value[key])
+        for key in ("defaults", "ignored_params", "substitutions")
+    ):
+        raise ValueError("invalid producer typed command metadata: required fields must be objects with string keys")
+    return value
+
+
 def checkpoint_owner(request):
     """Checkpoint custody is distinct from an attributed caller identity."""
     if isinstance(request.agent_id, str) and request.agent_id.strip():
@@ -83,6 +96,7 @@ def bind(request):
         declaration = {**declaration, "owner": "job:" + request.job_id}
     request.cooperative_checkpoint = True
     request.params = {**request.params, PARAM: declaration}
+    typed_command_metadata(request)
     checkpoint_owner(request)
     for capability in ("structured-command.v2", "checkpoint-continuation.v1", *([OWNER_CAPABILITY] if request.agent_id is None else [])):
         if capability not in request.required_worker_capabilities:

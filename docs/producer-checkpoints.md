@@ -16,6 +16,10 @@ executable and environment into an exact command. The receipt retains the typed
 defaults and ignored parameters. Unrelated modules, inline commands and shell
 wrappers do not inherit a neighboring declaration. Malformed declarations and
 entrypoints escaping their source root fail visibly.
+Typed receipt metadata requires `defaults`, `ignored_params` and `substitutions`
+objects. Unknown additive fields are preserved. Malformed metadata is rejected
+at admission; a malformed persisted request fails worker preflight with a terminal
+receipt before launching a child.
 
 The request binds declaration and entrypoint contents under
 `params._producer_checkpoint`. The worker checks the binding before executing
