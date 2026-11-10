@@ -185,3 +185,63 @@ def test_frozen_typed_command_preserves_executable_defaults_and_ignored_receipt(
     receipt = json.loads((queue / "done" / job.name / "receipt.json").read_text())
     assert receipt["effective_defaults"] == {"seed": "17"}
     assert receipt["ignored_params"] == {"unused": "9"}
+
+
+_BAD_TYPED = [None, {}, [],
+              *[{**{k: {} for k in ('defaults', 'ignored_params', 'substitutions')}, field: []}
+                for field in ('defaults', 'ignored_params', 'substitutions')]]
+
+
+@pytest.mark.parametrize('metadata', _BAD_TYPED)
+def test_malformed_typed_metadata_rejected_before_admission(tmp_path, metadata):
+    root = producer(tmp_path)
+    queue = GPUQueue(tmp_path / 'queue')
+    req = JobRequest(job_type='command', input_path='', repo_root=str(root), command_cwd=str(root),
+                     command_argv=[sys.executable, 'generate.py'],
+                     params={'_producer_typed_command': metadata})
+    with pytest.raises(ValueError, match='typed.*metadata'):
+        queue.submit(req)
+    assert not list((queue.queue_dir / 'pending').iterdir())
+    assert not list((queue.queue_dir / 'running').iterdir())
+
+
+@pytest.mark.parametrize('metadata', _BAD_TYPED)
+def test_persisted_malformed_typed_metadata_has_terminal_failure(tmp_path, metadata):
+    root = producer(tmp_path)
+    marker = tmp_path / 'child-ran'
+    (root / 'generate.py').write_text(f'from pathlib import Path\nPath({str(marker)!r}).touch()\n')
+    queue = GPUQueue(tmp_path / 'queue')
+    req = JobRequest(job_type='command', input_path='', repo_root=str(root), command_cwd=str(root),
+                     command_argv=[sys.executable, 'generate.py'],
+                     params={'_producer_typed_command': {k: {} for k in ('defaults', 'ignored_params', 'substitutions')}})
+    job = queue.submit(req)
+    saved = json.loads((job / 'request.json').read_text())
+    saved['params']['_producer_typed_command'] = metadata
+    (job / 'request.json').write_text(json.dumps(saved))
+    assert queue.run_one({}) is True
+    state = queue.get_job(req.job_id)
+    assert state.status.value == 'failed'
+    assert state.failure_phase == 'producer_checkpoint_preflight'
+    receipt = json.loads((queue.queue_dir / 'failed' / req.job_id / 'receipt.json').read_text())
+    assert 'typed' in receipt['error_message'] and 'metadata' in receipt['error_message']
+    assert not marker.exists()
+    assert not list((queue.queue_dir / 'running').iterdir())
+    following = JobRequest(job_type='command', input_path='', repo_root=str(root), command_cwd=str(root),
+                           command_argv=[sys.executable, 'generate.py'])
+    queue.submit(following)
+    assert queue.run_one({}) is True
+    assert queue.get_job(following.job_id).status.value == 'done'
+    assert marker.exists(), 'malformed predecessor stopped further dispatch'
+
+
+def test_typed_metadata_accepts_additive_fields(tmp_path):
+    root = producer(tmp_path)
+    queue = GPUQueue(tmp_path / 'queue')
+    metadata = {k: {} for k in ('defaults', 'ignored_params', 'substitutions')}
+    metadata['future_extension'] = {'revision': 2}
+    req = JobRequest(job_type='command', input_path='', repo_root=str(root), command_cwd=str(root),
+                     command_argv=[sys.executable, 'generate.py'], params={'_producer_typed_command': metadata})
+    job = queue.submit(req)
+    assert json.loads((job / 'request.json').read_text())['params']['_producer_typed_command'] == metadata
+    assert queue.run_one({})
+    assert queue.get_job(req.job_id).status.value == 'done'

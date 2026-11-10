@@ -2481,11 +2481,6 @@ class GPUQueue:
                 cmd = list(cmd_template)
                 ignored_params = {}
                 substitutions = {}
-                typed = request.params.get('_producer_typed_command') if request.params.get('_producer_checkpoint') else None
-                if typed is not None:
-                    job_defaults = typed['defaults']
-                    ignored_params = typed['ignored_params']
-                    substitutions = typed['substitutions']
             else:
                 # Per-job overrides: cwd and env from params (removed before template subs)
                 override_keys = {"cwd", "env"}
@@ -2517,8 +2512,14 @@ class GPUQueue:
 
                 cmd = [_safe_substitute(part, substitutions) for part in cmd_template]
             from .producer_checkpoints import assert_current as assert_producer_checkpoint
+            from .producer_checkpoints import typed_command_metadata
             try:
                 assert_producer_checkpoint(request)
+                typed = typed_command_metadata(request)
+                if is_command_job and typed is not None:
+                    job_defaults = typed['defaults']
+                    ignored_params = typed['ignored_params']
+                    substitutions = typed['substitutions']
             except (ValueError, OSError, KeyError, TypeError) as error:
                 state.status, state.failure_phase, state.exit_code = JobStatus.FAILED, 'producer_checkpoint_preflight', -1
                 state.error_message = str(error)
